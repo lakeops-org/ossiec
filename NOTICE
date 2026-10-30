@@ -1,0 +1,7 @@
+ossiec
+Copyright 2026 The ossiec authors
+
+tests/fixtures/ossie/ contains example semantic models and compliance fixtures
+copied from Apache Ossie (incubating), https://github.com/apache/ossie,
+licensed under the Apache License, Version 2.0.
+Copyright The Apache Software Foundation.

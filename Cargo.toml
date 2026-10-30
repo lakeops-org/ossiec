@@ -1,0 +1,31 @@
+[package]
+name = "ossiec"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "A compiler from Apache Ossie semantic models to correct, engine-native SQL"
+repository = "https://github.com/lakeops-org/ossiec"
+readme = "README.md"
+keywords = ["ossie", "semantic-layer", "sql", "metrics", "compiler"]
+categories = ["database", "compilers", "command-line-utilities"]
+exclude = ["tests/fixtures/shop/*.duckdb"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ossiec"
+path = "src/main.rs"
+
+[dependencies]
+polyglot-sql = "=0.13.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+
+[dev-dependencies]
+# Trino rows arrive as JSON objects; keep their column order.
+serde_json = { version = "1", features = ["preserve_order"] }
+duckdb = { version = "1.10501", features = ["bundled"] }

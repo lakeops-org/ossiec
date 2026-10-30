@@ -1,0 +1,340 @@
+<div align="center">
+
+# ossiec
+
+**The Apache Ossie compiler.**
+Define a metric once. Get correct SQL for any engine.
+
+[![CI](https://github.com/lakeops-org/ossiec/actions/workflows/ci.yml/badge.svg)](https://github.com/lakeops-org/ossiec/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Ossie spec](https://img.shields.io/badge/Apache%20Ossie-0.2.0.dev0-orange.svg)](https://github.com/apache/ossie/blob/main/core-spec/spec.md)
+
+</div>
+
+---
+
+[Apache Ossie](https://ossie.apache.org/) is the vendor-neutral standard for semantic models: datasets, fields, relationships and metrics in YAML. Ossie defines what a metric *means*. It doesn't say how to turn one into SQL.
+
+**ossiec does that part.** Give it an Ossie model and a request ("`total_revenue` by `customers.region`, last quarter") and it returns one SQL statement, in the dialect you need, that can't double-count.
+
+```console
+$ echo '{"metrics": ["total_stock"], "dimensions": ["customers.region"]}' \
+    | ossiec compile shop.yaml - --dialect snowflake
+```
+
+## Why a compiler?
+
+Ask a person or an LLM for "units in stock by customer region" over a star schema and you'll usually get this:
+
+```sql
+SELECT c.region, SUM(p.stock)
+FROM orders o
+LEFT JOIN customers c ON o.customer_id = c.customer_id
+LEFT JOIN products  p ON o.product_id  = p.product_id
+GROUP BY c.region
+```
+
+It runs, it looks right, and it's wrong. Stock lives on `products`, but the join repeats each product once per order. On the [test shop](tests/common/mod.rs):
+
+| region | naive SQL | ossiec | truth |
+|---|---:|---:|---|
+| EU | **250** | **150** | EU bought products 10 and 11: 100 + 50 units |
+| US | **60** | **30** | US bought product 12, twice: 30 units |
+
+ossiec sees that `SUM(products.stock)` reads only the "one" side of a many-to-one join, so it evaluates the sum over rows de-duplicated on `products`' primary key. The test suite runs both queries on DuckDB and checks that the naive one really is wrong, so the test can't pass for the wrong reason.
+
+## Features
+
+- **Reads the current Ossie spec** (`0.2.0.dev0`, model at the document root): datasets with table or query sources, fields, primary keys, relationships, dataset- and model-scoped metrics, `ai_context`, `custom_extensions`. Every [Ossie example and compliance fixture](tests/fixtures/ossie) binds.
+- **No fan traps or chasm traps by construction.** Joins only go many→one from a single root. Measures from different grains are computed separately and stacked with `UNION ALL`, never joined to each other ([how](#how-it-works)).
+- **Engine-native output, checked on real engines.** One AST, rendered by [polyglot-sql](https://crates.io/crates/polyglot-sql) for Trino, Athena, StarRocks, ClickHouse, DuckDB, MySQL, Postgres, Snowflake, BigQuery, Databricks, Redshift and 20+ more. Every correctness case runs on **DuckDB, Postgres, Trino, StarRocks and ClickHouse** and must return the same rows. Where an engine answers differently, a small [dialect rule](src/dialect.rs) fixes it (for example, ClickHouse's `lag` returns `0` instead of NULL for the first row).
+- **Window metrics:** running totals, rankings and period-over-period (`SUM(SUM(x)) OVER (…)`, `RANK() OVER (…)`, `LAG`), computed over the grouped result. `describe` tells callers which dimensions each one needs.
+- **Uses vendor expressions when you want them.** A field can carry a portable expression plus `SNOWFLAKE`, `TRINO`, … variants; `--prefer SNOWFLAKE` uses the native one.
+- **Answers in the model's language.** Errors name the problem and the valid choices (`unknown metric 'revenue'; available: total_revenue, …`), so an agent can correct itself. `describe` returns metrics, dimensions and `ai_context` as JSON.
+- **Safe SQL construction.** Model and request content become AST nodes, never SQL text.
+- **Deterministic.** The same model, request and options give byte-identical SQL and the same `request_hash`.
+- **Small and embeddable.** A Rust library plus CLI with no runtime, no server and no Python. Five dependencies.
+
+## Install
+
+```console
+cargo install --git https://github.com/lakeops-org/ossiec
+```
+
+or as a library:
+
+```toml
+[dependencies]
+ossiec = { git = "https://github.com/lakeops-org/ossiec" }
+```
+
+## Quick start
+
+A model ([full file](tests/fixtures/shop/model.yaml)):
+
+```yaml
+version: "0.2.0.dev0"
+name: shop
+datasets:
+  - name: orders
+    source: orders
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: order_id } }
+      - { name: customer_id, expression: { sql: customer_id } }
+      - { name: product_id, expression: { sql: product_id } }
+      - { name: order_date, expression: { sql: order_date }, datatype: Date }
+      - { name: revenue, expression: { sql: amount_cents / 100.0 } }
+      - { name: status, expression: { sql: status } }
+  - name: customers
+    source: SELECT * FROM raw_customers WHERE NOT deleted   # query sources work
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: customer_id } }
+      - { name: region, expression: { sql: region } }
+  - name: products
+    source: products
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: product_id } }
+      - { name: stock, expression: { sql: stock } }
+relationships:
+  - { name: orders_to_customers, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
+  - { name: orders_to_products, from: orders, to: products, from_columns: [product_id], to_columns: [id] }
+metrics:
+  - name: total_revenue
+    expression: { sql: SUM(orders.revenue) }
+  - name: completed_revenue
+    expression: { sql: "SUM(orders.revenue) FILTER (WHERE orders.status = 'completed')" }
+  - name: total_stock
+    expression: { sql: SUM(products.stock) }
+```
+
+Check it, then see what it offers:
+
+```console
+$ ossiec validate shop.yaml
+ok: `shop` — 3 datasets, 2 relationships, 13 metrics (0 not queryable yet)
+
+$ ossiec describe shop.yaml      # metrics, dimensions, ai_context as JSON
+```
+
+Compile a request. This one mixes a fact measure with a one-side measure:
+
+```console
+$ echo '{"metrics": ["total_revenue", "total_stock"], "dimensions": ["customers.region"]}' \
+    | ossiec compile shop.yaml - --dialect duckdb
+warning: FAN_TRAP_RISK: `SUM("products".stock)` is computed over `products` rows de-duplicated by primary key; ...
+```
+
+```sql
+SELECT
+  stacked.d0 AS "customers.region",
+  MAX(stacked.t0) AS "total_revenue",
+  MAX(stacked.t1) AS "total_stock"
+FROM (
+  -- revenue at the order grain
+  SELECT "customers".region AS d0, SUM("orders".amount_cents / 100.0) AS t0, NULL AS t1
+  FROM orders AS "orders"
+  LEFT JOIN (SELECT * FROM raw_customers WHERE NOT deleted) AS "customers"
+    ON "orders".customer_id = "customers".customer_id
+  LEFT JOIN products AS "products" ON "orders".product_id = "products".product_id
+  GROUP BY "customers".region
+  UNION ALL
+  -- stock over distinct (region, product) rows
+  SELECT dedup.d0 AS d0, NULL AS t0, SUM(dedup.c0) AS t1
+  FROM (
+    SELECT DISTINCT "customers".region AS d0, "products".product_id AS k0, "products".stock AS c0
+    FROM orders AS "orders"
+    LEFT JOIN (SELECT * FROM raw_customers WHERE NOT deleted) AS "customers"
+      ON "orders".customer_id = "customers".customer_id
+    LEFT JOIN products AS "products" ON "orders".product_id = "products".product_id
+    WHERE NOT "products".product_id IS NULL
+  ) AS dedup
+  GROUP BY dedup.d0
+) AS stacked
+GROUP BY stacked.d0
+```
+
+*(Condensed and commented for the README; real output is pretty-printed without comments.)*
+
+The same request with `--dialect bigquery`, `clickhouse` or `starrocks` renders that engine's quoting and functions. With no `--dialect`, ossiec emits the model's own source dialect, which is what a downstream translator wants.
+
+### From Rust
+
+```rust
+let graph = ossiec::from_yaml(&std::fs::read_to_string("shop.yaml")?)?; // load + validate once
+let request: ossiec::Request = serde_json::from_str(r#"{
+    "metrics": ["completed_revenue"],
+    "dimensions": ["orders.order_date"],
+    "timeGrain": "month",
+    "filters": [{"field": "orders.order_date", "op": ">=", "value": "2026-01-01"}]
+}"#)?;
+let out = ossiec::compile(&graph, &request, &ossiec::Options {
+    target: Some(ossiec::DialectType::Trino),
+    ..Default::default()
+})?;
+println!("{}", out.sql);       // the statement
+println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
+```
+
+## Requests
+
+```jsonc
+{
+  "metrics": ["total_revenue", "orders.order_count"], // model metrics by name, dataset metrics as dataset.metric
+  "dimensions": ["customers.region", "orders.order_date"],
+  "filters": [
+    {"field": "orders.status", "op": "IN", "values": ["completed", "shipped"]},
+    {"field": "orders.order_date", "op": "BETWEEN", "values": ["2026-01-01", "2026-03-31"]}
+  ],
+  "metricFilters": [{"metric": "total_revenue", "op": ">", "value": 1000}], // HAVING
+  "timeGrain": "month",                    // day | week | month | quarter | year
+  "timeDimension": "orders.order_date",    // only needed when several time dimensions are requested
+  "orderBy": [{"field": "total_revenue", "direction": "desc"}],
+  "limit": 100
+}
+```
+
+Leave out `metrics` to list **dimension values** instead: `{"dimensions": ["customers.region"]}` returns every region in `customers`. Dimensions from several datasets return only the combinations that occur, joined through the fact that links them. Agents use this to filter with real values.
+
+| Filter `op` | Value |
+|---|---|
+| `=` `!=` `<` `<=` `>` `>=` `LIKE` | `value` |
+| `IN` `NOT IN` | `values` (non-empty) |
+| `BETWEEN` | `values`: exactly two |
+| `IS NULL` `IS NOT NULL` | none |
+
+String values compared with `Date` and `DateTime` fields are cast (`CAST('2026-01-01' AS DATE)`), so they work on strict engines like Trino. Unknown request keys are rejected, so a typo like `dimension` fails loudly instead of being ignored.
+
+## How it works
+
+```
+YAML ─load─► Model ─bind─► SemanticGraph ─plan─► LogicalPlan ─lower─► AST ─render─► SQL
+```
+
+1. **Bind** (once per model). Parse every expression and resolve every name with ANSI identifier rules. Split each metric into aggregate *terms* and an outer formula: `SUM(a.x) / NULLIF(SUM(b.y), 0)` becomes two terms and `t0 / NULLIF(t1, 0)`. All problems are reported together.
+2. **Pick a join root.** Find the dataset from which every referenced dataset is reachable along many→one relationships, and `LEFT JOIN` from it. Many→one joins never multiply root rows, and `LEFT` keeps orphan rows in the NULL group instead of dropping them.
+3. **Classify each term.**
+   - A term that reads the root, or that duplicates can't change (`MIN`, `MAX`, `COUNT(DISTINCT …)`), is computed **inline** over the joined rows.
+   - A term that reads only one-side data (`SUM(products.stock)` over an `orders` root) is computed over rows **de-duplicated on that dataset's primary key**, which is the reference strategy in Ossie's relational spec (§9).
+4. **Stack, don't join.** Each strategy becomes a part grouped by the same dimensions. Parts are combined with `UNION ALL` and `MAX` per term, so there's no join predicate between parts to get wrong.
+5. **Windows last.** Window functions in a metric run in the final `SELECT`, over one row per group: `SUM(SUM(x)) OVER (ORDER BY d)` becomes `SUM(base.t0) OVER (ORDER BY base.d0)`. Fields a window partitions or orders by must be requested dimensions. When windows are present, `metricFilters` apply to the finished rows, so "rank ≤ 3" means the top three by the full ranking.
+6. **Render.** Build one polyglot AST and apply the target's [dialect rules](src/dialect.rs) (only where a real-engine test showed polyglot's rendering answers differently). Generate it in the source dialect, then transpile to the target.
+
+If ossiec can't make a request correct, it refuses it rather than guessing:
+
+| Situation | Response |
+|---|---|
+| Two facts with no common root (orders *and* support tickets by region) | `not supported yet: … independent facts` |
+| A dataset reachable two ways (departure *and* arrival airport) | `… reachable in more than one way (departs_from \| arrives_at)` |
+| A one-side measure on a dataset with no `primary_key` | `… declare a primary_key on 'products'` |
+| A window metric without the dimension it orders by | `metric 'cumulative_revenue' is a window over 'orders.order_date'; add it to 'dimensions'` |
+
+The full rationale is in **[docs/DESIGN.md](docs/DESIGN.md)**.
+
+## Ossie support
+
+| Spec feature | Status |
+|---|---|
+| Model at document root, `version`, `name`, `description`, `ai_context` | ✅ |
+| Dataset `source` as a table reference or a query | ✅ |
+| `primary_key`, `unique_keys` (validated) | ✅ |
+| Field expressions over source columns, `datatype`, `dimension.is_time` with spec defaults | ✅ |
+| Relationships (`from` many → `to` one, composite keys) | ✅ |
+| Dataset-scoped metrics (unqualified names) and model-scoped metrics (`dataset.field`) | ✅ |
+| `expression.sql` / `OSSIE_SQL_2026`, `ANSI_SQL`, vendor SQL dialects | ✅ |
+| Non-SQL dialects (`DAX`, `MDX`, `TABLEAU`, …) | Ignored (a field needs at least one SQL form) |
+| `FILTER (WHERE …)`, `COUNT(DISTINCT …)`, ratios, `CASE`, scalar functions | ✅ |
+| ANSI identifier rules (bare names case-insensitive, quoted exact) | ✅ |
+| Window functions in metrics (`OVER`, `RANK`, `LAG`, running totals) | ✅ |
+| Ossie ontology documents (Layer 4) | Rejected with a clear error |
+| Pre-0.2 `semantic_model:` documents | Rejected with a clear error |
+
+One leniency: Ossie requires `dataset.field` in model-scoped metrics, but the compliance fixtures include a bare form (`SUM(amount)`). ossiec accepts a bare name when exactly one dataset has that field, and warns.
+
+## Testing
+
+```console
+cargo test                        # everything (the first run builds DuckDB, a few minutes)
+scripts/engines.sh up && cargo test --test engines -- --ignored   # same cases on Postgres, Trino, StarRocks, ClickHouse
+cargo test --test correctness     # answers vs hand-written SQL on DuckDB
+UPDATE_GOLDEN=1 cargo test --test golden   # re-snapshot SQL after an intended change
+scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo test
+```
+
+| Suite | What it proves |
+|---|---|
+| [`correctness`](tests/correctness.rs) | **The numbers are right.** 15 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
+| [`engines`](tests/engines.rs) | **Every engine agrees.** The same 15 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1 and ClickHouse 25.8 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
+| [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
+| [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric compiles, and there's one test per validation rule. |
+| [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests) without `FILTER`, determinism. |
+
+## Known issues
+
+**Semantics to know**
+- **De-duplicated groups overlap.** A product sold in two regions counts in both, so per-group values don't sum to a grand total. ossiec warns (`FAN_TRAP_RISK`). Products that never sold aren't in any group; query the measure without dimensions for the catalogue total.
+- **Window metrics see only the rows in the result.** A running total over a filtered date range starts at the range's first row, and `stock_share` is a share of the groups returned. With windows present, metric filters apply after the window.
+- **Division is always true division.** `/` in portable expressions casts the numerator to `DOUBLE` unless one side is a fractional literal, so `COUNT(a) / COUNT(b)` isn't truncated on Postgres and Trino. Ratios therefore come back as floating point. `amount_cents / 100.0` stays exact.
+- **NULL ordering** follows generic SQL on every engine: NULLs sort first in ascending order (`NULLS FIRST` is emitted where needed).
+- **Time grains ignore time zones.** Truncating a `DateTimeTz` uses the engine's session time zone.
+
+**Refused for now:** independent facts (orders *and* tickets by region), role-playing dimensions (one dataset joined twice), nested windows.
+
+**Spec leniency:** bare names in model-scoped metrics are accepted with a warning. The rule that a `FILTER` predicate may only use the aggregate's own dataset isn't validated yet.
+
+**Engine coverage:** answers are verified on DuckDB, Postgres, Trino, StarRocks and ClickHouse. Athena, Snowflake, BigQuery, Databricks, Redshift and MySQL are compile-checked only. See [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md) to move an engine up.
+
+**Downstream translators:** if you emit `generic` SQL (no `--dialect`) and translate it elsewhere, ossiec's [dialect rules](src/dialect.rs) don't apply. For example, a translator that maps `LAG` to ClickHouse's `lag` gets `0` instead of NULL for the first row. Compile for the engine instead.
+
+**polyglot-sql 0.13.4 bugs, all guarded:**
+- its `QUALIFY` emulation produces invalid SQL;
+- it passes `UNION ALL BY NAME` and `FILTER (WHERE …)` through to engines that lack them;
+- its generic generator upper-cases function names.
+
+ossiec never emits these constructs (checked for 11 engines), and it renders with function case preserved.
+
+## Using ossiec in a query engine
+
+ossiec is a library first, built to be embedded in query engines, SQL proxies and agent tool servers.
+
+- **Compile for the engine you'll run on.** Resolve the target first, then call `compile` with `Options { target: Some(..), .. }`. You get engine-ready SQL with ossiec's [dialect rules](src/dialect.rs) applied.
+- **Or translate downstream.** With `target: None`, you get SQL in the model's source dialect (`Compiled::source_dialect`) to hand to your own translator. ossiec's dialect rules don't apply on that path.
+- **Apply your own governance.** Row filters, column masks and permissions work on the generated SQL like on any other query, since it references the model's physical tables.
+- **For agents,** `describe()` returns metrics, dimensions and `ai_context` as JSON, and a request without metrics lists dimension values for filters.
+
+## Roadmap
+
+- [x] Ossie `0.2` loading, validation and identifier rules
+- [x] Join-root planning, inline and primary-key de-duplicated terms, `UNION ALL` stacking
+- [x] `FILTER` lowering, time grains, metric filters, vendor-dialect preference
+- [x] CLI: `validate`, `describe`, `compile`
+- [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse
+- [x] Window metrics (cumulative, rank, period-over-period)
+- [ ] Multi-fact requests across conformed dimensions
+- [ ] Role-playing dimensions (path selection)
+- [ ] Ossie Layer 2: SQL with `AGG(measure)`
+- [ ] Publish to crates.io
+
+## Contributing
+
+Adding or verifying an engine? Follow **[docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md)**.
+
+
+Issues and PRs are welcome. Before opening a PR:
+
+```console
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+New planner behaviour needs a **correctness** case (a seed row that would expose the bug, plus reference SQL), not just a golden file.
+
+## Acknowledgements
+
+- [Apache Ossie](https://github.com/apache/ossie): the spec and the example models vendored in `tests/fixtures/ossie` (Apache-2.0).
+- [polyglot-sql](https://crates.io/crates/polyglot-sql): parsing, AST and multi-dialect generation.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

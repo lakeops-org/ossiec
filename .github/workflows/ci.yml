@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Bundled DuckDB is built from source for the correctness tier; the first run takes a few minutes.
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+
+  engines:
+    # Same correctness cases on Postgres, Trino, StarRocks and ClickHouse.
+    # Large images (StarRocks all-in-one is ~5 GB); runs after the fast job passes.
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/engines.sh up
+      - run: cargo test --test engines -- --ignored
+      - if: always()
+        run: scripts/engines.sh down

@@ -1,0 +1,3 @@
+/target
+*.duckdb
+.DS_Store

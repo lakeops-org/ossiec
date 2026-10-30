@@ -1,0 +1,76 @@
+version: "0.2.0.dev0"
+name: shop
+description: Orders, customers and products. The test model for ossiec's correctness suite.
+ai_context:
+  instructions: Revenue is in dollars. Use completed_revenue for recognised revenue.
+datasets:
+  - name: orders
+    source: orders
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: order_id }, datatype: Integer }
+      - { name: customer_id, expression: { sql: customer_id }, datatype: Integer }
+      - { name: product_id, expression: { sql: product_id }, datatype: Integer }
+      - { name: order_date, expression: { sql: order_date }, datatype: Date, dimension: {} }
+      - { name: revenue, expression: { sql: amount_cents / 100.0 }, datatype: Decimal }
+      - { name: status, expression: { sql: status }, datatype: String, dimension: {} }
+    metrics:
+      - name: order_count
+        expression: { sql: COUNT(*) }
+        description: Number of orders
+
+  - name: customers
+    # A query source: soft-deleted customers are not customers.
+    source: SELECT * FROM raw_customers WHERE NOT deleted
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: customer_id }, datatype: Integer }
+      - { name: name, expression: { sql: name }, datatype: String }
+      - { name: region, expression: { sql: region }, datatype: String, dimension: {} }
+      - { name: segment, expression: { sql: segment }, datatype: String, dimension: {} }
+
+  - name: products
+    source: products
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: product_id }, datatype: Integer }
+      - { name: category, expression: { sql: category }, datatype: String, dimension: {} }
+      - { name: stock, expression: { sql: stock }, datatype: Integer }
+
+relationships:
+  - { name: orders_to_customers, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
+  - { name: orders_to_products, from: orders, to: products, from_columns: [product_id], to_columns: [id] }
+
+metrics:
+  - name: total_revenue
+    expression: { sql: SUM(orders.revenue) }
+    description: Gross revenue in dollars
+    ai_context: { synonyms: [sales, gross revenue, GMV] }
+  - name: completed_revenue
+    expression: { sql: "SUM(orders.revenue) FILTER (WHERE orders.status = 'completed')" }
+  - name: avg_order_value
+    expression: { sql: AVG(orders.revenue) }
+  - name: buying_customers
+    expression: { sql: COUNT(DISTINCT customers.id) }
+  - name: revenue_per_customer
+    expression: { sql: "SUM(orders.revenue) / NULLIF(COUNT(DISTINCT customers.id), 0)" }
+  - name: total_stock
+    expression: { sql: SUM(products.stock) }
+    description: Units in stock
+  - name: revenue_per_stock_unit
+    expression: { sql: "SUM(orders.revenue) / NULLIF(SUM(products.stock), 0)" }
+  # Window metrics: computed over the grouped result.
+  - name: cumulative_revenue
+    expression: { sql: "SUM(SUM(orders.revenue)) OVER (ORDER BY orders.order_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)" }
+    description: Running total of revenue
+  - name: revenue_change
+    expression: { sql: "SUM(orders.revenue) - LAG(SUM(orders.revenue), 1) OVER (ORDER BY orders.order_date)" }
+    description: Revenue change from the previous period
+  - name: revenue_rank_in_region
+    expression: { sql: "RANK() OVER (PARTITION BY customers.region ORDER BY SUM(orders.revenue) DESC)" }
+  - name: stock_share
+    expression: { sql: "SUM(products.stock) / SUM(SUM(products.stock)) OVER ()" }
+    description: Share of all stock (over the groups in the result)
+  # A ratio of two integer counts: true division on every engine (Postgres and Trino would truncate).
+  - name: orders_per_customer
+    expression: { sql: "COUNT(orders.id) / NULLIF(COUNT(DISTINCT customers.id), 0)" }
