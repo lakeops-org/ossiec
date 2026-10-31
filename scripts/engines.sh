@@ -11,7 +11,7 @@ set -euo pipefail
 
 TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:484}"
 STARROCKS_IMAGE="${STARROCKS_IMAGE:-starrocks/allin1-ubuntu:4.1.6}"
-CLICKHOUSE_IMAGE="${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8}"
+CLICKHOUSE_IMAGE="${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8}"
 # Debian-based on purpose: its en_US.UTF-8 collation sorts like real deployments
 # (Alpine/musl sorts by byte), which the string_ordering case depends on.
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"
