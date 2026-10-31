@@ -14,6 +14,19 @@ datasets:
       - { name: order_date, expression: { sql: order_date }, datatype: Date, dimension: {} }
       - { name: revenue, expression: { sql: amount_cents / 100.0 }, datatype: Decimal }
       - { name: status, expression: { sql: status }, datatype: String, dimension: {} }
+      - { name: amount_cents, expression: { sql: amount_cents }, datatype: Integer }
+      # A portable expression plus one native expression per engine; requests can prefer the engine's own.
+      - name: order_yyyymm
+        datatype: Integer
+        expression:
+          sql: "EXTRACT(YEAR FROM order_date) * 100 + EXTRACT(MONTH FROM order_date)"
+          dialects:
+            - { dialect: DUCKDB, expression: "CAST(strftime(order_date, '%Y%m') AS INTEGER)" }
+            - { dialect: POSTGRES, expression: "CAST(to_char(order_date, 'YYYYMM') AS INTEGER)" }
+            - { dialect: TRINO, expression: "CAST(date_format(order_date, '%Y%m') AS INTEGER)" }
+            - { dialect: STARROCKS, expression: "CAST(date_format(order_date, '%Y%m') AS INT)" }
+            - { dialect: CLICKHOUSE, expression: "toYYYYMM(order_date)" }
+            - { dialect: MYSQL, expression: "CAST(DATE_FORMAT(order_date, '%Y%m') AS UNSIGNED)" }
     metrics:
       - name: order_count
         expression: { sql: COUNT(*) }
@@ -74,3 +87,14 @@ metrics:
   # A ratio of two integer counts: true division on every engine (Postgres and Trino would truncate).
   - name: orders_per_customer
     expression: { sql: "COUNT(orders.id) / NULLIF(COUNT(DISTINCT customers.id), 0)" }
+  # One-side COUNT and AVG: computed over primary-key de-duplicated rows.
+  - name: products_sold
+    expression: { sql: COUNT(products.id) }
+    description: Distinct products sold in the group
+  - name: customer_count
+    expression: { sql: COUNT(customers.id) }
+  - name: avg_stock
+    expression: { sql: AVG(products.stock) }
+  # AVG of an integer column: engines disagree on the result type.
+  - name: avg_amount_cents
+    expression: { sql: AVG(orders.amount_cents) }

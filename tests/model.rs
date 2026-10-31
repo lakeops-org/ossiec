@@ -2,7 +2,7 @@
 
 use ossiec::Error;
 
-fn fixture(name: &str) -> String {
+fn fixture_file(name: &str) -> String {
     std::fs::read_to_string(format!(
         "{}/tests/fixtures/ossie/{name}",
         env!("CARGO_MANIFEST_DIR")
@@ -25,7 +25,7 @@ fn every_ossie_example_model_binds() {
         "m3_filtered_agg_bare.ossie.yaml",
         "m3_filtered_agg_qualified.ossie.yaml",
     ] {
-        ossiec::from_yaml(&fixture(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+        ossiec::from_yaml(&fixture_file(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
     }
 }
 
@@ -39,7 +39,7 @@ fn every_compliance_metric_compiles() {
         "m2_aggregates_qualified",
         "m3_filtered_agg_qualified",
     ] {
-        let g = ossiec::from_yaml(&fixture(&format!("{f}.ossie.yaml"))).unwrap();
+        let g = ossiec::from_yaml(&fixture_file(&format!("{f}.ossie.yaml"))).unwrap();
         for m in g.describe().metrics {
             let req = ossiec::Request {
                 metrics: vec![m.name.clone()],
@@ -53,7 +53,7 @@ fn every_compliance_metric_compiles() {
 
 #[test]
 fn tpcds_window_metrics_compile_with_their_dimensions() {
-    let g = ossiec::from_yaml(&fixture("tpcds_semantic_model.yaml")).unwrap();
+    let g = ossiec::from_yaml(&fixture_file("tpcds_semantic_model.yaml")).unwrap();
     for m in g.describe().metrics {
         assert!(m.queryable, "{}", m.name);
         let req = ossiec::Request {
@@ -68,7 +68,7 @@ fn tpcds_window_metrics_compile_with_their_dimensions() {
 
 #[test]
 fn ontology_and_legacy_documents_are_rejected_clearly() {
-    let e = ossiec::load(&fixture("flights.yaml"))
+    let e = ossiec::load(&fixture_file("flights.yaml"))
         .unwrap_err()
         .to_string();
     assert!(e.contains("ontology"), "{e}");
@@ -150,4 +150,69 @@ fn bare_identifiers_match_case_insensitively_quoted_ones_exactly() {
     let bad = yaml.replace("\"Amount\")", "\"amount\")");
     assert_ne!(bad, yaml);
     assert!(invalid(&bad).contains("not a field"));
+}
+
+/// The Ossie compliance fixtures (M0-M3), executed: every metric compiled for
+/// DuckDB and run against `samples.sales.orders`, whose NULL amount and NULL
+/// customer exercise each aggregate's NULL handling.
+#[test]
+fn compliance_fixtures_execute_with_expected_answers() {
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "ATTACH ':memory:' AS samples; CREATE SCHEMA samples.sales;
+         CREATE TABLE samples.sales.orders (order_id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), status VARCHAR);
+         INSERT INTO samples.sales.orders VALUES
+           (1, 10, 100.00, 'completed'), (2, 10, 50.50, 'returned'), (3, 11, NULL, 'completed'),
+           (4, 12, 25.25, 'completed'), (5, NULL, 10.00, 'open');",
+    )
+    .unwrap();
+    let expected: &[(&str, &str, f64)] = &[
+        ("m0_ansi_qualified", "total_amount", 185.75),
+        ("m0_ossiesql_qualified", "total_amount", 185.75),
+        ("m0_sum_bare", "total_amount", 185.75),
+        ("m1_scalar_field", "total_amount", 185.75),
+        ("m2_aggregates_qualified", "sum_amount", 185.75),
+        ("m2_aggregates_qualified", "count_orders", 5.0),
+        ("m2_aggregates_qualified", "distinct_customers", 3.0),
+        ("m2_aggregates_qualified", "avg_amount", 46.4375), // NULL amount excluded: 185.75 / 4
+        ("m2_aggregates_qualified", "min_amount", 10.0),
+        ("m2_aggregates_qualified", "max_amount", 100.0),
+        ("m2_aggregates_bare", "avg_amount", 46.4375),
+        ("m3_filtered_agg_qualified", "completed_amount", 125.25), // NULL amount adds nothing
+        ("m3_filtered_agg_bare", "completed_amount", 125.25),
+    ];
+    for (fixture, metric, want) in expected {
+        let g = ossiec::from_yaml(&fixture_file(&format!("{fixture}.ossie.yaml"))).unwrap();
+        let req = ossiec::Request {
+            metrics: vec![metric.to_string()],
+            ..Default::default()
+        };
+        let opts = ossiec::Options {
+            target: Some(ossiec::DialectType::DuckDB),
+            ..Default::default()
+        };
+        let sql = ossiec::compile(&g, &req, &opts).unwrap().sql;
+        let got: f64 = db
+            .query_row(&format!("SELECT CAST(({sql}) AS DOUBLE)"), [], |r| r.get(0))
+            .unwrap_or_else(|e| panic!("{fixture}/{metric}: {e}\n{sql}"));
+        assert!(
+            (got - want).abs() < 1e-9,
+            "{fixture}/{metric}: got {got}, want {want}\n{sql}"
+        );
+    }
+    // The scalar field computes per row: amount * 1.1.
+    let g = ossiec::from_yaml(&fixture_file("m1_scalar_field.ossie.yaml")).unwrap();
+    let req: ossiec::Request = serde_json::from_str(r#"{"dimensions": ["sales.amount_with_tax"], "filters": [{"field": "sales.amount", "op": "=", "value": 100}]}"#).unwrap();
+    let opts = ossiec::Options {
+        target: Some(ossiec::DialectType::DuckDB),
+        ..Default::default()
+    };
+    let sql = ossiec::compile(&g, &req, &opts).unwrap().sql;
+    let got: f64 = db
+        .query_row(&format!("SELECT CAST(({sql}) AS DOUBLE)"), [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        (got - 110.0).abs() < 1e-9,
+        "amount_with_tax: got {got}\n{sql}"
+    );
 }

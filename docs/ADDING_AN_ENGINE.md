@@ -6,8 +6,8 @@ ossiec renders SQL with [polyglot-sql](https://github.com/tobilg/polyglot), so c
 
 | Level | Meaning | Engines today |
 |---|---|---|
-| **Executed** | Every correctness case runs on the engine in `tests/engines.rs` and returns exactly DuckDB's reference rows, including types and NULLs | DuckDB, Postgres, Trino, StarRocks, ClickHouse |
-| **Compiled** | Requests compile and contain no constructs the engine lacks (`tests/requests.rs`), but nothing has run there | Athena, Snowflake, BigQuery, Databricks, Redshift, MySQL |
+| **Executed** | Every correctness case runs on the engine in `tests/engines.rs` and returns exactly DuckDB's reference rows, including types and NULLs | DuckDB, Postgres, Trino, StarRocks, ClickHouse, MySQL |
+| **Compiled** | Requests compile and contain no constructs the engine lacks (`tests/requests.rs`), but nothing has run there | Athena, Snowflake, BigQuery, Databricks, Redshift |
 | **Renderable** | polyglot has the dialect; nothing in ossiec checks it | about 25 more |
 
 Only "executed" is a claim about correctness.
@@ -33,12 +33,14 @@ This takes roughly half a day to a day, mostly spent on the test harness.
    |---|---|
    | The seed or the output format | The harness. Not a product bug. |
    | The engine differs, and the fix is right on every engine | The planner, for example the `CAST(DATE_TRUNC(...) AS DATE)` on `Date` grains, or true division |
-   | The engine differs, and only it needs the fix | A rule in [`src/dialect.rs`](../src/dialect.rs): `adapt` before rendering, `finish` after |
+   | The engine differs, and only it needs the fix | A rule in that engine's file, [`src/dialect/<engine>.rs`](../src/dialect/) (create it if needed): `adapt` before rendering, `finish` after. Add its arms in `src/dialect/mod.rs` |
    | polyglot renders it wrong | A rule or a guard in ossiec, **and** an upstream issue |
 
    Every rule's doc comment names the engine case that proves it's needed.
 5. **Make sure the test can fail.** Disable your fix and check that the case fails. A case that passes either way proves nothing; that's how the gaps in the ClickHouse `join_use_nulls` evidence were caught.
-6. **Lock it in.**
+6. **Run TPC-DS.** Add the engine to `load()` in [`tests/tpcds.rs`](../tests/tpcds.rs) (CSV from DuckDB, then the engine's bulk loader) and a `sweep(Engine::New)` test. If a reference fails rather than ossiec's SQL, make the reference portable instead of special-casing the engine.
+7. **Fuzz it.** Add a `fuzz(Engine::New, count(40))` test in [`tests/fuzz.rs`](../tests/fuzz.rs).
+8. **Lock it in.**
    - Add a golden for a representative request in [`tests/golden.rs`](../tests/golden.rs).
    - Add the dialect to the compile sweep in [`tests/requests.rs`](../tests/requests.rs).
    - Add the container to the CI `engines` job if the image is a reasonable size.
@@ -67,6 +69,7 @@ These need no work. An Ossie `dialects:` entry named after any polyglot dialect 
 - [ ] Container and readiness check in `scripts/engines.sh`
 - [ ] `Engine` variant, seed DDL and a runner that keeps NULL distinct from `''`
 - [ ] Every case passes in `cargo test --test engines -- --ignored <engine>`
-- [ ] Each fix lives in the planner, `src/dialect.rs`, or upstream, and names its evidence
+- [ ] TPC-DS passes in `cargo test --test tpcds -- --ignored <engine>`
+- [ ] Each fix lives in the planner, `src/dialect/<engine>.rs`, or upstream, and names its evidence
 - [ ] Each fix was disabled once to confirm its case fails
 - [ ] Golden file, compile-sweep entry, CI job, README support level

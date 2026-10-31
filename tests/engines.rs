@@ -10,103 +10,9 @@
 
 mod common;
 
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-use common::{comparable, compile, duckdb, duckdb_rows, norm_text, seed_sql, Engine, CASES};
-
-/// Run SQL through the engine's own CLI inside its container. Every client prints
-/// NULL distinctly from '' (psql `-P null=NULL`, ClickHouse `\\N`, mysql `NULL`, Trino JSON `null`).
-fn run(engine: Engine, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let (container, args, stdin): (&str, Vec<&str>, Option<String>) = match engine {
-        Engine::Postgres => (
-            "ossiec-postgres",
-            vec![
-                "psql",
-                "-U",
-                "postgres",
-                "-X",
-                "-q",
-                "-At",
-                "-F",
-                "\t",
-                "-P",
-                "null=NULL",
-                "-v",
-                "ON_ERROR_STOP=1",
-            ],
-            Some(sql.to_string()),
-        ),
-        Engine::ClickHouse => (
-            "ossiec-clickhouse",
-            // No --join_use_nulls: ossiec's SQL must carry `SETTINGS join_use_nulls = 1` itself.
-            vec!["clickhouse-client", "--multiquery", "--format", "TSV"],
-            Some(sql.to_string()),
-        ),
-        Engine::Trino => (
-            "ossiec-trino",
-            vec![
-                "trino",
-                "--catalog",
-                "memory",
-                "--schema",
-                "default",
-                // JSON: Trino's TSV and CSV print NULL and '' identically.
-                "--output-format",
-                "JSON",
-                "--execute",
-                sql,
-            ],
-            None,
-        ),
-        Engine::StarRocks => (
-            "ossiec-starrocks",
-            vec!["mysql", "-h127.0.0.1", "-P9030", "-uroot", "-N", "-B"],
-            Some(format!(
-                "CREATE DATABASE IF NOT EXISTS ossiec;\nUSE ossiec;\n{sql};"
-            )),
-        ),
-        Engine::DuckDb => unreachable!("DuckDB runs in-process"),
-    };
-    let mut cmd = Command::new("docker");
-    cmd.arg("exec").arg("-i").arg(container).args(&args);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("docker: {e}"))?;
-    let mut pipe = child.stdin.take().expect("stdin");
-    if let Some(s) = stdin {
-        pipe.write_all(s.as_bytes()).map_err(|e| e.to_string())?;
-    }
-    drop(pipe);
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() || stderr.contains("ERROR") {
-        return Err(stderr.trim().to_string());
-    }
-    let lines = String::from_utf8_lossy(&out.stdout);
-    let lines = lines.lines().filter(|l| !l.is_empty());
-    if engine != Engine::Trino {
-        return Ok(lines
-            .map(|l| l.split('\t').map(norm_text).collect())
-            .collect());
-    }
-    lines
-        .map(|l| {
-            let row: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(l).map_err(|e| format!("trino JSON: {e}: {l}"))?;
-            Ok(row
-                .into_values()
-                .map(|v| match v {
-                    serde_json::Value::Null => "NULL".to_string(),
-                    serde_json::Value::String(s) => norm_text(&s),
-                    other => norm_text(&other.to_string()),
-                })
-                .collect())
-        })
-        .collect()
-}
+use common::{comparable, compile, duckdb, duckdb_rows, run, seed_sql, Engine, CASES};
 
 static SEEDED: Mutex<Vec<Engine>> = Mutex::new(Vec::new());
 
@@ -178,4 +84,10 @@ fn starrocks() {
 #[ignore = "needs Docker: scripts/engines.sh up"]
 fn clickhouse() {
     sweep(Engine::ClickHouse);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn mysql() {
+    sweep(Engine::MySql);
 }

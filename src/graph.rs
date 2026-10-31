@@ -83,6 +83,11 @@ pub(crate) struct Term {
     pub datasets: BTreeSet<usize>,
     /// `MIN`, `MAX`, `COUNT(DISTINCT ...)` and friends: duplicated input rows can't change them.
     pub dup_insensitive: bool,
+    /// `COUNT` and friends: over no rows the answer is 0, not NULL (spec §8.1).
+    pub zero_if_empty: bool,
+    /// The result's type family (`NUMERIC`, `TEXT`, `DATE`, ...), when known.
+    /// Engines that can't type a bare NULL in a UNION need it.
+    pub null_type: Option<&'static str>,
     /// Generated SQL of `ast`; identical aggregates across metrics share one term.
     pub key: String,
 }
@@ -172,20 +177,35 @@ fn vendor_dialect(name: &str) -> Option<DialectType> {
 /// Trino truncate integer division (`7 / 2 = 3`), so a ratio of counts would
 /// read 0 there; DuckDB, StarRocks and ClickHouse return 3.5. When neither side
 /// is a fractional literal (`x / 100.0` is already exact, and keeps DECIMAL
-/// precision for money), the numerator is cast to DOUBLE.
+/// precision for money), the numerator is cast to DOUBLE. A non-literal
+/// divisor is wrapped in `NULLIF(…, 0)`, so dividing by zero gives NULL on every engine.
 /// Evidence: engine case `integer_ratio`.
 fn true_division(ast: Expression) -> Expression {
     use polyglot_sql::expressions::Literal;
     let fractional = |e: &Expression| matches!(e, Expression::Literal(l) if matches!(l.as_ref(), Literal::Number(n) if n.contains(['.', 'e', 'E'])));
+    use polyglot_sql::builder::{cast, func, lit, Expr};
+    let take = |e: &mut Expression| {
+        Expr(std::mem::replace(
+            e,
+            Expression::Null(polyglot_sql::expressions::Null),
+        ))
+    };
     transform(ast, &|e| {
         Ok(Some(match e {
-            Expression::Div(mut d) if !fractional(&d.left) && !fractional(&d.right) => {
-                let left = std::mem::replace(
-                    &mut d.left,
-                    Expression::Null(polyglot_sql::expressions::Null),
-                );
-                d.left = polyglot_sql::builder::cast(polyglot_sql::builder::Expr(left), "DOUBLE")
-                    .into_inner();
+            Expression::Div(mut d) => {
+                if !fractional(&d.left) && !fractional(&d.right) {
+                    d.left = cast(take(&mut d.left), "DOUBLE").into_inner();
+                }
+                // x / 0 is NULL everywhere, instead of an error (Postgres,
+                // MySQL strict) or NaN/Infinity (Trino, ClickHouse doubles).
+                let guarded = match &d.right {
+                    Expression::Literal(_) | Expression::NullIf(_) | Expression::Nullif(_) => true,
+                    Expression::Function(f) => f.name.eq_ignore_ascii_case("NULLIF"),
+                    _ => false,
+                };
+                if !guarded {
+                    d.right = func("NULLIF", [take(&mut d.right), lit(0)]).into_inner();
+                }
                 Expression::Div(d)
             }
             other => other,
@@ -269,7 +289,7 @@ pub(crate) fn lookup<'a>(
 }
 
 /// Qualify the bare source columns of a field expression with the dataset alias.
-fn qualify(ast: Expression, dataset: &str) -> Expression {
+fn qualify(ast: Expression, dataset: &str, alias: &str) -> Expression {
     transform(ast, &|e| {
         Ok(Some(match e {
             Expression::Column(mut c) => {
@@ -277,7 +297,7 @@ fn qualify(ast: Expression, dataset: &str) -> Expression {
                     .as_ref()
                     .is_none_or(|t| t.name.eq_ignore_ascii_case(dataset))
                 {
-                    c.table = Some(Identifier::quoted(dataset));
+                    c.table = Some(Identifier::quoted(alias));
                 }
                 Expression::Column(c)
             }
@@ -583,6 +603,29 @@ fn lower_filters(e: Expression) -> Result<Expression> {
     .map_err(|e| Error::Internal(e.to_string()))
 }
 
+/// Type family of an aggregate's result: numeric for counting and arithmetic
+/// aggregates; for MIN/MAX/ANY_VALUE, the type of the one field they read.
+fn null_type(e: &Expression, datatypes: &BTreeSet<Option<String>>) -> Option<&'static str> {
+    match e {
+        Expression::Min(_) | Expression::Max(_) | Expression::AnyValue(_) => {
+            let mut it = datatypes.iter();
+            match (it.next(), it.next()) {
+                (Some(Some(d)), None) => match d.to_ascii_lowercase().as_str() {
+                    "integer" | "decimal" | "float" => Some("NUMERIC"),
+                    "string" => Some("TEXT"),
+                    "date" => Some("DATE"),
+                    "datetime" | "datetimetz" => Some("TIMESTAMP"),
+                    "boolean" => Some("BOOLEAN"),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Expression::AggregateFunction(_) => None,
+        _ => Some("NUMERIC"),
+    }
+}
+
 fn dup_insensitive(e: &Expression) -> bool {
     macro_rules! distinct {
         ($e:expr, $($v:ident),*) => {
@@ -667,26 +710,75 @@ impl SemanticGraph {
 
     /// The field's SQL in the chosen dialect, qualified by its dataset alias.
     pub(crate) fn field_sql(&self, ds: usize, f: usize, ctx: &mut Ctx) -> Expression {
-        let d = &self.datasets[ds];
-        // polyglot parenthesizes by precedence when generating, so no Paren node is needed.
-        qualify(ctx.pick(&d.fields[f].variants).ast.clone(), &d.name)
+        self.field_sql_as(ds, f, &self.datasets[ds].name, ctx)
     }
 
-    /// Resolve `dataset.field` (ANSI identifier rules on both parts).
-    pub(crate) fn field_by_name(&self, name: &str) -> Result<(usize, usize)> {
+    /// The field's SQL, qualified by `alias` (a role alias, or an unmatched-rows alias).
+    pub(crate) fn field_sql_as(
+        &self,
+        ds: usize,
+        f: usize,
+        alias: &str,
+        ctx: &mut Ctx,
+    ) -> Expression {
+        let d = &self.datasets[ds];
+        // polyglot parenthesizes by precedence when generating, so no Paren node is needed.
+        qualify(ctx.pick(&d.fields[f].variants).ast.clone(), &d.name, alias)
+    }
+
+    /// The dataset's `FROM` item under `alias`.
+    pub(crate) fn source_as(&self, ds: usize, alias: &str) -> Expression {
+        let mut e = self.datasets[ds].source.clone();
+        match &mut e {
+            Expression::Table(t) => t.alias = Some(Identifier::quoted(alias)),
+            Expression::Subquery(s) => s.alias = Some(Identifier::quoted(alias)),
+            _ => {}
+        }
+        e
+    }
+
+    /// Resolve `dataset.field`, or `relationship.field` for the dataset that
+    /// relationship leads to, playing that role (ANSI identifier rules).
+    /// Returns (dataset, field, role relationship).
+    pub(crate) fn field_by_name(&self, name: &str) -> Result<(usize, usize, Option<usize>)> {
         let c = match sql::parse(name, DialectType::Generic) {
             Ok(Expression::Column(c)) if c.table.is_some() => c,
             _ => {
                 return Err(Error::Request(format!(
-                    "`{name}` is not a field reference; use `dataset.field`"
+                    "`{name}` is not a field reference; use `dataset.field` or `relationship.field`"
                 )))
             }
         };
-        self.resolve_column(&c, None, &mut Ctx::default())
+        let t = c.table.as_ref().expect("checked above");
+        let is_dataset = lookup(
+            self.datasets.iter().map(|d| d.name.as_str()),
+            &t.name,
+            t.quoted,
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        let role = if is_dataset {
+            None
+        } else {
+            lookup(self.rels.iter().map(|r| r.name.as_str()), &t.name, t.quoted)
+                .map_err(Error::Request)?
+        };
+        let c = match role {
+            Some(r) => {
+                let mut c = c.clone();
+                c.table = Some(Identifier::quoted(&self.datasets[self.rels[r].to].name));
+                c
+            }
+            None => c,
+        };
+        let (ds, f) = self
+            .resolve_column(&c, None, &mut Ctx::default())
             .map_err(|e| match e {
                 Error::InvalidModel(v) => Error::Request(v.join("; ")),
                 other => other,
-            })
+            })?;
+        Ok((ds, f, role))
     }
 
     pub(crate) fn metric_by_name(&self, name: &str) -> Result<usize> {
@@ -947,6 +1039,7 @@ impl SemanticGraph {
                 return Err(bad("aggregates can only be nested inside a window function (SUM(SUM(x)) OVER (...))"));
             }
             let datasets = RefCell::new(BTreeSet::new());
+            let datatypes = RefCell::new(BTreeSet::new());
             let failure = RefCell::new(None);
             let ast = transform(raw.clone(), &|e| {
                 let Expression::Column(c) = e else {
@@ -956,6 +1049,9 @@ impl SemanticGraph {
                 Ok(Some(match self.resolve_column(&c, info.owner, &mut ctx) {
                     Ok((ds, f)) => {
                         datasets.borrow_mut().insert(ds);
+                        datatypes
+                            .borrow_mut()
+                            .insert(self.datasets[ds].fields[f].datatype.clone());
                         self.field_sql(ds, f, &mut ctx)
                     }
                     Err(err) => {
@@ -979,8 +1075,17 @@ impl SemanticGraph {
             }
             let key = polyglot_sql::generate(&ast, DialectType::Generic)
                 .map_err(|e| Error::Internal(e.to_string()))?;
+            let datatypes = datatypes.into_inner();
             terms.push(Term {
+                null_type: null_type(&raw, &datatypes),
                 dup_insensitive: dup_insensitive(&raw),
+                zero_if_empty: matches!(
+                    raw,
+                    Expression::Count(_)
+                        | Expression::CountIf(_)
+                        | Expression::ApproxDistinct(_)
+                        | Expression::ApproxCountDistinct(_)
+                ),
                 ast,
                 datasets,
                 key,

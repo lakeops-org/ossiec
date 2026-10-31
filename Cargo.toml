@@ -9,7 +9,6 @@ repository = "https://github.com/lakeops-org/ossiec"
 readme = "README.md"
 keywords = ["ossie", "semantic-layer", "sql", "metrics", "compiler"]
 categories = ["database", "compilers", "command-line-utilities"]
-exclude = ["tests/fixtures/shop/*.duckdb"]
 
 [lib]
 path = "src/lib.rs"
@@ -28,4 +27,8 @@ thiserror = "2"
 [dev-dependencies]
 # Trino rows arrive as JSON objects; keep their column order.
 serde_json = { version = "1", features = ["preserve_order"] }
-duckdb = { version = "1.10501", features = ["bundled"] }
+# DuckDB 1.5.1, linked against its prebuilt library (downloaded on first build,
+# see .cargo/config.toml) instead of compiling DuckDB from C++ source.
+duckdb = "=1.10501.0"
+# Transpiles reference SQL (written for DuckDB) to the engine under test.
+polyglot-sql = "=0.13.4"

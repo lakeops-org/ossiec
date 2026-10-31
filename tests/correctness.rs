@@ -74,7 +74,7 @@ fn order_and_limit_are_applied() {
 fn rank_filter_keeps_one_top_category_per_region() {
     assert_eq!(
         check("rank_filter_after_window").len(),
-        3,
-        "EU, US and the unknown region"
+        4,
+        "EU, US, APAC and the unknown region"
     );
 }

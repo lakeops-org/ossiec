@@ -79,19 +79,34 @@ metrics:
 "#;
 
 #[test]
-fn independent_facts_are_refused_not_silently_joined() {
-    let e = compile_err(
-        TWO_FACTS,
-        r#"{"metrics": ["revenue", "tickets"], "dimensions": ["customers.region"]}"#,
-    );
+fn independent_facts_are_stacked_not_joined() {
+    // No dataset reaches both orders and tickets: one leg per fact, stacked.
+    let g = ossiec::from_yaml(TWO_FACTS).unwrap();
+    let c = ossiec::compile(
+        &g,
+        &req(r#"{"metrics": ["revenue", "tickets"], "dimensions": ["customers.region"]}"#),
+        &Options::default(),
+    )
+    .unwrap();
+    assert!(c.sql.contains("UNION ALL"), "{}", c.sql);
     assert!(
-        matches!(e, Error::Unsupported(ref m) if m.contains("independent facts")),
-        "{e}"
+        !c.sql.contains("JOIN tickets") || !c.sql.contains("JOIN orders"),
+        "facts must not be joined to each other:\n{}",
+        c.sql
     );
 }
 
 #[test]
-fn role_playing_paths_are_refused() {
+fn dimension_only_request_across_facts_is_ambiguous() {
+    let e = compile_err(
+        TWO_FACTS,
+        r#"{"dimensions": ["customers.region"], "filters": [{"field": "orders.amount", "op": ">", "value": 0}, {"field": "tickets.id", "op": ">", "value": 0}]}"#,
+    );
+    assert!(matches!(e, Error::Unsupported(_)), "{e}");
+}
+
+#[test]
+fn role_playing_ties_are_refused_and_roles_can_be_named() {
     let model = r#"
 version: "0.2.0.dev0"
 name: flights

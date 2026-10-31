@@ -194,3 +194,37 @@ fn clickhouse_lag_keeps_standard_null_semantics() {
         None,
     );
 }
+
+#[test]
+fn bigquery_week_starts_on_monday() {
+    golden(
+        "shop_week_grain_bigquery",
+        SHOP,
+        r#"{"metrics": ["total_revenue"], "dimensions": ["orders.order_date"], "timeGrain": "week"}"#,
+        Some(DialectType::BigQuery),
+        None,
+    );
+}
+
+#[test]
+fn starrocks_doubles_backslashes_in_literals() {
+    golden(
+        "shop_backslash_literal_starrocks",
+        SHOP,
+        r#"{"dimensions": ["customers.name"], "filters": [{"field": "customers.name", "op": "IN", "values": ["O'Brien", "C:\\temp"]}]}"#,
+        Some(DialectType::StarRocks),
+        None,
+    );
+}
+
+#[test]
+fn postgres_types_stacked_nulls_and_collates_strings() {
+    golden(
+        "shop_three_parts_postgres",
+        SHOP,
+        r#"{"metrics": ["total_revenue", "total_stock", "customer_count"], "dimensions": ["products.category"],
+            "orderBy": [{"field": "products.category"}]}"#,
+        Some(DialectType::PostgreSQL),
+        None,
+    );
+}

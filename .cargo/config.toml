@@ -1,0 +1,4 @@
+[env]
+# Tests use DuckDB. Link its prebuilt shared library, downloaded once into
+# target/duckdb-download/, rather than compiling DuckDB from C++ (minutes per profile).
+DUCKDB_DOWNLOAD_LIB = "1"

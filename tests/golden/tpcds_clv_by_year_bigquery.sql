@@ -4,7 +4,7 @@
 -- dialect: bigquery (source: generic)
 SELECT
   base.d0 AS `date_dim.d_year`,
-  CAST(base.t0 AS FLOAT64) / base.t1 AS `customer_lifetime_value`
+  CAST(base.t0 AS FLOAT64) / NULLIF(base.t1, 0) AS `customer_lifetime_value`
 FROM (
   SELECT
     `date_dim`.d_year AS d0,

@@ -19,10 +19,8 @@
 #
 # M0 ladder rung -- one dataset, one field, one SUM metric.
 # Variant: OSSIE_SQL_2026 tag, QUALIFIED reference form (dataset.field).
-# This is the variant that RELABELED on kayemkim's M0 run (dbt, wisdom,
-# honeydew, orionbelt returned it tagged ANSI_SQL with the text unchanged;
-# only cube kept the OSSIE_SQL_2026 tag). "tag preserved" is tracked as a
-# sub-metric under PORTABLE so that 1-of-N signal survives.
+# Implementations have relabeled this variant ANSI_SQL with the text
+# unchanged; "tag preserved" is tracked as a sub-metric under PORTABLE.
 version: "0.2.0.dev0"
 name: m0_sales
 description: M0 baseline -- single dataset, single field, single SUM metric.

@@ -1,0 +1,173 @@
+# Test-only Ossie model for the official TPC-DS query sweep (tests/tpcds.rs).
+# Apache Ossie's TPC-DS example (tests/fixtures/ossie/) lacks the item and date
+# fields official queries filter on, so this model declares them. It also adds
+# customer_address (two hops from the fact) and store_returns (joined to
+# store_sales on a two-column key) for multi-hop and composite-key cases, two
+# customer date roles, and web_sales as an independent second fact. Sources use the
+# same `tpcds.public.` prefix as the example; tests rewrite it per engine.
+version: "0.2.0.dev0"
+name: tpcds_sweep
+description: Store sales with the item and date attributes used by TPC-DS q3, q42, q52, q55 and q98.
+datasets:
+  - name: store_sales
+    source: tpcds.public.store_sales
+    primary_key: [ss_item_sk, ss_ticket_number]
+    fields:
+      - { name: ss_sold_date_sk, expression: { sql: ss_sold_date_sk }, datatype: Integer }
+      - { name: ss_item_sk, expression: { sql: ss_item_sk }, datatype: Integer }
+      - { name: ss_ticket_number, expression: { sql: ss_ticket_number }, datatype: Integer }
+      - { name: ss_customer_sk, expression: { sql: ss_customer_sk }, datatype: Integer }
+      - { name: ss_store_sk, expression: { sql: ss_store_sk }, datatype: Integer }
+      - { name: ss_sold_time_sk, expression: { sql: ss_sold_time_sk }, datatype: Integer }
+      - { name: ss_hdemo_sk, expression: { sql: ss_hdemo_sk }, datatype: Integer }
+      - { name: ss_sales_price, expression: { sql: ss_sales_price }, datatype: Decimal }
+      - { name: ss_ext_sales_price, expression: { sql: ss_ext_sales_price }, datatype: Decimal }
+    metrics:
+      - { name: sales_count, expression: { sql: "COUNT(*)" } }
+
+  - name: web_sales
+    source: tpcds.public.web_sales
+    primary_key: [ws_item_sk, ws_order_number]
+    fields:
+      - { name: ws_item_sk, expression: { sql: ws_item_sk }, datatype: Integer }
+      - { name: ws_order_number, expression: { sql: ws_order_number }, datatype: Integer }
+      - { name: ws_sold_date_sk, expression: { sql: ws_sold_date_sk }, datatype: Integer }
+      - { name: ws_ext_sales_price, expression: { sql: ws_ext_sales_price }, datatype: Decimal }
+
+  - name: store
+    source: tpcds.public.store
+    primary_key: [s_store_sk]
+    fields:
+      - { name: s_store_sk, expression: { sql: s_store_sk }, datatype: Integer }
+      - { name: s_store_id, expression: { sql: s_store_id }, datatype: String }
+      - { name: s_store_name, expression: { sql: s_store_name }, datatype: String }
+      - { name: s_gmt_offset, expression: { sql: s_gmt_offset }, datatype: Decimal }
+
+  - name: time_dim
+    source: tpcds.public.time_dim
+    primary_key: [t_time_sk]
+    fields:
+      - { name: t_time_sk, expression: { sql: t_time_sk }, datatype: Integer }
+      - { name: t_hour, expression: { sql: t_hour }, datatype: Integer }
+      - { name: t_minute, expression: { sql: t_minute }, datatype: Integer }
+
+  - name: household_demographics
+    source: tpcds.public.household_demographics
+    primary_key: [hd_demo_sk]
+    fields:
+      - { name: hd_demo_sk, expression: { sql: hd_demo_sk }, datatype: Integer }
+      - { name: hd_dep_count, expression: { sql: hd_dep_count }, datatype: Integer }
+
+  - name: store_returns
+    source: tpcds.public.store_returns
+    primary_key: [sr_item_sk, sr_ticket_number]
+    fields:
+      - { name: sr_item_sk, expression: { sql: sr_item_sk }, datatype: Integer }
+      - { name: sr_ticket_number, expression: { sql: sr_ticket_number }, datatype: Integer }
+      - { name: sr_return_amt, expression: { sql: sr_return_amt }, datatype: Decimal }
+
+  - name: customer
+    source: tpcds.public.customer
+    primary_key: [c_customer_sk]
+    fields:
+      - { name: c_customer_sk, expression: { sql: c_customer_sk }, datatype: Integer }
+      - { name: c_current_addr_sk, expression: { sql: c_current_addr_sk }, datatype: Integer }
+      - { name: c_birth_country, expression: { sql: c_birth_country }, datatype: String }
+      - { name: c_first_sales_date_sk, expression: { sql: c_first_sales_date_sk }, datatype: Integer }
+      - { name: c_first_shipto_date_sk, expression: { sql: c_first_shipto_date_sk }, datatype: Integer }
+
+  - name: customer_address
+    source: tpcds.public.customer_address
+    primary_key: [ca_address_sk]
+    fields:
+      - { name: ca_address_sk, expression: { sql: ca_address_sk }, datatype: Integer }
+      - { name: ca_state, expression: { sql: ca_state }, datatype: String }
+      - { name: ca_gmt_offset, expression: { sql: ca_gmt_offset }, datatype: Decimal }
+
+  - name: date_dim
+    source: tpcds.public.date_dim
+    primary_key: [d_date_sk]
+    fields:
+      - { name: d_date_sk, expression: { sql: d_date_sk }, datatype: Integer }
+      - { name: d_date, expression: { sql: d_date }, datatype: Date }
+      - { name: d_year, expression: { sql: d_year }, datatype: Integer }
+      - { name: d_moy, expression: { sql: d_moy }, datatype: Integer }
+      - { name: d_day_name, expression: { sql: d_day_name }, datatype: String }
+
+  - name: item
+    source: tpcds.public.item
+    primary_key: [i_item_sk]
+    fields:
+      - { name: i_item_sk, expression: { sql: i_item_sk }, datatype: Integer }
+      - { name: i_item_id, expression: { sql: i_item_id }, datatype: String }
+      - { name: i_item_desc, expression: { sql: i_item_desc }, datatype: String }
+      - { name: i_brand_id, expression: { sql: i_brand_id }, datatype: Integer }
+      - { name: i_brand, expression: { sql: i_brand }, datatype: String }
+      - { name: i_category_id, expression: { sql: i_category_id }, datatype: Integer }
+      - { name: i_category, expression: { sql: i_category }, datatype: String }
+      - { name: i_class, expression: { sql: i_class }, datatype: String }
+      - { name: i_current_price, expression: { sql: i_current_price }, datatype: Decimal }
+      - { name: i_manufact_id, expression: { sql: i_manufact_id }, datatype: Integer }
+      - { name: i_manager_id, expression: { sql: i_manager_id }, datatype: Integer }
+
+relationships:
+  - { name: sales_to_date, from: store_sales, to: date_dim, from_columns: [ss_sold_date_sk], to_columns: [d_date_sk] }
+  - { name: sales_to_item, from: store_sales, to: item, from_columns: [ss_item_sk], to_columns: [i_item_sk] }
+  - { name: sales_to_customer, from: store_sales, to: customer, from_columns: [ss_customer_sk], to_columns: [c_customer_sk] }
+  - { name: customer_to_address, from: customer, to: customer_address, from_columns: [c_current_addr_sk], to_columns: [ca_address_sk] }
+  - { name: sales_to_store, from: store_sales, to: store, from_columns: [ss_store_sk], to_columns: [s_store_sk] }
+  - { name: sales_to_time, from: store_sales, to: time_dim, from_columns: [ss_sold_time_sk], to_columns: [t_time_sk] }
+  - { name: sales_to_hdemo, from: store_sales, to: household_demographics, from_columns: [ss_hdemo_sk], to_columns: [hd_demo_sk] }
+  # Role-playing: date_dim is also the customer's first-sale and first-ship-to date.
+  # From store_sales, a plain `date_dim.x` is the one-hop sale date (shortest path).
+  - { name: customer_first_sales, from: customer, to: date_dim, from_columns: [c_first_sales_date_sk], to_columns: [d_date_sk] }
+  - { name: customer_first_shipto, from: customer, to: date_dim, from_columns: [c_first_shipto_date_sk], to_columns: [d_date_sk] }
+  # A second, independent fact sharing item and date_dim.
+  - { name: web_to_date, from: web_sales, to: date_dim, from_columns: [ws_sold_date_sk], to_columns: [d_date_sk] }
+  - { name: web_to_item, from: web_sales, to: item, from_columns: [ws_item_sk], to_columns: [i_item_sk] }
+  # A return belongs to one sale line, identified by (item, ticket).
+  - name: returns_to_sales
+    from: store_returns
+    to: store_sales
+    from_columns: [sr_item_sk, sr_ticket_number]
+    to_columns: [ss_item_sk, ss_ticket_number]
+
+metrics:
+  - name: total_sales
+    expression: { sql: SUM(store_sales.ss_ext_sales_price) }
+  # TPC-DS q98's revenueratio: an item's share of its class's revenue.
+  - name: revenue_ratio
+    expression:
+      sql: "SUM(store_sales.ss_ext_sales_price) * 100.0000 / SUM(SUM(store_sales.ss_ext_sales_price)) OVER (PARTITION BY item.i_class)"
+  - name: returned_amount
+    expression: { sql: SUM(store_returns.sr_return_amt) }
+  # Two hops from store_sales: de-duplicated on customer_address's key.
+  - name: address_gmt_total
+    expression: { sql: SUM(customer_address.ca_gmt_offset) }
+  # One-side measure for includeUnmatched (items never sold).
+  - name: item_price_total
+    expression: { sql: SUM(item.i_current_price) }
+  # Independent facts.
+  - name: web_sales_total
+    expression: { sql: SUM(web_sales.ws_ext_sales_price) }
+  - name: web_to_store_ratio
+    expression: { sql: "SUM(web_sales.ws_ext_sales_price) / NULLIF(SUM(store_sales.ss_ext_sales_price), 0)" }
+  # TPC-DS q12's revenueratio, over web sales.
+  - name: web_revenue_ratio
+    expression:
+      sql: "SUM(web_sales.ws_ext_sales_price) * 100.0000 / SUM(SUM(web_sales.ws_ext_sales_price)) OVER (PARTITION BY item.i_class)"
+  # TPC-DS q43: store sales pivoted by weekday.
+  - name: sun_sales
+    expression: { sql: "SUM(CASE WHEN date_dim.d_day_name = 'Sunday' THEN store_sales.ss_sales_price ELSE NULL END)" }
+  - name: mon_sales
+    expression: { sql: "SUM(CASE WHEN date_dim.d_day_name = 'Monday' THEN store_sales.ss_sales_price ELSE NULL END)" }
+  - name: tue_sales
+    expression: { sql: "SUM(CASE WHEN date_dim.d_day_name = 'Tuesday' THEN store_sales.ss_sales_price ELSE NULL END)" }
+  - name: wed_sales
+    expression: { sql: "SUM(CASE WHEN date_dim.d_day_name = 'Wednesday' THEN store_sales.ss_sales_price ELSE NULL END)" }
+  - name: thu_sales
+    expression: { sql: "SUM(CASE WHEN date_dim.d_day_name = 'Thursday' THEN store_sales.ss_sales_price ELSE NULL END)" }
+  - name: fri_sales
+    expression: { sql: "SUM(CASE WHEN date_dim.d_day_name = 'Friday' THEN store_sales.ss_sales_price ELSE NULL END)" }
+  - name: sat_sales
+    expression: { sql: "SUM(CASE WHEN date_dim.d_day_name = 'Saturday' THEN store_sales.ss_sales_price ELSE NULL END)" }

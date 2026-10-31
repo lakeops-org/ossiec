@@ -52,6 +52,11 @@ pub struct Request {
     pub order_by: Vec<OrderBy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+    /// Also count one-side rows no fact row reaches (products never sold), as a
+    /// group of their own where the fact's dimensions are NULL. Off by default:
+    /// the request's joins decide its rows (relational semantics §10.2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_unmatched: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +84,17 @@ pub struct OrderBy {
     pub field: String,
     #[serde(default)]
     pub direction: Direction,
+    /// Where NULLs go. Default: first when ascending, last when descending,
+    /// on every engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nulls: Option<Nulls>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Nulls {
+    First,
+    Last,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,13 +166,32 @@ pub(crate) enum Strategy {
 pub(crate) struct PlannedTerm {
     pub term: Term,
     pub strategy: Strategy,
+    /// Index of the leg (join tree) this term is evaluated in.
+    pub leg: usize,
+}
+
+/// A dataset in a join tree: itself, or playing a role (reached through a
+/// named relationship), each with its own alias.
+pub(crate) type Node = (usize, Option<usize>);
+
+/// One join: `LEFT JOIN <to> AS to_alias ON <rel's columns from from_alias>`.
+pub(crate) struct JoinStep {
+    pub rel: usize,
+    pub from_alias: String,
+    pub to: usize,
+    pub to_alias: String,
+}
+
+/// A join tree rooted at one fact. Requests over independent facts have one
+/// leg per fact; their parts are stacked like any others.
+pub(crate) struct Leg {
+    pub root: usize,
+    pub joins: Vec<JoinStep>,
 }
 
 /// Everything `lower` needs; no SQL decisions are left.
 pub(crate) struct LogicalPlan {
-    pub root: usize,
-    /// Relationship indices, in join order.
-    pub joins: Vec<usize>,
+    pub legs: Vec<Leg>,
     /// (output name, expression with time grain applied).
     pub dims: Vec<(String, Expression)>,
     pub filters: Vec<Expression>,
@@ -165,11 +200,29 @@ pub(crate) struct LogicalPlan {
     pub outputs: Vec<(String, Expression)>,
     /// Metric predicates, over the metric expression and over the output column.
     pub metric_filters: Vec<(Expression, Expression)>,
+    /// Each dimension's SQL type, from its field's datatype, when declared. Used
+    /// to type the NULL a dimension takes in unmatched rows.
+    pub dim_types: Vec<Option<&'static str>>,
+    /// Output names of String-typed dimensions (for engines whose default
+    /// collation doesn't sort by byte).
+    pub string_dims: Vec<String>,
+    /// String-typed field expressions used as dimensions or filtered on (for
+    /// engines whose default collation compares case-insensitively).
+    pub string_exprs: Vec<Expression>,
     /// Some output uses a window function. Metric filters then apply to the
     /// finished rows (after windows), not to groups.
     pub windowed: bool,
-    pub order: Vec<(String, Direction)>,
+    pub include_unmatched: bool,
+    pub order: Vec<(String, Direction, Option<Nulls>)>,
     pub limit: Option<u64>,
+}
+
+/// The alias a node gets: the dataset's name, or `dataset__relationship` for a role.
+pub(crate) fn alias(g: &SemanticGraph, (ds, role): Node) -> String {
+    match role {
+        None => g.datasets[ds].name.clone(),
+        Some(r) => format!("{}__{}", g.datasets[ds].name, g.rels[r].name),
+    }
 }
 
 fn req_err(m: impl Into<String>) -> Error {
@@ -183,22 +236,27 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
     }
 
     // Dimensions.
-    let mut dim_refs: Vec<(String, usize, usize)> = vec![];
+    // (output name, dataset, field, role)
+    let mut dim_refs: Vec<(String, usize, usize, Option<usize>)> = vec![];
     for d in &req.dimensions {
-        let (ds, f) = g.field_by_name(d)?;
-        let name = format!("{}.{}", g.datasets[ds].name, g.datasets[ds].fields[f].name);
+        let (ds, f, role) = g.field_by_name(d)?;
+        let prefix = match role {
+            Some(r) => g.rels[r].name.clone(),
+            None => g.datasets[ds].name.clone(),
+        };
+        let name = format!("{prefix}.{}", g.datasets[ds].fields[f].name);
         if !dim_refs.iter().any(|(n, ..)| *n == name) {
-            dim_refs.push((name, ds, f));
+            dim_refs.push((name, ds, f, role));
         }
     }
     let grained = match (req.time_grain, &req.time_dimension) {
         (None, None) => None,
         (None, Some(_)) => return Err(req_err("timeDimension needs a timeGrain")),
         (Some(grain), Some(td)) => {
-            let (ds, f) = g.field_by_name(td)?;
+            let (ds, f, role) = g.field_by_name(td)?;
             let i = dim_refs
                 .iter()
-                .position(|(_, d, ff)| (*d, *ff) == (ds, f))
+                .position(|(_, d, ff, r)| (*d, *ff, *r) == (ds, f, role))
                 .ok_or_else(|| {
                     req_err(format!(
                         "timeDimension `{td}` must also be a requested dimension"
@@ -218,8 +276,8 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
         }
     };
     let mut dims = vec![];
-    for (i, (name, ds, f)) in dim_refs.iter().enumerate() {
-        let mut e = g.field_sql(*ds, *f, ctx);
+    for (i, (name, ds, f, role)) in dim_refs.iter().enumerate() {
+        let mut e = g.field_sql_as(*ds, *f, &alias(g, (*ds, *role)), ctx);
         if let Some((gi, grain)) = grained {
             if gi == i {
                 let mut t = Tpl::new();
@@ -261,7 +319,7 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
             .map(|&(ds, f)| {
                 dim_refs
                     .iter()
-                    .position(|(_, d, ff)| (*d, *ff) == (ds, f))
+                    .position(|(_, d, ff, r)| (*d, *ff, *r) == (ds, f, None))
                     .ok_or_else(|| {
                         req_err(format!(
                             "metric `{name}` is a window over `{}.{}`; add it to `dimensions`",
@@ -285,12 +343,30 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
     }
 
     // Filters.
-    let mut required: BTreeSet<usize> = dim_refs.iter().map(|(_, ds, _)| *ds).collect();
+    let mut required: BTreeSet<Node> = dim_refs
+        .iter()
+        .map(|(_, ds, _, role)| (*ds, *role))
+        .collect();
     let mut filters = vec![];
+    let is_string = |ds: usize, f: usize| {
+        g.datasets[ds].fields[f]
+            .datatype
+            .as_deref()
+            .is_some_and(|d| d.eq_ignore_ascii_case("string"))
+    };
+    let mut string_exprs: Vec<Expression> = dim_refs
+        .iter()
+        .zip(&dims)
+        .filter(|((_, ds, f, _), _)| is_string(*ds, *f))
+        .map(|(_, (_, e))| e.clone())
+        .collect();
     for f in &req.filters {
-        let (ds, fi) = g.field_by_name(&f.field)?;
-        required.insert(ds);
-        let lhs = g.field_sql(ds, fi, ctx);
+        let (ds, fi, role) = g.field_by_name(&f.field)?;
+        required.insert((ds, role));
+        let lhs = g.field_sql_as(ds, fi, &alias(g, (ds, role)), ctx);
+        if is_string(ds, fi) && !string_exprs.contains(&lhs) {
+            string_exprs.push(lhs.clone());
+        }
         let datatype = g.datasets[ds].fields[fi].datatype.as_deref();
         filters.push(predicate(lhs, f.op, f.value.as_ref(), &f.values, datatype)?);
     }
@@ -342,17 +418,19 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
                 )))
             }
         };
-        order.push((name, o.direction));
+        order.push((name, o.direction, o.nulls));
     }
 
-    // Join tree and term strategies.
-    for t in &terms {
-        required.extend(t.datasets.iter().copied());
-    }
-    let (root, joins) = join_tree(g, &required)?;
+    // Join trees (one per fact) and term strategies.
+    let (legs, term_legs) = plan_legs(g, &required, &terms)?;
     let mut planned = vec![];
-    for term in terms {
-        let strategy = if term.dup_insensitive || term.datasets.contains(&root) {
+    for (term, leg) in terms.into_iter().zip(term_legs) {
+        let root = legs[leg].root;
+        // With includeUnmatched, every one-side term is de-duplicated, so its
+        // unmatched rows can be added (an inline COUNT DISTINCT can't take them).
+        let inline =
+            term.datasets.contains(&root) || (term.dup_insensitive && !req.include_unmatched);
+        let strategy = if inline {
             Strategy::Inline
         } else {
             let grain = grain_of(g, &term.datasets)?;
@@ -368,21 +446,54 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
             ));
             Strategy::PkDedup { grain }
         };
-        planned.push(PlannedTerm { term, strategy });
+        planned.push(PlannedTerm {
+            term,
+            strategy,
+            leg,
+        });
     }
 
     Ok(LogicalPlan {
-        root,
-        joins,
+        legs,
         dims,
         filters,
         terms: planned,
         outputs,
         metric_filters,
+        string_dims: dim_refs
+            .iter()
+            .filter(|(_, ds, f, _)| {
+                g.datasets[*ds].fields[*f]
+                    .datatype
+                    .as_deref()
+                    .is_some_and(|d| d.eq_ignore_ascii_case("string"))
+            })
+            .map(|(n, ..)| n.clone())
+            .collect(),
+        dim_types: dim_refs
+            .iter()
+            .map(|(_, ds, f, _)| sql_type(g.datasets[*ds].fields[*f].datatype.as_deref()))
+            .collect(),
+        string_exprs,
         windowed,
+        include_unmatched: req.include_unmatched,
         order,
         limit: req.limit,
     })
+}
+
+/// SQL type for an Ossie datatype.
+fn sql_type(datatype: Option<&str>) -> Option<&'static str> {
+    match datatype?.to_ascii_lowercase().as_str() {
+        "integer" => Some("BIGINT"),
+        "decimal" => Some("DECIMAL(38, 9)"),
+        "float" => Some("DOUBLE"),
+        "string" => Some("VARCHAR"),
+        "date" => Some("DATE"),
+        "datetime" | "datetimetz" => Some("TIMESTAMP"),
+        "boolean" => Some("BOOLEAN"),
+        _ => None,
+    }
 }
 
 /// Rename local term placeholders to global term numbers.
@@ -482,28 +593,83 @@ fn predicate(
     t.build()
 }
 
-/// The dataset every required dataset hangs off, and the joins to reach them.
-fn join_tree(g: &SemanticGraph, required: &BTreeSet<usize>) -> Result<(usize, Vec<usize>)> {
+/// One join tree for everything, or, when no dataset reaches all of `required`
+/// (independent facts sharing dimensions), one per fact: each term gets the
+/// tree for its own datasets plus every dimension and filter. Returns the legs
+/// and each term's leg.
+fn plan_legs(
+    g: &SemanticGraph,
+    required: &BTreeSet<Node>,
+    terms: &[Term],
+) -> Result<(Vec<Leg>, Vec<usize>)> {
+    let mut all = required.clone();
+    for t in terms {
+        all.extend(t.datasets.iter().map(|&d| (d, None)));
+    }
+    let single = join_tree(g, &all);
+    let independent =
+        matches!(&single, Err(Error::Unsupported(m)) if m.contains("independent facts"));
+    if !independent || terms.is_empty() {
+        return Ok((vec![single?], vec![0; terms.len()]));
+    }
+    // One leg per root: terms whose own tree roots at the same fact share it.
+    let mut by_root: Vec<(usize, BTreeSet<Node>)> = vec![];
+    let mut term_roots = vec![];
+    for t in terms {
+        let mut req = required.clone();
+        req.extend(t.datasets.iter().map(|&d| (d, None)));
+        let root = join_tree(g, &req)?.root;
+        match by_root.iter_mut().find(|(r, _)| *r == root) {
+            Some((_, nodes)) => nodes.extend(req),
+            None => by_root.push((root, req)),
+        }
+        term_roots.push(root);
+    }
+    let legs = by_root
+        .iter()
+        .map(|(_, nodes)| join_tree(g, nodes))
+        .collect::<Result<Vec<_>>>()?;
+    let term_legs = term_roots
+        .iter()
+        .map(|r| by_root.iter().position(|(x, _)| x == r).expect("leg"))
+        .collect();
+    Ok((legs, term_legs))
+}
+
+/// The dataset every required node hangs off, and the joins to reach them.
+///
+/// A plain dataset reachable more than one way takes the unique shortest path
+/// (`date_dim` from `store_sales` is the sale date, not the customer's first-sale
+/// date two hops away). A tie is an error that suggests naming the role. A role
+/// node `(dataset, rel)` is reached through `rel`, under its own alias.
+fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
+    let plain: BTreeSet<usize> = required
+        .iter()
+        .map(|&(ds, role)| match role {
+            None => ds,
+            Some(r) => g.rels[r].from, // a role needs its relationship's source
+        })
+        .collect();
     let names = |s: &BTreeSet<usize>| {
         s.iter()
             .map(|&d| format!("`{}`", g.datasets[d].name))
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let reaches = |r: usize, paths: &std::collections::BTreeMap<usize, Vec<Vec<usize>>>| {
-        required.iter().all(|t| *t == r || paths.contains_key(t))
-    };
     let all_paths: Vec<_> = (0..g.datasets.len()).map(|r| g.paths_from(r)).collect();
-    let candidates: BTreeSet<usize> = (0..g.datasets.len())
-        .filter(|&r| reaches(r, &all_paths[r]))
-        .collect();
+    let reaches = |r: usize| {
+        plain
+            .iter()
+            .all(|t| *t == r || all_paths[r].contains_key(t))
+    };
+    let candidates: BTreeSet<usize> = (0..g.datasets.len()).filter(|&r| reaches(r)).collect();
     if candidates.is_empty() {
         return Err(Error::Unsupported(format!(
-            "no dataset joins to all of {} along many-to-one relationships; queries across independent facts are not supported yet",
-            names(required)
+            "no dataset joins to all of {} along many-to-one relationships, and they don't split into independent facts sharing the requested dimensions",
+            names(&plain)
         )));
     }
-    let inside: Vec<usize> = candidates.intersection(required).copied().collect();
+    let inside: Vec<usize> = candidates.intersection(&plain).copied().collect();
     let root = match inside.as_slice() {
         [one] => *one,
         [] => {
@@ -521,8 +687,8 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<usize>) -> Result<(usize, Ve
                 [one] => *one,
                 _ => {
                     return Err(Error::Unsupported(format!(
-                        "{} are joined by several facts ({}) and the request doesn't say which; queries across independent facts are not supported yet",
-                        names(required),
+                        "{} are joined by several facts ({}); with no measure to say which, the request is ambiguous (independent facts need a measure from each)",
+                        names(&plain),
                         names(&candidates)
                     )))
                 }
@@ -531,38 +697,87 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<usize>) -> Result<(usize, Ve
         _ => {
             return Err(Error::Unsupported(format!(
                 "relationships between {} form a cycle",
-                names(required)
+                names(&plain)
             )))
         }
     };
 
-    let mut edges: Vec<(usize, usize)> = vec![]; // (depth, relationship)
-    for t in required.iter().filter(|&&t| t != root) {
-        let paths = &all_paths[root][t];
-        if paths.len() > 1 {
-            let show = |p: &Vec<usize>| {
-                p.iter()
-                    .map(|&r| g.rels[r].name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" → ")
-            };
-            return Err(req_err(format!(
-                "`{}` is reachable from `{}` in more than one way ({}); role-playing dimensions are not supported yet",
-                g.datasets[*t].name,
+    let show = |p: &Vec<usize>| {
+        p.iter()
+            .map(|&r| g.rels[r].name.as_str())
+            .collect::<Vec<_>>()
+            .join(" → ")
+    };
+    // The default path to `t`: the only one, or the unique shortest.
+    let path_to = |t: usize| -> Result<Vec<usize>> {
+        let paths = &all_paths[root][&t];
+        let shortest = paths.iter().map(Vec::len).min().unwrap_or(0);
+        let best: Vec<&Vec<usize>> = paths.iter().filter(|p| p.len() == shortest).collect();
+        match best.as_slice() {
+            [one] => Ok((*one).clone()),
+            _ => Err(req_err(format!(
+                "`{}` is reachable from `{}` in more than one way ({}); name the one you mean as `<relationship>.<field>`, e.g. `{}.<field>`",
+                g.datasets[t].name,
                 g.datasets[root].name,
-                paths.iter().map(show).collect::<Vec<_>>().join(" | ")
-            )));
+                best.iter().map(|p| show(p)).collect::<Vec<_>>().join(" | "),
+                g.rels[*best[0].last().expect("non-empty path")].name
+            ))),
         }
-        edges.extend(paths[0].iter().enumerate().map(|(depth, &r)| (depth, r)));
-    }
-    edges.sort();
-    let mut joins = vec![];
-    for (_, r) in edges {
-        if !joins.contains(&r) {
-            joins.push(r);
+    };
+
+    // (depth, step)
+    let mut steps: Vec<(usize, JoinStep)> = vec![];
+    let add_path = |path: &[usize], steps: &mut Vec<(usize, JoinStep)>| -> Result<()> {
+        for (depth, &r) in path.iter().enumerate() {
+            let rel = &g.rels[r];
+            match steps.iter().find(|(_, s)| s.to_alias == g.datasets[rel.to].name) {
+                Some((_, s)) if s.rel == r => {}
+                Some((_, s)) => {
+                    return Err(req_err(format!(
+                        "`{}` is reached both through `{}` and `{}`; name the role you mean as `<relationship>.<field>`",
+                        g.datasets[rel.to].name, g.rels[s.rel].name, rel.name
+                    )))
+                }
+                None => steps.push((
+                    depth,
+                    JoinStep { rel: r, from_alias: g.datasets[rel.from].name.clone(), to: rel.to, to_alias: g.datasets[rel.to].name.clone() },
+                )),
+            }
+        }
+        Ok(())
+    };
+    for &(ds, role) in required {
+        let target = match role {
+            None => ds,
+            Some(r) => g.rels[r].from,
+        };
+        let path = if target == root {
+            vec![]
+        } else {
+            path_to(target)?
+        };
+        add_path(&path, &mut steps)?;
+        if let Some(r) = role {
+            let to_alias = alias(g, (ds, role));
+            if !steps.iter().any(|(_, s)| s.to_alias == to_alias) {
+                let from_alias = g.datasets[g.rels[r].from].name.clone();
+                steps.push((
+                    path.len(),
+                    JoinStep {
+                        rel: r,
+                        from_alias,
+                        to: ds,
+                        to_alias,
+                    },
+                ));
+            }
         }
     }
-    Ok((root, joins))
+    steps.sort_by(|(da, a), (db, b)| (da, a.rel, &a.to_alias).cmp(&(db, b.rel, &b.to_alias)));
+    Ok(Leg {
+        root,
+        joins: steps.into_iter().map(|(_, s)| s).collect(),
+    })
 }
 
 /// The dataset among `datasets` that reaches all the others: the term's row grain.

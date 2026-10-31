@@ -47,7 +47,7 @@ ossiec sees that `SUM(products.stock)` reads only the "one" side of a many-to-on
 
 - **Reads the current Ossie spec** (`0.2.0.dev0`, model at the document root): datasets with table or query sources, fields, primary keys, relationships, dataset- and model-scoped metrics, `ai_context`, `custom_extensions`. Every [Ossie example and compliance fixture](tests/fixtures/ossie) binds.
 - **No fan traps or chasm traps by construction.** Joins only go many→one from a single root. Measures from different grains are computed separately and stacked with `UNION ALL`, never joined to each other ([how](#how-it-works)).
-- **Engine-native output, checked on real engines.** One AST, rendered by [polyglot-sql](https://crates.io/crates/polyglot-sql) for Trino, Athena, StarRocks, ClickHouse, DuckDB, MySQL, Postgres, Snowflake, BigQuery, Databricks, Redshift and 20+ more. Every correctness case runs on **DuckDB, Postgres, Trino, StarRocks and ClickHouse** and must return the same rows. Where an engine answers differently, a small [dialect rule](src/dialect.rs) fixes it (for example, ClickHouse's `lag` returns `0` instead of NULL for the first row).
+- **Engine-native output, checked on real engines.** One AST, rendered by [polyglot-sql](https://crates.io/crates/polyglot-sql) for Trino, Athena, StarRocks, ClickHouse, DuckDB, MySQL, Postgres, Snowflake, BigQuery, Databricks, Redshift and 20+ more. Every correctness case runs on **DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL** and must return the same rows. Where an engine answers differently, a small [dialect rule](src/dialect/) fixes it (for example, ClickHouse's `lag` returns `0` instead of NULL for the first row).
 - **Window metrics:** running totals, rankings and period-over-period (`SUM(SUM(x)) OVER (…)`, `RANK() OVER (…)`, `LAG`), computed over the grouped result. `describe` tells callers which dimensions each one needs.
 - **Uses vendor expressions when you want them.** A field can carry a portable expression plus `SNOWFLAKE`, `TRINO`, … variants; `--prefer SNOWFLAKE` uses the native one.
 - **Answers in the model's language.** Errors name the problem and the valid choices (`unknown metric 'revenue'; available: total_revenue, …`), so an agent can correct itself. `describe` returns metrics, dimensions and `ai_context` as JSON.
@@ -191,10 +191,17 @@ println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
   "metricFilters": [{"metric": "total_revenue", "op": ">", "value": 1000}], // HAVING
   "timeGrain": "month",                    // day | week | month | quarter | year
   "timeDimension": "orders.order_date",    // only needed when several time dimensions are requested
-  "orderBy": [{"field": "total_revenue", "direction": "desc"}],
-  "limit": 100
+  "orderBy": [{"field": "total_revenue", "direction": "desc", "nulls": "last"}], // nulls: first | last (optional)
+  "limit": 100,
+  "includeUnmatched": false                // see below
 }
 ```
+
+**Roles.** When a dataset is reachable more than one way (a customer's first-sale date and the sale's own date both lead to `date_dim`), a plain `date_dim.d_year` takes the **shortest** path. To use another, name the relationship: `customer_first_sales.d_year`. A request can use several roles at once, each joined under its own alias. If two paths tie, the request is refused with the relationship names to choose from.
+
+**Independent facts.** Measures from facts that don't join each other (store sales and web sales by item category) are computed in one join tree per fact and stacked, so groups are the union across facts: a category sold only online still appears. Every requested dimension and filter must be reachable from each fact.
+
+**`includeUnmatched`.** By default a one-side measure only sees rows a fact reaches: stock of products that sold. With `"includeUnmatched": true`, rows no fact reaches (products never sold, customers who never ordered) are added as a group of their own, where the fact's dimensions are NULL. Filters on the fact side exclude them, as SQL NULL semantics say.
 
 Leave out `metrics` to list **dimension values** instead: `{"dimensions": ["customers.region"]}` returns every region in `customers`. Dimensions from several datasets return only the combinations that occur, joined through the fact that links them. Agents use this to filter with real values.
 
@@ -220,14 +227,14 @@ YAML ─load─► Model ─bind─► SemanticGraph ─plan─► LogicalPlan �
    - A term that reads only one-side data (`SUM(products.stock)` over an `orders` root) is computed over rows **de-duplicated on that dataset's primary key**, which is the reference strategy in Ossie's relational spec (§9).
 4. **Stack, don't join.** Each strategy becomes a part grouped by the same dimensions. Parts are combined with `UNION ALL` and `MAX` per term, so there's no join predicate between parts to get wrong.
 5. **Windows last.** Window functions in a metric run in the final `SELECT`, over one row per group: `SUM(SUM(x)) OVER (ORDER BY d)` becomes `SUM(base.t0) OVER (ORDER BY base.d0)`. Fields a window partitions or orders by must be requested dimensions. When windows are present, `metricFilters` apply to the finished rows, so "rank ≤ 3" means the top three by the full ranking.
-6. **Render.** Build one polyglot AST and apply the target's [dialect rules](src/dialect.rs) (only where a real-engine test showed polyglot's rendering answers differently). Generate it in the source dialect, then transpile to the target.
+6. **Render.** Build one polyglot AST and apply the target's [dialect rules](src/dialect/) (only where a real-engine test showed polyglot's rendering answers differently). Generate it in the source dialect, then transpile to the target.
 
 If ossiec can't make a request correct, it refuses it rather than guessing:
 
 | Situation | Response |
 |---|---|
-| Two facts with no common root (orders *and* support tickets by region) | `not supported yet: … independent facts` |
-| A dataset reachable two ways (departure *and* arrival airport) | `… reachable in more than one way (departs_from \| arrives_at)` |
+| Dimensions or filters several facts could link, with no measure saying which (item prices by year, when store and web sales both have items and dates) | `… joined by several facts (…); … independent facts need a measure from each` |
+| A dataset reachable two ways of equal length (departure *and* arrival airport) | `… in more than one way (departs_from \| arrives_at); name the one you mean as <relationship>.<field>` |
 | A one-side measure on a dataset with no `primary_key` | `… declare a primary_key on 'products'` |
 | A window metric without the dimension it orders by | `metric 'cumulative_revenue' is a window over 'orders.order_date'; add it to 'dimensions'` |
 
@@ -256,8 +263,9 @@ One leniency: Ossie requires `dataset.field` in model-scoped metrics, but the co
 ## Testing
 
 ```console
-cargo test                        # everything (the first run builds DuckDB, a few minutes)
-scripts/engines.sh up && cargo test --test engines -- --ignored   # same cases on Postgres, Trino, StarRocks, ClickHouse
+cargo test                        # everything (the first run downloads DuckDB's prebuilt library)
+scripts/engines.sh up && cargo test --test engines -- --ignored   # same cases on Postgres, Trino, StarRocks, ClickHouse, MySQL
+cargo test --test tpcds -- --include-ignored                      # TPC-DS on all six engines (DuckDB alone needs no Docker)
 cargo test --test correctness     # answers vs hand-written SQL on DuckDB
 UPDATE_GOLDEN=1 cargo test --test golden   # re-snapshot SQL after an intended change
 scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo test
@@ -265,28 +273,36 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 | Suite | What it proves |
 |---|---|
-| [`correctness`](tests/correctness.rs) | **The numbers are right.** 15 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
-| [`engines`](tests/engines.rs) | **Every engine agrees.** The same 15 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1 and ClickHouse 25.8 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
+| [`correctness`](tests/correctness.rs) | **The numbers are right.** 31 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
+| [`engines`](tests/engines.rs) | **Every engine agrees.** The same 31 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1, ClickHouse 25.8 and MySQL 8.4 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
+| [`tpcds`](tests/tpcds.rs) | **Real data, and the benchmark's own SQL.**<br>• **Apache Ossie's TPC-DS example model, unchanged,** on generated TPC-DS data: all its metric kinds, including the de-duplicated `store_productivity` and the window metrics.<br>• **Official TPC-DS queries q3, q12, q42, q43, q52, q55, q96 and q98**, expressed as ossiec requests and compared row by row with TPC-DS's own query text.<br>26 cases, including multi-hop joins, composite keys, date roles, store-and-web independent facts and unmatched items, on DuckDB (sf=0.1, 288k `store_sales` rows), Trino (`tpcds.tiny`), Postgres, StarRocks and ClickHouse. Each reference runs on the same engine, so data-generator differences cancel out. |
+| [`fuzz`](tests/fuzz.rs) | **Cases nobody wrote.** Random requests compared with an independent reference generated from the spec's own evaluation strategy, on all six engines. |
+| [`scale`](tests/scale.rs) | **No blow-ups.** A 121-table model binds in about 0.1 s and compiles in about 10 ms per request (unoptimized build). On Trino sf=1, each TPC-DS case must run within 3× its reference. |
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
-| [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric compiles, and there's one test per validation rule. |
+| [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests) without `FILTER`, determinism. |
 
 ## Known issues
 
 **Semantics to know**
-- **De-duplicated groups overlap.** A product sold in two regions counts in both, so per-group values don't sum to a grand total. ossiec warns (`FAN_TRAP_RISK`). Products that never sold aren't in any group; query the measure without dimensions for the catalogue total.
+- **De-duplicated groups overlap.** A product sold in two regions counts in both, so per-group values don't sum to a grand total. ossiec warns (`FAN_TRAP_RISK`). Products that never sold aren't in any group unless the request sets `includeUnmatched`; or query the measure without dimensions for the catalogue total.
 - **Window metrics see only the rows in the result.** A running total over a filtered date range starts at the range's first row, and `stock_share` is a share of the groups returned. With windows present, metric filters apply after the window.
 - **Division is always true division.** `/` in portable expressions casts the numerator to `DOUBLE` unless one side is a fractional literal, so `COUNT(a) / COUNT(b)` isn't truncated on Postgres and Trino. Ratios therefore come back as floating point. `amount_cents / 100.0` stays exact.
 - **NULL ordering** follows generic SQL on every engine: NULLs sort first in ascending order (`NULLS FIRST` is emitted where needed).
+- **Strings compare and sort by byte on every engine**, so `'Bob'` comes before `'ada'` and `'ada'` never equals `'Ada'`. Postgres string dimensions carry `COLLATE "C"`, and MySQL string dimensions and filters `COLLATE utf8mb4_bin`, to match.
+- **A backslash in a `LIKE` pattern is an ordinary character**, as in SQL without `ESCAPE`. On engines that escape with it by default (Postgres, ClickHouse, StarRocks, MySQL), ossiec doubles it.
+- **Groups don't depend on the measures you ask for.** A group appears whenever some joined row has it, and a measure with no rows there reads NULL (`COUNT` reads 0).
 - **Time grains ignore time zones.** Truncating a `DateTimeTz` uses the engine's session time zone.
 
-**Refused for now:** independent facts (orders *and* tickets by region), role-playing dimensions (one dataset joined twice), nested windows.
+**Refused for now:** nested windows; a dataset reached two ways of equal length unless the role is named.
 
 **Spec leniency:** bare names in model-scoped metrics are accepted with a warning. The rule that a `FILTER` predicate may only use the aggregate's own dataset isn't validated yet.
 
-**Engine coverage:** answers are verified on DuckDB, Postgres, Trino, StarRocks and ClickHouse. Athena, Snowflake, BigQuery, Databricks, Redshift and MySQL are compile-checked only. See [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md) to move an engine up.
+**Engine coverage:** answers are verified on DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL, on the shop cases, TPC-DS and fuzzing. Athena, Snowflake, BigQuery, Databricks and Redshift are compile-checked only. See [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md) to move an engine up.
 
-**Downstream translators:** if you emit `generic` SQL (no `--dialect`) and translate it elsewhere, ossiec's [dialect rules](src/dialect.rs) don't apply. For example, a translator that maps `LAG` to ClickHouse's `lag` gets `0` instead of NULL for the first row. Compile for the engine instead.
+**Downstream translators:** if you emit `generic` SQL (no `--dialect`) and translate it elsewhere, ossiec's [dialect rules](src/dialect/) don't apply. For example, a translator that maps `LAG` to ClickHouse's `lag` gets `0` instead of NULL for the first row. Compile for the engine instead.
+
+**Engines not in the executed set, with known risks:** Doris has StarRocks' backslash-literal gap; Redshift probably has Postgres' untyped-`NULL` union issue. Neither is covered by dialect rules yet.
 
 **polyglot-sql 0.13.4 bugs, all guarded:**
 - its `QUALIFY` emulation produces invalid SQL;
@@ -299,7 +315,7 @@ ossiec never emits these constructs (checked for 11 engines), and it renders wit
 
 ossiec is a library first, built to be embedded in query engines, SQL proxies and agent tool servers.
 
-- **Compile for the engine you'll run on.** Resolve the target first, then call `compile` with `Options { target: Some(..), .. }`. You get engine-ready SQL with ossiec's [dialect rules](src/dialect.rs) applied.
+- **Compile for the engine you'll run on.** Resolve the target first, then call `compile` with `Options { target: Some(..), .. }`. You get engine-ready SQL with ossiec's [dialect rules](src/dialect/) applied.
 - **Or translate downstream.** With `target: None`, you get SQL in the model's source dialect (`Compiled::source_dialect`) to hand to your own translator. ossiec's dialect rules don't apply on that path.
 - **Apply your own governance.** Row filters, column masks and permissions work on the generated SQL like on any other query, since it references the model's physical tables.
 - **For agents,** `describe()` returns metrics, dimensions and `ai_context` as JSON, and a request without metrics lists dimension values for filters.
@@ -310,10 +326,15 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Join-root planning, inline and primary-key de-duplicated terms, `UNION ALL` stacking
 - [x] `FILTER` lowering, time grains, metric filters, vendor-dialect preference
 - [x] CLI: `validate`, `describe`, `compile`
-- [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse
+- [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse, MySQL
+- [x] TPC-DS: Ossie's example model on real data, plus official queries q3, q42, q52, q55, q98
+- [x] Official TPC-DS queries q3, q12, q42, q43, q52, q55, q96, q98
+- [ ] More official TPC-DS queries (many of the 99 need constructs no semantic request expresses: correlated subqueries, cross-channel set operations)
 - [x] Window metrics (cumulative, rank, period-over-period)
-- [ ] Multi-fact requests across conformed dimensions
-- [ ] Role-playing dimensions (path selection)
+- [x] Independent facts across shared dimensions
+- [x] Role-playing dimensions (`relationship.field`, shortest path by default)
+- [x] Unmatched one-side rows (`includeUnmatched`)
+- [x] NULL placement in `orderBy`
 - [ ] Ossie Layer 2: SQL with `AGG(measure)`
 - [ ] Publish to crates.io
 

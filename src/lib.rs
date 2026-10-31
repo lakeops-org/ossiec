@@ -36,7 +36,7 @@ mod sql;
 
 pub use graph::{bind, Catalog, DimensionDoc, MetricDoc, SemanticGraph};
 pub use model::Model;
-pub use plan::{Direction, Filter, MetricFilter, Op, OrderBy, Request, TimeGrain};
+pub use plan::{Direction, Filter, MetricFilter, Nulls, Op, OrderBy, Request, TimeGrain};
 pub use polyglot_sql::DialectType;
 
 use serde::Serialize;
@@ -138,7 +138,7 @@ pub fn compile(graph: &SemanticGraph, request: &Request, opts: &Options) -> Resu
     let plan = plan::plan(graph, request, &mut ctx)?;
     let ast = lower::lower(graph, &plan, &mut ctx)?;
     let ast = match opts.target {
-        Some(target) => dialect::adapt(ast, target)?,
+        Some(target) => dialect::adapt(ast, target, &plan)?,
         None => ast,
     };
     let (source_name, source) = ctx.source_dialect()?;

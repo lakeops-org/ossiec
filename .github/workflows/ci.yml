@@ -35,5 +35,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: scripts/engines.sh up
       - run: cargo test --test engines -- --ignored
+      - run: cargo test --test tpcds -- --ignored --skip trino_sf1_performance
       - if: always()
         run: scripts/engines.sh down
