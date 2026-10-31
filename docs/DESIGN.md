@@ -116,12 +116,16 @@ ossiec keeps one shared generator and a thin per-dialect layer, [`src/dialect/`]
 | Postgres, ClickHouse, StarRocks, MySQL: backslashes in `LIKE` patterns doubled (shared helper in `dialect/mod.rs`) | `like_with_a_backslash`: these engines escape with `\` by default; SQL without `ESCAPE` (Trino, DuckDB) treats it as an ordinary character |
 | MySQL: string dimensions and filters `COLLATE utf8mb4_bin` | `string_ordering` (case-insensitive grouping merged `Ada` and `ada`) and `case_sensitive_filter` (`'ada'` matched `Ada`) |
 | MySQL: `AVG` argument cast to `DOUBLE` | `averages_of_integers_and_one_side_values`: `AVG` of integers rounds to 4 decimals |
+| MySQL: `NULLS FIRST/LAST` → leading `CASE WHEN x IS NULL THEN 1 ELSE 0 END` key | TPC-DS `q12`: MySQL has no `NULLS LAST` syntax and polyglot drops it ([polyglot#515](https://github.com/tobilg/polyglot/issues/515)) |
+| ClickHouse: `CAST(NULL AS T)` → `CAST(NULL AS Nullable(T))` (`finish`) | `unmatched_products_included`: `Cannot convert NULL to a non-nullable type`; polyglot wraps some types only ([polyglot#514](https://github.com/tobilg/polyglot/issues/514)) |
 
 Engine-neutral rules that came out of the same tests live in binding and planning instead:
 - **Groups never depend on which measures are asked for** (spec §8.4, closure). With dimensions, the base part always runs, even when it computes no terms, so groups come from every joined row. Evidence: `one_side_measure_dedup`, which used to drop a region whose orders had no product.
 - **`COUNT` over no rows is 0** (spec §8.1). In stacked parts a missing group reads `COALESCE(MAX(tN), 0)` for `COUNT`-like terms. Evidence: `count_is_zero_for_a_group_without_rows`.
 - A time grain on a `Date` field is cast back to `DATE`, because Postgres returns `timestamptz` and StarRocks `DATETIME` (`month_grain_with_date_range`).
 - `/` in portable expressions is true division. Postgres and Trino truncate `7 / 2` to `3`, while DuckDB, StarRocks and ClickHouse return `3.5`. The numerator is cast to `DOUBLE` unless one side is a fractional literal, which keeps `amount_cents / 100.0` exact (`integer_ratio`). Vendor-dialect expressions keep their engine's own semantics.
+- Division by zero is NULL: a non-literal divisor is wrapped in `NULLIF(…, 0)`. Otherwise Postgres errors and Trino returns `NaN` (TPC-DS `q12` on Trino).
+- With `includeUnmatched`, one `DISTINCT` runs over the matched and unmatched rows, not one per `UNION ALL` branch. ClickHouse before 26.5 prunes a branch's `DISTINCT` columns to the ones the outer query reads, so items with equal prices collapsed (`unmatched_items_included`; fixed upstream in ClickHouse#104114).
 
 Rules have two hooks: `adapt` rewrites the neutral AST before rendering, and `finish` edits the rendered SQL in the target's own dialect, for syntax only that dialect has.
 

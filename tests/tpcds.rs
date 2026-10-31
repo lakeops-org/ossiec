@@ -401,8 +401,9 @@ const CASES: &[Case] = &[
             "dimensions": ["item.i_item_id", "item.i_item_desc", "item.i_category", "item.i_class", "item.i_current_price"],
             "filters": [{"field": "item.i_category", "op": "IN", "values": ["Sports", "Books", "Home"]},
                         {"field": "date_dim.d_date", "op": "BETWEEN", "values": ["1999-02-22", "1999-03-24"]}],
-            "orderBy": [{"field": "item.i_category"}, {"field": "item.i_class"}, {"field": "item.i_item_id"},
-                        {"field": "item.i_item_desc"}, {"field": "revenue_ratio"}]}"#,
+            "orderBy": [{"field": "item.i_category", "nulls": "first"}, {"field": "item.i_class", "nulls": "first"},
+                        {"field": "item.i_item_id", "nulls": "first"}, {"field": "item.i_item_desc", "nulls": "first"},
+                        {"field": "revenue_ratio", "nulls": "first"}]}"#,
         reference: Reference::Official(98),
     },
     Case {
@@ -599,16 +600,31 @@ fn load(engine: Engine, duck: &Connection) {
 }
 
 /// DuckDB sorts NULLs last; StarRocks and MySQL sort them first on ASC. Spell
-/// DuckDB's order out so a transpiled reference sorts the way it does on DuckDB.
-fn duckdb_null_order(sql: &str) -> String {
+/// DuckDB's order out so a transpiled reference sorts the way it does on DuckDB:
+/// `NULLS LAST`, or for MySQL, which has no such syntax, a leading `x IS NULL` key.
+fn duckdb_null_order(sql: &str, engine: Engine) -> String {
     let ast = polyglot_sql::parse(sql, DialectType::DuckDB)
         .unwrap()
         .remove(0);
     let ast = polyglot_sql::transform(ast, &|e| {
         Ok(Some(match e {
             polyglot_sql::Expression::Select(mut s) => {
-                for o in s.order_by.iter_mut().flat_map(|o| o.expressions.iter_mut()) {
-                    o.nulls_first.get_or_insert(false);
+                for order in s.order_by.iter_mut() {
+                    let mut keys = vec![];
+                    for mut o in std::mem::take(&mut order.expressions) {
+                        if engine == Engine::MySql {
+                            let mut is_null = o.clone();
+                            is_null.this = polyglot_sql::builder::Expr(o.this.clone())
+                                .is_null()
+                                .into_inner();
+                            is_null.desc = o.nulls_first.take() == Some(true);
+                            keys.push(is_null);
+                        } else {
+                            o.nulls_first.get_or_insert(false);
+                        }
+                        keys.push(o);
+                    }
+                    order.expressions = keys;
                 }
                 polyglot_sql::Expression::Select(s)
             }
@@ -647,7 +663,7 @@ fn sweep(engine: Engine) {
             ),
             _ => {
                 let mut reference = transpile(
-                    &duckdb_null_order(&reference),
+                    &duckdb_null_order(&reference, engine),
                     DialectType::DuckDB,
                     engine.dialect(),
                 )
