@@ -28,21 +28,46 @@
 //! README for the planning rules that keep metrics free of fan-out and chasm traps.
 
 mod dialect;
+mod front;
 mod graph;
-mod layer2;
 mod lower;
 pub mod model;
 mod plan;
 mod sql;
 
 pub use graph::{bind, Catalog, DimensionDoc, MetricDoc, SemanticGraph};
-pub use layer2::{
-    compile_layer2, compile_layer2_script, compile_layer2_with, define_layer2_view,
-    to_request as layer2_to_request, Layer2Catalog, Layer2Column, Layer2ColumnKind,
-};
 pub use model::Model;
 pub use plan::{Direction, Filter, MetricFilter, Nulls, Op, OrderBy, Request, TimeGrain};
 pub use polyglot_sql::DialectType;
+
+/// Compile consumer SQL with `AGG(measure)` (Ossie Layer 2 surface).
+///
+/// Same pipeline as [`compile`]: the frontend turns SQL into [`Request`] stages,
+/// then `plan → lower → render`. Prefer this name over the older `compile_layer2`.
+pub use front::compile as compile_sql;
+
+/// Flat AGG SQL → [`Request`] (leaf measures only). Nested SQL needs [`compile_sql`].
+pub use front::to_request as sql_to_request;
+
+/// [`compile_sql`] against a session [`Layer2Catalog`].
+pub use front::compile_with as compile_sql_with;
+
+/// `CREATE VIEW` + `SELECT` script for the SQL frontend.
+pub use front::compile_script as compile_sql_script;
+
+pub use front::{define_layer2_view, Layer2Catalog, Layer2Column, Layer2ColumnKind};
+
+/// Older name for [`compile_sql`].
+pub use front::compile as compile_layer2;
+
+/// Older name for [`compile_sql_with`].
+pub use front::compile_with as compile_layer2_with;
+
+/// Older name for [`compile_sql_script`].
+pub use front::compile_script as compile_layer2_script;
+
+/// Older name for [`sql_to_request`].
+pub use front::to_request as layer2_to_request;
 
 use serde::Serialize;
 

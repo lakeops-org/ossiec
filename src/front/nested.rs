@@ -1,4 +1,4 @@
-//! Nested Layer 2: derived tables (Appendix A.2–A.3).
+//! Nested AGG stages: derived tables (Appendix A.2–A.3).
 //!
 //! **One recursive compile, no nested [`Request`] / [`LogicalPlan`].** Every
 //! `AGG` stage is the flat pipeline (request → `plan` → `lower` → FILTER lowering →
