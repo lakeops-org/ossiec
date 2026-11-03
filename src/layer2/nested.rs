@@ -28,8 +28,8 @@ use polyglot_sql::{generate, DialectType, Expression};
 
 use super::{
     apply_consumer_joins, apply_select_formulas, parse_stage_from, parse_stage_prep,
-    parse_top_select, planned_alias_on_leg, rename_consumer_outputs, stage_aliases, unsupported,
-    L2Formula, StageCfg,
+    parse_top_select, planned_alias_on_leg, protect_inflating_joins, rename_consumer_outputs,
+    stage_aliases, unsupported, L2Formula, StageCfg,
 };
 use crate::graph::{Ctx, SemanticGraph};
 use crate::plan::{self, DerivedJoin, Request};
@@ -336,7 +336,9 @@ impl Compiler<'_> {
                 rel_cols.push(node.outputs[i].name.clone());
                 key_idx.push(i);
             }
-            if aggregates {
+            // CROSS has no join columns; primary-key de-duplication (below) keeps
+            // G2. An equijoin must still be unique on its keys.
+            if aggregates && spec.kind != plan::JoinKind::Cross {
                 let unique = node
                     .unique_key
                     .as_ref()
@@ -392,6 +394,7 @@ impl Compiler<'_> {
                 }
             }
         }
+        protect_inflating_joins(graph, &mut logical, &mut self.ctx)?;
         apply_select_formulas(graph, &mut logical, &parsed.measure_outputs)?;
         rename_consumer_outputs(&mut logical, &parsed.measure_outputs, &parsed.dim_labels);
 

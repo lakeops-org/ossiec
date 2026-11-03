@@ -181,7 +181,12 @@ fn tree_sql(
 ) -> String {
     let mut out = format!(" FROM {}", t.e(g.source_as(start.0, &rename(start.1))));
     for step in steps {
-        let r = &g.rels[step.rel];
+        if step.kind == JoinKind::Cross {
+            let to = t.e(g.source_as(step.to, &rename(&step.to_alias)));
+            out.push_str(&format!(" CROSS JOIN {to}"));
+            continue;
+        }
+        let r = &g.rels[step.rel.expect("relationship join")];
         let joined_ds = if step.reverse { r.from } else { step.to };
         let to = t.e(g.source_as(joined_ds, &rename(&step.to_alias)));
         let conds: Vec<String> = if step.reverse {
@@ -205,11 +210,11 @@ fn tree_sql(
                 })
                 .collect()
         };
-        let kw = match step.kind {
-            JoinKind::Left => "LEFT JOIN",
-            JoinKind::Inner => "INNER JOIN",
-        };
-        out.push_str(&format!(" {kw} {to} ON {}", conds.join(" AND ")));
+        out.push_str(&format!(
+            " {} {to} ON {}",
+            step.kind.sql(),
+            conds.join(" AND ")
+        ));
     }
     // Derived tables (Layer 2 A.2) come last: their ON reads attach-side
     // fields, which relationship joins may have just introduced. Every part
@@ -233,11 +238,15 @@ fn tree_sql(
                 }
             })
             .collect();
-        let kw = match d.kind {
-            JoinKind::Left => "LEFT JOIN",
-            JoinKind::Inner => "INNER JOIN",
-        };
-        out.push_str(&format!(" {kw} {rel} ON {}", conds.join(" AND ")));
+        if d.kind == JoinKind::Cross {
+            out.push_str(&format!(" CROSS JOIN {rel}"));
+            continue;
+        }
+        out.push_str(&format!(
+            " {} {rel} ON {}",
+            d.kind.sql(),
+            conds.join(" AND ")
+        ));
     }
     out
 }

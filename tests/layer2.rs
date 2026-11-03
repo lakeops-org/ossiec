@@ -1,4 +1,4 @@
-//! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1, A.2, A.3, A.4, A.5, A.6).
+//! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1–A.6, §7.6 join kinds).
 
 mod common;
 
@@ -137,6 +137,148 @@ fn left_join_customers_matches_layer3_agg_shape() {
     )
     .unwrap();
     assert_eq!(l2.sql, l3.sql);
+}
+
+/// Shop answers for §7.6. `COUNT(*)` would count null-extended or crossed rows;
+/// the reference counts order ids so a preserved customer with no order adds nothing.
+fn assert_join_answer(sql: &str, keyword: &str, reference: &str, naive: &str) {
+    let c = ossiec::compile_layer2(&graph(), sql, &duck()).unwrap();
+    assert!(
+        c.sql.to_uppercase().contains(keyword),
+        "expected {keyword} in {}",
+        c.sql
+    );
+    let db = duckdb();
+    let got = sorted(duckdb_rows(&db, &c.sql));
+    let want = sorted(duckdb_rows(&db, reference));
+    let inflated = sorted(duckdb_rows(&db, naive));
+    assert_ne!(
+        inflated, want,
+        "reference must differ from a join that counts null-extended rows"
+    );
+    assert_eq!(got, want, "sql:\n{}", c.sql);
+}
+
+#[test]
+fn right_join_keeps_customers_without_inflating_orders() {
+    let sql = "SELECT c.id, AGG(o.order_count) AS n \
+        FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id \
+        GROUP BY c.id";
+    let reference = "SELECT c.customer_id, COUNT(o.order_id) \
+        FROM orders o RIGHT JOIN {customers} c ON o.customer_id = c.customer_id \
+        GROUP BY c.customer_id";
+    let naive = "SELECT c.customer_id, COUNT(*) \
+        FROM orders o RIGHT JOIN {customers} c ON o.customer_id = c.customer_id \
+        GROUP BY c.customer_id";
+    assert_join_answer(sql, "RIGHT JOIN", reference, naive);
+}
+
+#[test]
+fn full_join_keeps_both_sides_without_inflating_orders() {
+    let sql = "SELECT c.id, AGG(o.order_count) AS n \
+        FROM orders o FULL JOIN customers c ON o.customer_id = c.id \
+        GROUP BY c.id";
+    let reference = "SELECT c.customer_id, COUNT(o.order_id) \
+        FROM orders o FULL JOIN {customers} c ON o.customer_id = c.customer_id \
+        GROUP BY c.customer_id";
+    let naive = "SELECT c.customer_id, COUNT(*) \
+        FROM orders o FULL JOIN {customers} c ON o.customer_id = c.customer_id \
+        GROUP BY c.customer_id";
+    assert_join_answer(sql, "FULL JOIN", reference, naive);
+}
+
+#[test]
+fn cross_join_does_not_multiply_the_measure() {
+    let sql = "SELECT AGG(o.order_count) AS n FROM orders o CROSS JOIN customers c";
+    let c = ossiec::compile_layer2(&graph(), sql, &duck()).unwrap();
+    assert!(c.sql.to_uppercase().contains("CROSS JOIN"), "{}", c.sql);
+    let db = duckdb();
+    let got = duckdb_rows(&db, &c.sql);
+    let want = duckdb_rows(&db, "SELECT COUNT(*) FROM orders");
+    let inflated = duckdb_rows(&db, "SELECT COUNT(*) FROM orders CROSS JOIN {customers}");
+    assert_ne!(inflated, want);
+    assert_eq!(got, want, "sql:\n{}", c.sql);
+}
+
+#[test]
+fn cross_join_grouped_by_the_other_side_counts_each_order_once_per_group() {
+    let sql = "SELECT c.region, AGG(o.order_count) AS n \
+        FROM orders o CROSS JOIN customers c GROUP BY c.region";
+    let reference = "SELECT region, (SELECT COUNT(*) FROM orders) \
+        FROM {customers} GROUP BY region";
+    let naive = "SELECT c.region, COUNT(*) \
+        FROM orders o CROSS JOIN {customers} c GROUP BY c.region";
+    assert_join_answer(sql, "CROSS JOIN", reference, naive);
+}
+
+#[test]
+fn cross_join_with_on_is_refused() {
+    let m = unsupported_msg(
+        ossiec::compile_layer2(
+            &graph(),
+            "SELECT AGG(o.order_count) FROM orders o CROSS JOIN customers c ON o.customer_id = c.id",
+            &duck(),
+        )
+        .unwrap_err(),
+    );
+    assert!(m.contains("CROSS JOIN") && m.contains("ON"), "{m}");
+}
+
+#[test]
+fn derived_cross_join_does_not_multiply_the_measure() {
+    let sql = "SELECT AGG(o.order_count) AS n FROM orders o \
+        CROSS JOIN (SELECT region FROM customers GROUP BY region) t";
+    let c = ossiec::compile_layer2(&graph(), sql, &duck()).unwrap();
+    assert!(c.sql.to_uppercase().contains("CROSS JOIN"), "{}", c.sql);
+    let db = duckdb();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(&db, "SELECT COUNT(*) FROM orders"),
+        "sql:\n{}",
+        c.sql
+    );
+}
+
+#[test]
+fn shell_right_and_cross_join_match_plain_sql() {
+    let db = duckdb();
+    let right = "SELECT d.status, COUNT(*) AS n \
+        FROM (SELECT status, customer_id FROM orders GROUP BY status, customer_id) d \
+        RIGHT JOIN (SELECT id FROM customers GROUP BY id) m ON d.customer_id = m.id \
+        GROUP BY d.status";
+    let c = ossiec::compile_layer2(&graph(), right, &duck()).unwrap();
+    assert!(c.sql.to_uppercase().contains("RIGHT JOIN"), "{}", c.sql);
+    let right_ref = "SELECT d.status, COUNT(*) AS n \
+        FROM (SELECT status, customer_id FROM orders GROUP BY status, customer_id) d \
+        RIGHT JOIN (SELECT customer_id AS id FROM {customers} GROUP BY customer_id) m \
+          ON d.customer_id = m.id \
+        GROUP BY d.status";
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(&db, right_ref))
+    );
+
+    let cross = "SELECT COUNT(*) AS n \
+        FROM (SELECT status FROM orders GROUP BY status) d \
+        CROSS JOIN (SELECT region FROM customers GROUP BY region) c";
+    let c = ossiec::compile_layer2(&graph(), cross, &duck()).unwrap();
+    assert!(c.sql.to_uppercase().contains("CROSS JOIN"), "{}", c.sql);
+    let cross_ref = "SELECT COUNT(*) FROM (SELECT status FROM orders GROUP BY status) d \
+        CROSS JOIN (SELECT region FROM {customers} GROUP BY region) c";
+    assert_eq!(duckdb_rows(&db, &c.sql), duckdb_rows(&db, cross_ref));
+}
+
+#[test]
+fn exotic_join_kind_is_still_refused() {
+    let m = unsupported_msg(
+        ossiec::compile_layer2(
+            &graph(),
+            "SELECT AGG(o.order_count) FROM orders o NATURAL JOIN customers c",
+            &duck(),
+        )
+        .unwrap_err(),
+    );
+    assert!(m.contains("not supported") && m.contains("INNER"), "{m}");
 }
 
 fn two_facts_graph() -> ossiec::SemanticGraph {

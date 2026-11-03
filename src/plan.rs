@@ -182,17 +182,41 @@ pub(crate) struct PlannedTerm {
 pub(crate) type Node = (usize, Option<usize>);
 
 /// Join type for a step in a leg. Layer 3 requests always use [`JoinKind::Left`];
-/// Layer 2 consumer SQL may ask for [`JoinKind::Inner`] (relational_semantics A.6).
+/// Layer 2 consumer SQL may ask for inner, left, right, full, or cross
+/// (relational_semantics A.6 and §7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum JoinKind {
     #[default]
     Left,
     Inner,
+    Right,
+    Full,
+    Cross,
+}
+
+impl JoinKind {
+    pub(crate) fn sql(self) -> &'static str {
+        match self {
+            JoinKind::Left => "LEFT JOIN",
+            JoinKind::Inner => "INNER JOIN",
+            JoinKind::Right => "RIGHT JOIN",
+            JoinKind::Full => "FULL JOIN",
+            JoinKind::Cross => "CROSS JOIN",
+        }
+    }
+
+    /// RIGHT/FULL null-extend one side and CROSS multiplies rows. An inline
+    /// aggregate would then see rows that are not the measure's source rows
+    /// (relational_semantics §7.6, G2).
+    pub(crate) fn inflates_inline(self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Full | JoinKind::Cross)
+    }
 }
 
 /// One join: `<kind> JOIN <to> AS to_alias ON <rel's columns from from_alias>`.
+/// [`JoinKind::Cross`] has no `ON` and no relationship (`rel` is `None`).
 pub(crate) struct JoinStep {
-    pub rel: usize,
+    pub rel: Option<usize>,
     pub from_alias: String,
     pub to: usize,
     pub to_alias: String,
@@ -779,17 +803,19 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
         for (depth, &r) in path.iter().enumerate() {
             let rel = &g.rels[r];
             match steps.iter().find(|(_, s)| s.to_alias == g.datasets[rel.to].name) {
-                Some((_, s)) if s.rel == r => {}
+                Some((_, s)) if s.rel == Some(r) => {}
                 Some((_, s)) => {
                     return Err(req_err(format!(
                         "`{}` is reached both through `{}` and `{}`; name the role you mean as `<relationship>.<field>`",
-                        g.datasets[rel.to].name, g.rels[s.rel].name, rel.name
+                        g.datasets[rel.to].name,
+                        g.rels[s.rel.expect("planned relationship join")].name,
+                        rel.name
                     )))
                 }
                 None => steps.push((
                     depth,
                     JoinStep {
-                        rel: r,
+                        rel: Some(r),
                         from_alias: g.datasets[rel.from].name.clone(),
                         to: rel.to,
                         to_alias: g.datasets[rel.to].name.clone(),
@@ -819,7 +845,7 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
                 steps.push((
                     path.len(),
                     JoinStep {
-                        rel: r,
+                        rel: Some(r),
                         from_alias,
                         to: ds,
                         to_alias,

@@ -3,7 +3,8 @@
 //! Spec: `relational_semantics.md` (draft). Appendix **A.1** (single `FROM` relation),
 //! **A.4** (multi-fact measures sharing dimensions, plus `AGG` arithmetic in the
 //! select list), and **A.5–A.6** (consumer joins along model relationships,
-//! including unused many→one and reverse fan-out, with `INNER` vs `LEFT`) translate
+//! including unused many→one and reverse fan-out, with `INNER` / `LEFT` /
+//! `RIGHT` / `FULL` / `CROSS`, §7.6) translate
 //! to the existing [`Request`] planner. [`to_request`] / [`layer2_to_request`] expose
 //! only **leaf** measures referenced inside `AGG(...)`, not composed output names,
 //! and only for flat queries.
@@ -16,8 +17,8 @@
 //! **§7.7** (unevaluated measures): a derived table may pass a dataset-scoped
 //! measure through its select list; an outer `AGG(t.m)` evaluates it. A query-local
 //! `(AGG(a) / AGG(b)) TO MEASURE AS m` item (Appendix A.7 / §5.2 surface) defers a
-//! composed measure the same way. Other join forms (`RIGHT`/`FULL`/`CROSS`/`ASOF`,
-//! `CREATE VIEW`, …) stay [`Error::Unsupported`].
+//! composed measure the same way. Other join forms (`ASOF`, `SEMI`/`ANTI`,
+//! `NATURAL`, `LATERAL`, …) and `CREATE VIEW` stay [`Error::Unsupported`].
 //!
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
@@ -143,7 +144,8 @@ pub(super) struct DerivedSpec {
 }
 
 pub(super) struct ConsumerJoin {
-    rel: usize,
+    /// Model relationship. `None` for `CROSS JOIN` (no `ON`).
+    rel: Option<usize>,
     kind: JoinKind,
     reverse: bool,
     attach_ds: usize,
@@ -530,10 +532,15 @@ fn apply_consumer_joins(
 ) -> Result<()> {
     let mut added_reverse: Vec<usize> = vec![];
     for cj in consumer {
+        if cj.kind == JoinKind::Cross {
+            apply_cross_join(graph, logical, cj)?;
+            continue;
+        }
+        let rel = cj.rel.expect("relationship join");
         let mut patched = false;
         for leg in &mut logical.legs {
             for step in &mut leg.joins {
-                if step.rel == cj.rel {
+                if step.rel == Some(rel) {
                     step.kind = cj.kind;
                     patched = true;
                 }
@@ -542,7 +549,7 @@ fn apply_consumer_joins(
         if patched {
             continue;
         }
-        let leg_i = consumer_join_leg(graph, logical, cj)?;
+        let leg_i = consumer_join_leg(graph, logical, cj, rel)?;
         // ON must use the same aliases `tree_sql` uses for the leg (dataset
         // name for the root, `to_alias` for prior joins)—not the consumer SQL
         // alias (`o` vs `orders`).
@@ -550,12 +557,12 @@ fn apply_consumer_joins(
             .ok_or_else(|| {
                 unsupported(format!(
                     "Layer 2 join on `{}`: attach dataset `{}` has no planned alias on its leg",
-                    graph.rels[cj.rel].name, graph.datasets[cj.attach_ds].name
+                    graph.rels[rel].name, graph.datasets[cj.attach_ds].name
                 ))
             })?;
         let leg = &mut logical.legs[leg_i];
         leg.joins.push(JoinStep {
-            rel: cj.rel,
+            rel: Some(rel),
             from_alias,
             to: cj.other_ds,
             to_alias: cj.other_alias.clone(),
@@ -592,10 +599,129 @@ fn apply_consumer_joins(
     Ok(())
 }
 
+/// `CROSS JOIN` has no relationship. One measure leg: either replace the planned
+/// equijoin of that dataset with `CROSS JOIN`, or append one when the dataset
+/// was not already required. Several legs have no single join tree to put a
+/// Cartesian product on.
+fn apply_cross_join(
+    graph: &SemanticGraph,
+    logical: &mut LogicalPlan,
+    cj: &ConsumerJoin,
+) -> Result<()> {
+    if logical.legs.len() != 1 {
+        return Err(unsupported(
+            "Layer 2 CROSS JOIN cannot span independent facts (relational_semantics §7.6); a Cartesian product has no single measure leg to attach to",
+        ));
+    }
+    let root = logical.legs[0].root;
+    let on_leg = |ds: usize| planned_alias_on_leg(graph, &logical.legs[0], ds).is_some();
+    if !on_leg(cj.attach_ds) && !on_leg(cj.other_ds) {
+        return Err(unsupported(
+            "Layer 2 CROSS JOIN cannot attach to the planned query; neither side is on the measure's join tree (relational_semantics §7.6)",
+        ));
+    }
+    // The fact stays the root. Cross the other dataset onto it.
+    let target = if cj.other_ds == root {
+        cj.attach_ds
+    } else {
+        cj.other_ds
+    };
+    if target == root {
+        return Err(unsupported(
+            "Layer 2 CROSS JOIN needs two datasets; both sides resolved to the same fact",
+        ));
+    }
+    let alias = if target == cj.other_ds {
+        cj.other_alias.clone()
+    } else {
+        cj.attach_alias.clone()
+    };
+    let name = graph.datasets[target].name.clone();
+    let hits: Vec<usize> = logical.legs[0]
+        .joins
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.to == target)
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [i] => {
+            let step = &mut logical.legs[0].joins[*i];
+            if step.kind == JoinKind::Cross {
+                return Err(unsupported(format!(
+                    "Layer 2 duplicate CROSS JOIN of `{name}`"
+                )));
+            }
+            step.kind = JoinKind::Cross;
+        }
+        [] => {
+            logical.legs[0].joins.push(JoinStep {
+                rel: None,
+                from_alias: graph.datasets[root].name.clone(),
+                to: target,
+                to_alias: alias,
+                kind: JoinKind::Cross,
+                reverse: false,
+            });
+        }
+        _ => {
+            return Err(unsupported(format!(
+                "Layer 2 CROSS JOIN of `{name}` is ambiguous; the planned query joins it more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// RIGHT/FULL add null-extended rows and CROSS multiplies them. Inline
+/// `COUNT(*)` / `SUM` would count those rows. De-duplicate the fact by its
+/// primary key (the same path as fan-out) so each source row enters a group
+/// once, while the base part still emits every group the join produced (§7.6).
+pub(super) fn protect_inflating_joins(
+    graph: &SemanticGraph,
+    logical: &mut LogicalPlan,
+    ctx: &mut graph::Ctx,
+) -> Result<()> {
+    for leg_i in 0..logical.legs.len() {
+        let inflates = logical.legs[leg_i]
+            .joins
+            .iter()
+            .any(|s| s.kind.inflates_inline())
+            || logical.legs[leg_i]
+                .derived
+                .iter()
+                .any(|d| d.kind.inflates_inline());
+        if !inflates {
+            continue;
+        }
+        let root = logical.legs[leg_i].root;
+        if graph.datasets[root].primary_key.is_empty() {
+            return Err(unsupported(format!(
+                "Layer 2 RIGHT, FULL, or CROSS JOIN requires a primary_key on `{}` so measures stay duplicate-free (relational_semantics §7.6 G2)",
+                graph.datasets[root].name
+            )));
+        }
+        for term in &mut logical.terms {
+            if term.leg != leg_i || term.strategy != Strategy::Inline || term.term.dup_insensitive {
+                continue;
+            }
+            ctx.warn(format!(
+                "FAN_TRAP_RISK: `{}` is computed over `{}` rows de-duplicated by primary key; a `{}` row that belongs to several groups counts in each, so groups do not add up to a grand total",
+                term.term.key,
+                graph.datasets[root].name,
+                graph.datasets[root].name
+            ));
+            term.strategy = Strategy::PkDedup { grain: root };
+        }
+    }
+    Ok(())
+}
+
 fn consumer_join_leg(
     graph: &SemanticGraph,
     logical: &LogicalPlan,
     cj: &ConsumerJoin,
+    rel: usize,
 ) -> Result<usize> {
     for (i, leg) in logical.legs.iter().enumerate() {
         if leg_hosts_attach(graph, leg, cj.attach_ds, &cj.attach_alias) {
@@ -604,7 +730,7 @@ fn consumer_join_leg(
     }
     Err(unsupported(format!(
         "Layer 2 join on relationship `{}` cannot attach to the planned query; no leg includes `{}` as `{}`",
-        graph.rels[cj.rel].name,
+        graph.rels[rel].name,
         graph.datasets[cj.attach_ds].name,
         cj.attach_alias
     )))
@@ -626,7 +752,7 @@ fn planned_alias_on_leg(graph: &SemanticGraph, leg: &plan::Leg, ds: usize) -> Op
     }
     for s in &leg.joins {
         let joined = if s.reverse {
-            graph.rels[s.rel].from
+            graph.rels[s.rel.expect("reverse relationship join")].from
         } else {
             s.to
         };
@@ -892,15 +1018,49 @@ pub(super) fn parse_from_clause(
     let mut consumer_joins = Vec::new();
     for j in joins {
         if let Some((select, alias)) = as_derived(&j.this)? {
+            let kind = consumer_join_kind(j)?;
+            if kind == JoinKind::Cross {
+                if j.on.is_some() {
+                    return Err(cross_join_on());
+                }
+                if !j.using.is_empty() {
+                    return Err(unsupported("Layer 2 JOIN USING is not supported; use ON"));
+                }
+                if scope.bindings.is_empty() {
+                    return Err(unsupported(
+                        "Layer 2 CROSS JOIN of a derived table needs a model dataset in FROM",
+                    ));
+                }
+                let taken = scope
+                    .bindings
+                    .iter()
+                    .map(|b| &b.alias)
+                    .chain(&scope.derived)
+                    .any(|a| a.eq_ignore_ascii_case(&alias));
+                if taken {
+                    return Err(Error::Request(format!(
+                        "Layer 2 derived table alias `{alias}` collides with another relation in FROM/JOIN"
+                    )));
+                }
+                let attach_ds = scope.bindings[0].dataset;
+                scope.derived.push(alias.clone());
+                derived_specs.push(DerivedSpec {
+                    alias,
+                    select: select.clone(),
+                    kind,
+                    attach_ds,
+                    from_fields: vec![],
+                    cols: vec![],
+                    null_safe: false,
+                });
+                continue;
+            }
             let spec = parse_derived_join(graph, &scope, j, select, alias)?;
             scope.derived.push(spec.alias.clone());
             derived_specs.push(spec);
             continue;
         }
         let kind = consumer_join_kind(j)?;
-        let on = j.on.as_ref().ok_or_else(|| {
-            unsupported("Layer 2 JOIN requires an ON condition matching a model relationship")
-        })?;
         if !j.using.is_empty() {
             return Err(unsupported("Layer 2 JOIN USING is not supported; use ON"));
         }
@@ -909,6 +1069,37 @@ pub(super) fn parse_from_clause(
             dataset: right_ds,
             alias: right_alias.unwrap_or_else(|| graph.datasets[right_ds].name.clone()),
         };
+        if kind == JoinKind::Cross {
+            if j.on.is_some() {
+                return Err(cross_join_on());
+            }
+            if scope.bindings.is_empty() {
+                return Err(unsupported(
+                    "Layer 2 CROSS JOIN needs a dataset already in FROM",
+                ));
+            }
+            if scope.bindings.iter().any(|b| b.dataset == right_ds) {
+                return Err(unsupported(format!(
+                    "Layer 2 CROSS JOIN target `{}` is already in FROM",
+                    graph.datasets[right_ds].name
+                )));
+            }
+            let attach = &scope.bindings[0];
+            consumer_joins.push(ConsumerJoin {
+                rel: None,
+                kind,
+                reverse: false,
+                attach_ds: attach.dataset,
+                attach_alias: attach.alias.clone(),
+                other_ds: right_ds,
+                other_alias: right_binding.alias.clone(),
+            });
+            scope.bindings.push(right_binding);
+            continue;
+        }
+        let on = j.on.as_ref().ok_or_else(|| {
+            unsupported("Layer 2 JOIN requires an ON condition matching a model relationship")
+        })?;
         let pairs = on_equality_pairs(on)?;
         let join_scope = QueryScope {
             bindings: scope
@@ -922,7 +1113,10 @@ pub(super) fn parse_from_clause(
             outer: scope.outer.clone(),
         };
         let rel = match_relationship(graph, &join_scope, &pairs)?;
-        if consumer_joins.iter().any(|c: &ConsumerJoin| c.rel == rel) {
+        if consumer_joins
+            .iter()
+            .any(|c: &ConsumerJoin| c.rel == Some(rel))
+        {
             return Err(unsupported(format!(
                 "Layer 2 duplicate join on relationship `{}`",
                 graph.rels[rel].name
@@ -956,7 +1150,7 @@ pub(super) fn parse_from_clause(
                 ))
             })?;
         consumer_joins.push(ConsumerJoin {
-            rel,
+            rel: Some(rel),
             kind,
             reverse,
             attach_ds,
@@ -1069,14 +1263,20 @@ fn on_pairs_null_safe(on: &Expression) -> Result<Vec<(Column, Column, bool)>> {
     }
 }
 
+pub(super) fn cross_join_on() -> Error {
+    unsupported(
+        "Layer 2 CROSS JOIN does not take an ON condition; it is a Cartesian product (relational_semantics §7.6). Drop ON, or use INNER, LEFT, RIGHT, or FULL JOIN",
+    )
+}
+
 fn consumer_join_kind(j: &Join) -> Result<JoinKind> {
     match j.kind {
         SqlJoinKind::Inner | SqlJoinKind::Implicit => Ok(JoinKind::Inner),
         SqlJoinKind::Left | SqlJoinKind::NaturalLeft => Ok(JoinKind::Left),
-        SqlJoinKind::Right
-        | SqlJoinKind::Full
-        | SqlJoinKind::Cross
-        | SqlJoinKind::AsOf
+        SqlJoinKind::Right => Ok(JoinKind::Right),
+        SqlJoinKind::Full => Ok(JoinKind::Full),
+        SqlJoinKind::Cross => Ok(JoinKind::Cross),
+        SqlJoinKind::AsOf
         | SqlJoinKind::AsOfLeft
         | SqlJoinKind::AsOfRight
         | SqlJoinKind::Outer
@@ -1098,7 +1298,7 @@ fn consumer_join_kind(j: &Join) -> Result<JoinKind> {
         | SqlJoinKind::LeftArray
         | SqlJoinKind::Paste
         | SqlJoinKind::Positional => Err(unsupported(
-            "Layer 2 only supports INNER JOIN, JOIN, and LEFT JOIN (Appendix A.6)",
+            "Layer 2 supports INNER, LEFT, RIGHT, FULL, and CROSS JOIN (relational_semantics §7.6); this join kind is not supported",
         )),
     }
 }
