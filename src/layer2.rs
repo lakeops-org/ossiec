@@ -11,7 +11,8 @@
 //!
 //! **A.2–A.3** (derived tables) compile recursively in [`nested`]: every `AGG`
 //! stage is an ordinary [`Request`] → plan → lower pass, derived tables join in
-//! through the planner's `DerivedJoin`, and an outer SQL aggregate over derived
+//! through the planner's `DerivedJoin` on each leg that hosts the attach dataset,
+//! and an outer SQL aggregate over derived
 //! tables (A.3) is a thin shell outside plan/lower.
 //!
 //! **§7.7** (unevaluated measures): a derived table may pass a dataset-scoped

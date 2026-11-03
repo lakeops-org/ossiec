@@ -7,8 +7,10 @@
 //! spliced into the plan as SQL text:
 //!
 //! 1. The outer stage plans and lowers with a **placeholder relation**
-//!    (`__ossiec_derivN`) joined through a [`plan::DerivedJoin`] on its leg, so the
-//!    join exists in every part `lower` builds (base, stacked, `PkDedup`).
+//!    (`__ossiec_derivN`) joined through a [`plan::DerivedJoin`] on each leg that
+//!    hosts the attach dataset, so the join exists in every part `lower` builds
+//!    for those legs (base, stacked, `PkDedup`). A leg that does not host the
+//!    dataset is left unrestricted.
 //! 2. Each stage is adapted for the target with its own plan.
 //! 3. [`resolve`] substitutes every placeholder, bottom-up, with the (already
 //!    adapted) inner AST.
@@ -375,25 +377,16 @@ impl Compiler<'_> {
                     "Layer 2 derived-table JOIN cannot be combined with includeUnmatched",
                 ));
             }
-            // A derived table restricts the dataset it attaches to, in every leg
-            // that reads it: independent facts (A.4) share a dimension to attach to.
+            // Attach only to legs that host the dataset. A leg that does not
+            // read it stays unrestricted, so one independent fact can be filtered
+            // without filtering the others. Refuse only when no leg hosts it.
             for (spec, (placeholder, rel_cols)) in parsed.derived.iter().zip(prepared) {
-                let parsed_legs = logical.legs.len();
+                let mut attached = false;
                 for leg in &mut logical.legs {
-                    let from_alias = planned_alias_on_leg(graph, leg, spec.attach_ds)
-                        .ok_or_else(|| {
-                            if parsed_legs > 1 {
-                                unsupported(format!(
-                                    "Layer 2 derived-table JOIN `{}` with measures from independent facts (A.4) needs a dataset every fact reaches; `{}` is not part of each planned leg",
-                                    spec.alias, graph.datasets[spec.attach_ds].name
-                                ))
-                            } else {
-                                unsupported(format!(
-                                    "Layer 2 derived-table JOIN `{}`: dataset `{}` is not part of the planned query",
-                                    spec.alias, graph.datasets[spec.attach_ds].name
-                                ))
-                            }
-                        })?;
+                    let Some(from_alias) = planned_alias_on_leg(graph, leg, spec.attach_ds) else {
+                        continue;
+                    };
+                    attached = true;
                     leg.derived.push(DerivedJoin {
                         from_alias,
                         from_fields: spec.from_fields.clone(),
@@ -402,6 +395,20 @@ impl Compiler<'_> {
                         rel_cols: rel_cols.clone(),
                         null_safe: spec.null_safe,
                         kind: spec.kind,
+                    });
+                }
+                if !attached {
+                    let ds = &graph.datasets[spec.attach_ds].name;
+                    return Err(if logical.legs.len() > 1 {
+                        unsupported(format!(
+                            "Layer 2 derived-table JOIN `{}` with measures from independent facts (A.4) needs a dataset every fact reaches; `{}` is not part of each planned leg",
+                            spec.alias, ds
+                        ))
+                    } else {
+                        unsupported(format!(
+                            "Layer 2 derived-table JOIN `{}`: dataset `{}` is not part of the planned query",
+                            spec.alias, ds
+                        ))
                     });
                 }
             }
