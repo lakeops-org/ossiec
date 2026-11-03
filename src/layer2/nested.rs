@@ -204,13 +204,15 @@ pub(super) fn view_outputs(
     opts: &Options,
 ) -> Result<Vec<OutCol>> {
     let mut c = Compiler {
-        graph,
+        graph: graph.clone(),
         opts,
         ctx: Ctx {
             prefer: opts.prefer_dialect.clone(),
             ..Default::default()
         },
         derived_count: 0,
+        base_seq: 0,
+        include_unmatched: false,
         flat_request: None,
         to_measures: to_measures.to_vec(),
     };
