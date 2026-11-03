@@ -16,8 +16,8 @@
 //!   derived column, or `COUNT(*)`; each may carry an alias. Without one the
 //!   output is named after the column, or `{func}_{column}` (`avg_n`,
 //!   `count_star`).
-//! - `FROM <derived> [INNER|LEFT] JOIN <derived> ON a = b [AND ...]`; `=` or
-//!   `IS NOT DISTINCT FROM` per pair.
+//! - `FROM <derived> [INNER|LEFT|RIGHT|FULL] JOIN <derived> ON a = b [AND ...]`,
+//!   or `CROSS JOIN` with no `ON`; `=` or `IS NOT DISTINCT FROM` per pair.
 //! - `WHERE column <op> literal`, `HAVING aggregate <op> literal` joined by `AND`;
 //!   `GROUP BY` the selected plain columns; `ORDER BY` an output name (or the
 //!   item it names); `LIMIT n`.
@@ -33,7 +33,8 @@ use polyglot_sql::Expression;
 
 use super::nested::{check_unique_names, Compiler, Node, OutCol, OutKind, Relation};
 use super::{
-    as_column, as_derived, consumer_join_kind, limit_u64, table_expr, take_agg, unsupported,
+    as_column, as_derived, consumer_join_kind, cross_join_on, limit_u64, table_expr, take_agg,
+    unsupported,
 };
 use crate::dialect;
 use crate::plan::JoinKind;
@@ -62,7 +63,12 @@ impl AggFn {
 }
 
 /// One `FROM` / `JOIN` item: alias, the derived `SELECT`, and for a join its kind and `ON`.
-type ShellFrom<'a> = (String, &'a Select, Option<(JoinKind, &'a Expression)>);
+/// `CROSS JOIN` carries `None` for the condition.
+type ShellFrom<'a> = (
+    String,
+    &'a Select,
+    Option<(JoinKind, Option<&'a Expression>)>,
+);
 
 /// `(relation, column)` indexes into the shell's relations.
 type ColRef = (usize, usize);
@@ -101,10 +107,18 @@ impl Compiler<'_> {
             if !j.using.is_empty() {
                 return Err(unsupported("Layer 2 JOIN USING is not supported; use ON"));
             }
+            let kind = consumer_join_kind(j)?;
+            if kind == JoinKind::Cross {
+                if j.on.is_some() {
+                    return Err(cross_join_on());
+                }
+                items.push((alias, select, Some((kind, None))));
+                continue;
+            }
             let on = j.on.as_ref().ok_or_else(|| {
                 unsupported("Layer 2 JOIN between derived tables requires an ON condition")
             })?;
-            items.push((alias, select, Some((consumer_join_kind(j)?, on))));
+            items.push((alias, select, Some((kind, Some(on)))));
         }
         for (i, (a, ..)) in items.iter().enumerate() {
             if items[..i].iter().any(|(b, ..)| b.eq_ignore_ascii_case(a)) {
@@ -219,13 +233,16 @@ impl Compiler<'_> {
             let r = t.e(sql::placeholder_relation(placeholder, alias));
             match &items[k].2 {
                 None => text.push_str(&format!(" FROM {r}")),
-                Some((kind, on)) => {
-                    let kw = match kind {
-                        JoinKind::Left => "LEFT JOIN",
-                        JoinKind::Inner => "INNER JOIN",
-                    };
+                Some((JoinKind::Cross, None)) => text.push_str(&format!(" CROSS JOIN {r}")),
+                Some((JoinKind::Cross, Some(_))) => return Err(cross_join_on()),
+                Some((kind, Some(on))) => {
                     let cond = scope.join_condition(on, k, graph, &mut t, native_null_safe)?;
-                    text.push_str(&format!(" {kw} {r} ON {cond}"));
+                    text.push_str(&format!(" {} {r} ON {cond}", kind.sql()));
+                }
+                Some((_, None)) => {
+                    return Err(unsupported(
+                        "Layer 2 JOIN between derived tables requires an ON condition",
+                    ));
                 }
             }
         }
