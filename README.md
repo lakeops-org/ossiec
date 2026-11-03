@@ -304,12 +304,11 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 **Engines not in the executed set, with known risks:** Doris has StarRocks' backslash-literal gap; Redshift probably has Postgres' untyped-`NULL` union issue. Neither is covered by dialect rules yet.
 
-**polyglot-sql 0.13.4 bugs, all guarded:**
-- its `QUALIFY` emulation produces invalid SQL;
-- it passes `UNION ALL BY NAME` and `FILTER (WHERE …)` through to engines that lack them;
+**polyglot-sql 0.13.5 notes, still guarded where needed:**
+- it still passes `UNION ALL BY NAME` and `FILTER (WHERE …)` through to engines that lack them;
 - its generic generator upper-cases function names.
 
-ossiec never emits these constructs (checked for 11 engines), and it renders with function case preserved.
+ossiec never emits those constructs (checked for 11 engines), and it renders with function case preserved. `CAST(NULL AS …)` for ClickHouse and MySQL `NULLS FIRST/LAST` are fixed upstream ([polyglot#514](https://github.com/tobilg/polyglot/issues/514), [polyglot#515](https://github.com/tobilg/polyglot/issues/515)).
 
 ## Using ossiec in a query engine
 
