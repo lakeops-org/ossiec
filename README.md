@@ -180,7 +180,7 @@ println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
 
 ### Layer 2 (`AGG(measure)`)
 
-Ossie Layer 2 Appendix A.1: a single dataset, `AGG` over a dataset-scoped metric.
+Ossie Layer 2 Appendix A.1, A.4, and A.5–A.6: `AGG` over dataset-scoped measures, including independent facts that share dimensions, optionally joining model relationships (`INNER` / `LEFT`).
 
 ```bash
 echo "SELECT status, AGG(order_count) FROM orders GROUP BY status" \
@@ -191,7 +191,7 @@ echo "SELECT status, AGG(order_count) FROM orders GROUP BY status" \
 let out = ossiec::compile_layer2(&graph, "SELECT AGG(order_count) FROM orders", &opts)?;
 ```
 
-Model-scoped metrics are not measures (§10.3). Consumer joins and subqueries (A.2–A.7) are not implemented yet.
+Model-scoped metrics are not measures (§10.3). Subqueries and other join forms (A.2–A.3, A.7, `RIGHT`/`FULL`/`CROSS`, …) are not implemented yet.
 
 ## Requests
 
@@ -296,7 +296,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** Appendix A.1 maps to the Layer 3 plan; model-scoped metrics and joins are refused. |
+| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.4 (independent facts), and relationship joins (A.5–A.6) map to the Layer 3 plan; join kinds are patched on lower. |
 
 ## Known issues
 
@@ -312,7 +312,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 **Refused for now:** nested windows; a dataset reached two ways of equal length unless the role is named.
 
-**Spec leniency:** bare names in model-scoped metrics are accepted with a warning. The rule that a `FILTER` predicate may only use the aggregate's own dataset isn't validated yet.
+**Spec leniency:** bare names in model-scoped metrics are accepted with a warning.
 
 **Engine coverage:** answers are verified on DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL, on the shop cases, TPC-DS and fuzzing. Athena, Snowflake, BigQuery, Databricks and Redshift are compile-checked only. See [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md) to move an engine up.
 
@@ -350,7 +350,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Role-playing dimensions (`relationship.field`, shortest path by default)
 - [x] Unmatched one-side rows (`includeUnmatched`)
 - [x] NULL placement in `orderBy`
-- [x] Ossie Layer 2: SQL with `AGG(measure)` (Appendix A.1; joins/subqueries later)
+- [x] Ossie Layer 2: SQL with `AGG(measure)` (Appendix A.1 and A.4; consumer joins A.5–A.6; subqueries later)
 - [ ] Publish to crates.io
 
 ## Contributing

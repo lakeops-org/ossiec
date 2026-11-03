@@ -1,0 +1,29 @@
+# Minimal two independent facts for Layer 2 A.4 tests.
+version: "0.2.0.dev0"
+name: two_facts_layer2
+datasets:
+  - name: orders
+    source: orders
+    fields:
+      - { name: customer_id, expression: { sql: customer_id } }
+      - { name: amount, expression: { sql: amount } }
+    metrics:
+      - { name: order_amt, expression: { sql: SUM(amount) } }
+  - name: tickets
+    source: tickets
+    fields:
+      - { name: customer_id, expression: { sql: customer_id } }
+      - { name: id, expression: { sql: id } }
+    metrics:
+      - { name: ticket_count, expression: { sql: COUNT(*) } }
+  - name: customers
+    source: customers
+    fields:
+      - { name: id, expression: { sql: id } }
+      - { name: region, expression: { sql: region }, dimension: {} }
+relationships:
+  - { name: o_c, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
+  - { name: t_c, from: tickets, to: customers, from_columns: [customer_id], to_columns: [id] }
+metrics:
+  - { name: revenue, expression: { sql: SUM(orders.amount) } }
+  - { name: tickets, expression: { sql: COUNT(tickets.id) } }

@@ -545,6 +545,100 @@ pub fn bind(model: Model) -> Result<SemanticGraph> {
     Ok(g)
 }
 
+/// The `FILTER (WHERE …)` predicate on a typed aggregate, if any.
+fn aggregate_filter(e: &Expression) -> Option<&Expression> {
+    match e {
+        Expression::Sum(f)
+        | Expression::Avg(f)
+        | Expression::Min(f)
+        | Expression::Max(f)
+        | Expression::Median(f)
+        | Expression::Stddev(f)
+        | Expression::StddevPop(f)
+        | Expression::StddevSamp(f)
+        | Expression::Variance(f)
+        | Expression::VarPop(f)
+        | Expression::VarSamp(f)
+        | Expression::ApproxDistinct(f)
+        | Expression::ApproxCountDistinct(f)
+        | Expression::AnyValue(f) => f.filter.as_ref(),
+        Expression::Count(c) => c.filter.as_ref(),
+        Expression::AggregateFunction(a) => a.filter.as_ref(),
+        _ => None,
+    }
+}
+
+/// Same aggregate with its FILTER clause removed (for dataset checks on the body).
+fn clear_aggregate_filter(e: Expression) -> Expression {
+    match e {
+        Expression::Sum(mut f) => {
+            f.filter = None;
+            Expression::Sum(f)
+        }
+        Expression::Avg(mut f) => {
+            f.filter = None;
+            Expression::Avg(f)
+        }
+        Expression::Min(mut f) => {
+            f.filter = None;
+            Expression::Min(f)
+        }
+        Expression::Max(mut f) => {
+            f.filter = None;
+            Expression::Max(f)
+        }
+        Expression::Median(mut f) => {
+            f.filter = None;
+            Expression::Median(f)
+        }
+        Expression::Stddev(mut f) => {
+            f.filter = None;
+            Expression::Stddev(f)
+        }
+        Expression::StddevPop(mut f) => {
+            f.filter = None;
+            Expression::StddevPop(f)
+        }
+        Expression::StddevSamp(mut f) => {
+            f.filter = None;
+            Expression::StddevSamp(f)
+        }
+        Expression::Variance(mut f) => {
+            f.filter = None;
+            Expression::Variance(f)
+        }
+        Expression::VarPop(mut f) => {
+            f.filter = None;
+            Expression::VarPop(f)
+        }
+        Expression::VarSamp(mut f) => {
+            f.filter = None;
+            Expression::VarSamp(f)
+        }
+        Expression::ApproxDistinct(mut f) => {
+            f.filter = None;
+            Expression::ApproxDistinct(f)
+        }
+        Expression::ApproxCountDistinct(mut f) => {
+            f.filter = None;
+            Expression::ApproxCountDistinct(f)
+        }
+        Expression::AnyValue(mut f) => {
+            f.filter = None;
+            Expression::AnyValue(f)
+        }
+        Expression::Count(mut c) => {
+            c.filter = None;
+            Expression::Count(c)
+        }
+        Expression::AggregateFunction(mut a) => {
+            a.filter = None;
+            Expression::AggregateFunction(a)
+        }
+        other => other,
+    }
+}
+
 /// Lower `agg(x) FILTER (WHERE p)` to `agg(CASE WHEN p THEN x END)`.
 /// The expression language allows this rewrite (`expression_language.md`, FILTER section).
 /// Called at compile time only for targets that lack native aggregate FILTER.
@@ -797,6 +891,68 @@ impl SemanticGraph {
         }
     }
 
+    /// `FILTER (WHERE p)` may only name fields of the aggregate's own dataset
+    /// (`expression_language.md`, Conditional Aggregations).
+    fn check_filter_datasets(
+        &self,
+        agg: &Expression,
+        owner: Option<usize>,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        let Some(pred) = aggregate_filter(agg) else {
+            return Ok(());
+        };
+        let body = clear_aggregate_filter(agg.clone());
+        let body_ds = self.column_datasets(&body, owner, ctx)?;
+        let filter_ds = self.column_datasets(pred, owner, ctx)?;
+        let mut allowed = body_ds;
+        if allowed.is_empty() {
+            if let Some(o) = owner {
+                allowed.insert(o);
+            }
+        }
+        for &ds in &filter_ds {
+            if !allowed.contains(&ds) {
+                let names = |s: &BTreeSet<usize>| {
+                    s.iter()
+                        .map(|&i| self.datasets[i].name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                return Err(Error::InvalidModel(vec![format!(
+                    "FILTER (WHERE …) may only reference fields of the aggregate's dataset(s) ({}); predicate uses `{}`",
+                    if allowed.is_empty() {
+                        "none".into()
+                    } else {
+                        names(&allowed)
+                    },
+                    self.datasets[ds].name
+                )]));
+            }
+        }
+        Ok(())
+    }
+
+    fn column_datasets(
+        &self,
+        e: &Expression,
+        owner: Option<usize>,
+        ctx: &mut Ctx,
+    ) -> Result<BTreeSet<usize>> {
+        let mut out = BTreeSet::new();
+        for c in get_columns(e) {
+            let Expression::Column(col) = c else {
+                continue;
+            };
+            if is_placeholder(col) {
+                continue;
+            }
+            let (ds, _) = self.resolve_column(col, owner, ctx)?;
+            out.insert(ds);
+        }
+        Ok(out)
+    }
+
     fn resolve_column(
         &self,
         c: &Column,
@@ -1041,6 +1197,13 @@ impl SemanticGraph {
             if nested {
                 return Err(bad("aggregates can only be nested inside a window function (SUM(SUM(x)) OVER (...))"));
             }
+            // expression_language.md: FILTER predicates may only reference fields
+            // of the same dataset as the aggregate's arguments.
+            self.check_filter_datasets(&raw, info.owner, &mut ctx_cell.borrow_mut())
+                .map_err(|e| match e {
+                    Error::InvalidModel(v) => bad(&v.join("; ")),
+                    other => other,
+                })?;
             let datasets = RefCell::new(BTreeSet::new());
             let datatypes = RefCell::new(BTreeSet::new());
             let failure = RefCell::new(None);

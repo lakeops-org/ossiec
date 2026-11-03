@@ -1,27 +1,63 @@
 //! Ossie Layer 2 frontend: consumer SQL with `AGG(measure)` → Layer 3 request.
 //!
-//! Spec: `relational_semantics.md` (draft). This first cut covers Appendix A.1 —
-//! a single measure relation, no consumer joins — by translating to the existing
-//! [`Request`] planner. Joins and subqueries (A.2–A.7) stay [`Error::Unsupported`].
+//! Spec: `relational_semantics.md` (draft). Appendix **A.1** (single `FROM` relation)
+//! and **A.5–A.6** (consumer joins along model relationships, `INNER` vs `LEFT`)
+//! translate to the existing [`Request`] planner; join kinds are patched onto the
+//! planned join path before lowering. Appendix **A.4** (measures from independent
+//! facts sharing dimensions) maps to the same multi-leg [`Request`] planner.
+//! Subqueries and other join forms (A.2–A.3, A.7, `RIGHT`/`FULL`/`CROSS`/`ASOF`,
+//! …) stay [`Error::Unsupported`].
 //!
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
 
-use polyglot_sql::expressions::{Column, Literal, TableRef};
+use polyglot_sql::expressions::{Column, Join, JoinKind as SqlJoinKind, Literal, TableRef};
 use polyglot_sql::{parse_one, DialectType, Expression};
 
 use crate::graph::SemanticGraph;
-use crate::plan::{Direction, Filter, Nulls, Op, OrderBy, Request};
-use crate::{compile, Compiled, Error, Options, Result};
+use crate::plan::{self, Direction, Filter, JoinKind, Nulls, Op, OrderBy, Request};
+use crate::{finish_compile, Compiled, Error, Options, Result};
 
 /// Compile a Layer 2 SQL query (`AGG(measure)` over model relations) to SQL.
 pub fn compile_layer2(graph: &SemanticGraph, sql: &str, opts: &Options) -> Result<Compiled> {
-    let request = to_request(graph, sql)?;
-    compile(graph, &request, opts)
+    let parsed = parse_layer2(graph, sql)?;
+    let mut ctx = crate::graph::Ctx {
+        prefer: opts.prefer_dialect.clone(),
+        ..Default::default()
+    };
+    let mut logical = plan::plan(graph, &parsed.request, &mut ctx)?;
+    patch_consumer_joins(graph, &mut logical, &parsed.consumer_joins)?;
+    finish_compile(graph, &parsed.request, logical, ctx, opts)
 }
 
-/// Translate Layer 2 SQL into a Layer 3 [`Request`] (A.1 shape only).
+/// Translate Layer 2 SQL into a Layer 3 [`Request`] (join kinds are not represented).
 pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
+    Ok(parse_layer2(graph, sql)?.request)
+}
+
+struct Layer2Parsed {
+    request: Request,
+    /// Join kinds from the consumer `FROM` / `JOIN` list (Appendix A.6).
+    consumer_joins: Vec<ConsumerJoin>,
+}
+
+struct ConsumerJoin {
+    rel: usize,
+    kind: JoinKind,
+}
+
+/// One dataset in the consumer `FROM` / `JOIN` list and its SQL alias.
+#[derive(Clone)]
+struct TableBinding {
+    dataset: usize,
+    alias: String,
+}
+
+struct QueryScope {
+    bindings: Vec<TableBinding>,
+}
+
+fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
     let ast = parse_one(sql.trim(), DialectType::Generic)
         .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
     let Expression::Select(sel) = ast else {
@@ -29,19 +65,14 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
             "Layer 2 currently accepts a single SELECT (Appendix A.1); joins and set ops come later",
         ));
     };
-    if !sel.joins.is_empty() {
-        return Err(unsupported(
-            "Layer 2 consumer joins (Appendix A.4–A.6) are not implemented yet; use a single FROM relation",
-        ));
-    }
     if sel.with.is_some() || sel.distinct || sel.having.is_some() || sel.qualify.is_some() {
         return Err(unsupported(
             "Layer 2 WITH / DISTINCT / HAVING / QUALIFY are not implemented yet",
         ));
     }
 
-    let (dataset, alias) = from_relation(graph, sel.from.as_ref())?;
-    let ds_name = graph.datasets[dataset].name.clone();
+    let parsed_from = parse_from_clause(graph, sel.from.as_ref(), &sel.joins)?;
+    let scope = &parsed_from.scope;
 
     let mut metrics = Vec::new();
     let mut dimensions = Vec::new();
@@ -52,7 +83,7 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
         let (inner, out_name) = strip_alias(expr);
         match take_agg(inner)? {
             Some(measure) => {
-                let metric = resolve_measure(graph, dataset, &ds_name, alias.as_deref(), measure)?;
+                let metric = resolve_measure(graph, scope, measure)?;
                 let label = out_name.clone().unwrap_or_else(|| metric.clone());
                 if !metrics.iter().any(|m| m == &metric) {
                     metrics.push(metric.clone());
@@ -65,7 +96,7 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
                         "Layer 2 select list may only contain AGG(measure) and dimension columns",
                     )
                 })?;
-                let dim = resolve_dim(graph, dataset, &ds_name, alias.as_deref(), col)?;
+                let dim = resolve_dim(graph, scope, col)?;
                 let label = out_name.unwrap_or_else(|| dim.clone());
                 if !dimensions.iter().any(|d| d == &dim) {
                     dimensions.push(dim.clone());
@@ -98,13 +129,7 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
                     let col = as_column(e).ok_or_else(|| {
                         unsupported("Layer 2 GROUP BY must name dimension columns")
                     })?;
-                    gb_dims.push(resolve_dim(
-                        graph,
-                        dataset,
-                        &ds_name,
-                        alias.as_deref(),
-                        col,
-                    )?);
+                    gb_dims.push(resolve_dim(graph, scope, col)?);
                 }
                 let mut want = dimensions.clone();
                 want.sort();
@@ -127,14 +152,12 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
 
     let filters = match &sel.where_clause {
         None => vec![],
-        Some(w) => where_to_filters(graph, dataset, &ds_name, alias.as_deref(), &w.this)?,
+        Some(w) => where_to_filters(graph, scope, &w.this)?,
     };
 
     let order_ctx = OrderCtx {
         graph,
-        dataset,
-        ds_name: &ds_name,
-        table_alias: alias.as_deref(),
+        scope,
         outputs: &outputs,
         metrics: &metrics,
         dimensions: &dimensions,
@@ -172,31 +195,302 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
         }
     };
 
-    Ok(Request {
-        metrics,
-        dimensions,
-        filters,
-        order_by,
-        limit,
-        ..Default::default()
+    Ok(Layer2Parsed {
+        request: Request {
+            metrics,
+            dimensions,
+            filters,
+            order_by,
+            limit,
+            ..Default::default()
+        },
+        consumer_joins: parsed_from.consumer_joins,
     })
+}
+
+fn patch_consumer_joins(
+    graph: &SemanticGraph,
+    logical: &mut plan::LogicalPlan,
+    consumer: &[ConsumerJoin],
+) -> Result<()> {
+    let planned: std::collections::BTreeSet<usize> = logical
+        .legs
+        .iter()
+        .flat_map(|leg| leg.joins.iter().map(|s| s.rel))
+        .collect();
+    for cj in consumer {
+        if !planned.contains(&cj.rel) {
+            return Err(unsupported(format!(
+                "Layer 2 join on relationship `{}` is not on the resolved join path; \
+                 Appendix A.5 fan-out or joins the planner does not use need more work",
+                graph.rels[cj.rel].name
+            )));
+        }
+    }
+    for leg in &mut logical.legs {
+        for step in &mut leg.joins {
+            if let Some(cj) = consumer.iter().find(|c| c.rel == step.rel) {
+                step.kind = cj.kind;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn unsupported(msg: impl Into<String>) -> Error {
     Error::Unsupported(msg.into())
 }
 
-fn from_relation(
+struct ParsedFrom {
+    scope: QueryScope,
+    consumer_joins: Vec<ConsumerJoin>,
+}
+
+fn parse_from_clause(
     graph: &SemanticGraph,
     from: Option<&polyglot_sql::expressions::From>,
-) -> Result<(usize, Option<String>)> {
+    joins: &[Join],
+) -> Result<ParsedFrom> {
     let from = from.ok_or_else(|| Error::Request("Layer 2 query needs a FROM clause".into()))?;
-    if from.expressions.len() != 1 {
-        return Err(unsupported(
-            "Layer 2 currently accepts one FROM relation (no commas / joins)",
-        ));
+    if from.expressions.is_empty() {
+        return Err(Error::Request("Layer 2 query needs a FROM clause".into()));
     }
-    table_expr(graph, &from.expressions[0])
+    let mut scope = QueryScope { bindings: vec![] };
+    for e in &from.expressions {
+        let (dataset, alias) = table_expr(graph, e)?;
+        let alias = alias.unwrap_or_else(|| graph.datasets[dataset].name.clone());
+        if scope
+            .bindings
+            .iter()
+            .any(|b| b.alias.eq_ignore_ascii_case(&alias))
+        {
+            return Err(Error::Request(format!(
+                "Layer 2 duplicate relation alias `{alias}` in FROM"
+            )));
+        }
+        scope.bindings.push(TableBinding { dataset, alias });
+    }
+    let mut consumer_joins = Vec::new();
+    for j in joins {
+        let kind = consumer_join_kind(j)?;
+        let on = j.on.as_ref().ok_or_else(|| {
+            unsupported("Layer 2 JOIN requires an ON condition matching a model relationship")
+        })?;
+        if !j.using.is_empty() {
+            return Err(unsupported("Layer 2 JOIN USING is not supported; use ON"));
+        }
+        let (right_ds, right_alias) = table_expr(graph, &j.this)?;
+        let right_binding = TableBinding {
+            dataset: right_ds,
+            alias: right_alias.unwrap_or_else(|| graph.datasets[right_ds].name.clone()),
+        };
+        let pairs = on_equality_pairs(on)?;
+        let join_scope = QueryScope {
+            bindings: scope
+                .bindings
+                .iter()
+                .chain(std::iter::once(&right_binding))
+                .cloned()
+                .collect(),
+        };
+        let rel = match_relationship(graph, &join_scope, &pairs)?;
+        if consumer_joins.iter().any(|c: &ConsumerJoin| c.rel == rel) {
+            return Err(unsupported(format!(
+                "Layer 2 duplicate join on relationship `{}`",
+                graph.rels[rel].name
+            )));
+        }
+        consumer_joins.push(ConsumerJoin { rel, kind });
+        scope.bindings.push(right_binding);
+    }
+    Ok(ParsedFrom {
+        scope,
+        consumer_joins,
+    })
+}
+
+fn consumer_join_kind(j: &Join) -> Result<JoinKind> {
+    match j.kind {
+        SqlJoinKind::Inner | SqlJoinKind::Implicit => Ok(JoinKind::Inner),
+        SqlJoinKind::Left | SqlJoinKind::NaturalLeft => Ok(JoinKind::Left),
+        SqlJoinKind::Right
+        | SqlJoinKind::Full
+        | SqlJoinKind::Cross
+        | SqlJoinKind::AsOf
+        | SqlJoinKind::AsOfLeft
+        | SqlJoinKind::AsOfRight
+        | SqlJoinKind::Outer
+        | SqlJoinKind::Natural
+        | SqlJoinKind::NaturalRight
+        | SqlJoinKind::NaturalFull
+        | SqlJoinKind::Semi
+        | SqlJoinKind::Anti
+        | SqlJoinKind::LeftSemi
+        | SqlJoinKind::LeftAnti
+        | SqlJoinKind::RightSemi
+        | SqlJoinKind::RightAnti
+        | SqlJoinKind::CrossApply
+        | SqlJoinKind::OuterApply
+        | SqlJoinKind::Lateral
+        | SqlJoinKind::LeftLateral
+        | SqlJoinKind::Straight
+        | SqlJoinKind::Array
+        | SqlJoinKind::LeftArray
+        | SqlJoinKind::Paste
+        | SqlJoinKind::Positional => Err(unsupported(
+            "Layer 2 only supports INNER JOIN, JOIN, and LEFT JOIN (Appendix A.6)",
+        )),
+    }
+}
+
+fn on_equality_pairs(on: &Expression) -> Result<Vec<(Column, Column)>> {
+    match on {
+        Expression::Eq(b) => {
+            let l = as_column(&b.left).ok_or_else(on_must_be_equalities)?;
+            let r = as_column(&b.right).ok_or_else(on_must_be_equalities)?;
+            Ok(vec![(l.to_owned(), r.to_owned())])
+        }
+        Expression::And(a) => {
+            let mut out = on_equality_pairs(&a.left)?;
+            out.extend(on_equality_pairs(&a.right)?);
+            Ok(out)
+        }
+        _ => Err(on_must_be_equalities()),
+    }
+}
+
+fn on_must_be_equalities() -> Error {
+    unsupported("Layer 2 JOIN ON must be column equalities (and AND of equalities)")
+}
+
+/// Resolved endpoints of one ON equality: `(dataset, field_name)`.
+type FieldRef = (usize, String);
+
+fn match_relationship(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    pairs: &[(Column, Column)],
+) -> Result<usize> {
+    if pairs.is_empty() {
+        return Err(on_must_be_equalities());
+    }
+    let resolved: Result<Vec<(FieldRef, FieldRef)>> = pairs
+        .iter()
+        .map(|(l, r)| {
+            Ok((
+                resolve_field_ref(graph, scope, l)?,
+                resolve_field_ref(graph, scope, r)?,
+            ))
+        })
+        .collect();
+    let resolved = resolved?;
+    for (ri, rel) in graph.rels.iter().enumerate() {
+        if rel_matches_pairs(graph, rel, &resolved) {
+            return Ok(ri);
+        }
+    }
+    Err(unsupported(
+        "Layer 2 JOIN ON must match a model relationship (equality on its from_columns and to_columns, in either direction)",
+    ))
+}
+
+fn rel_matches_pairs(
+    graph: &SemanticGraph,
+    rel: &crate::graph::RelInfo,
+    pairs: &[(FieldRef, FieldRef)],
+) -> bool {
+    if pairs.len() != rel.from_fields.len() {
+        return false;
+    }
+    let forward: Vec<(FieldRef, FieldRef)> = rel
+        .from_fields
+        .iter()
+        .zip(rel.to_fields.iter())
+        .map(|(&ff, &tf)| {
+            (
+                (rel.from, graph.datasets[rel.from].fields[ff].name.clone()),
+                (rel.to, graph.datasets[rel.to].fields[tf].name.clone()),
+            )
+        })
+        .collect();
+    pairs_match_set(pairs, &forward) || pairs_match_set(pairs, &reverse_pairs(&forward))
+}
+
+fn reverse_pairs(pairs: &[(FieldRef, FieldRef)]) -> Vec<(FieldRef, FieldRef)> {
+    pairs.iter().map(|(a, b)| (b.clone(), a.clone())).collect()
+}
+
+fn pairs_match_set(got: &[(FieldRef, FieldRef)], want: &[(FieldRef, FieldRef)]) -> bool {
+    want.iter().all(|w| {
+        got.iter()
+            .any(|g| field_pair_eq(g, w) || field_pair_eq(g, &(w.1.clone(), w.0.clone())))
+    }) && got.iter().all(|g| {
+        want.iter()
+            .any(|w| field_pair_eq(g, w) || field_pair_eq(g, &(w.1.clone(), w.0.clone())))
+    })
+}
+
+fn field_pair_eq(a: &(FieldRef, FieldRef), b: &(FieldRef, FieldRef)) -> bool {
+    a.0 .0 == b.0 .0
+        && a.1 .0 == b.1 .0
+        && a.0 .1.eq_ignore_ascii_case(&b.0 .1)
+        && a.1 .1.eq_ignore_ascii_case(&b.1 .1)
+}
+
+fn resolve_field_ref(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Result<FieldRef> {
+    let ds = resolve_column_dataset(graph, scope, col)?;
+    let field = &col.name.name;
+    let f = graph.datasets[ds]
+        .fields
+        .iter()
+        .position(|f| f.name.eq_ignore_ascii_case(field))
+        .ok_or_else(|| {
+            Error::Request(format!(
+                "unknown field `{field}` on dataset `{}`",
+                graph.datasets[ds].name
+            ))
+        })?;
+    Ok((ds, graph.datasets[ds].fields[f].name.clone()))
+}
+
+fn resolve_column_dataset(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    col: &Column,
+) -> Result<usize> {
+    if let Some(t) = &col.table {
+        for b in &scope.bindings {
+            let ds_name = &graph.datasets[b.dataset].name;
+            if t.name.eq_ignore_ascii_case(&b.alias) || t.name.eq_ignore_ascii_case(ds_name) {
+                return Ok(b.dataset);
+            }
+        }
+        return Err(Error::Request(format!(
+            "column `{}.{}` does not refer to a relation in FROM/JOIN",
+            t.name, col.name.name
+        )));
+    }
+    if scope.bindings.len() == 1 {
+        return Ok(scope.bindings[0].dataset);
+    }
+    let field = &col.name.name;
+    let hits: Vec<usize> = scope
+        .bindings
+        .iter()
+        .filter(|b| {
+            graph.datasets[b.dataset]
+                .fields
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(field))
+        })
+        .map(|b| b.dataset)
+        .collect();
+    match hits.as_slice() {
+        [one] => Ok(*one),
+        _ => Err(Error::Request(format!(
+            "column `{field}` is ambiguous; qualify it with a FROM/JOIN alias"
+        ))),
+    }
 }
 
 fn table_expr(graph: &SemanticGraph, e: &Expression) -> Result<(usize, Option<String>)> {
@@ -207,7 +501,8 @@ fn table_expr(graph: &SemanticGraph, e: &Expression) -> Result<(usize, Option<St
             Ok((ds, Some(a.alias.name.clone())))
         }
         _ => Err(unsupported(
-            "Layer 2 FROM must be a model dataset (table or alias), not a subquery",
+            "Layer 2 FROM must be a model dataset (table or alias); \
+             derived tables / subqueries (Appendix A.2–A.3) are not supported yet",
         )),
     }
 }
@@ -285,13 +580,7 @@ fn as_column(e: &Expression) -> Option<&Column> {
     }
 }
 
-fn resolve_measure(
-    graph: &SemanticGraph,
-    dataset: usize,
-    ds_name: &str,
-    table_alias: Option<&str>,
-    arg: &Expression,
-) -> Result<String> {
+fn resolve_measure(graph: &SemanticGraph, scope: &QueryScope, arg: &Expression) -> Result<String> {
     let col = as_column(arg).ok_or_else(|| {
         Error::Request(
             "AGG() argument must be a measure column reference (AGG(m) or AGG(alias.m)); \
@@ -299,7 +588,8 @@ fn resolve_measure(
                 .into(),
         )
     })?;
-    check_table_qual(col, ds_name, table_alias)?;
+    let dataset = resolve_column_dataset(graph, scope, col)?;
+    let ds_name = &graph.datasets[dataset].name;
     let measure = &col.name.name;
 
     let scoped = format!("{ds_name}.{measure}");
@@ -342,14 +632,9 @@ fn resolve_measure(
     )))
 }
 
-fn resolve_dim(
-    graph: &SemanticGraph,
-    dataset: usize,
-    ds_name: &str,
-    table_alias: Option<&str>,
-    col: &Column,
-) -> Result<String> {
-    check_table_qual(col, ds_name, table_alias)?;
+fn resolve_dim(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Result<String> {
+    let dataset = resolve_column_dataset(graph, scope, col)?;
+    let ds_name = &graph.datasets[dataset].name;
     let field = &col.name.name;
     let f = graph.datasets[dataset]
         .fields
@@ -362,99 +647,27 @@ fn resolve_dim(
     ))
 }
 
-fn check_table_qual(col: &Column, ds_name: &str, table_alias: Option<&str>) -> Result<()> {
-    let Some(t) = &col.table else {
-        return Ok(());
-    };
-    let ok = t.name.eq_ignore_ascii_case(ds_name)
-        || table_alias.is_some_and(|a| t.name.eq_ignore_ascii_case(a));
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Request(format!(
-            "column `{}.{}` does not refer to the FROM relation `{ds_name}`",
-            t.name, col.name.name
-        )))
-    }
-}
-
 fn where_to_filters(
     graph: &SemanticGraph,
-    dataset: usize,
-    ds_name: &str,
-    table_alias: Option<&str>,
+    scope: &QueryScope,
     e: &Expression,
 ) -> Result<Vec<Filter>> {
     match e {
         Expression::And(a) => {
-            let mut out = where_to_filters(graph, dataset, ds_name, table_alias, &a.left)?;
-            out.extend(where_to_filters(
-                graph,
-                dataset,
-                ds_name,
-                table_alias,
-                &a.right,
-            )?);
+            let mut out = where_to_filters(graph, scope, &a.left)?;
+            out.extend(where_to_filters(graph, scope, &a.right)?);
             Ok(out)
         }
-        Expression::Eq(b) => cmp_filter(
-            graph,
-            dataset,
-            ds_name,
-            table_alias,
-            &b.left,
-            &b.right,
-            Op::Eq,
-        ),
-        Expression::Neq(b) => cmp_filter(
-            graph,
-            dataset,
-            ds_name,
-            table_alias,
-            &b.left,
-            &b.right,
-            Op::Ne,
-        ),
-        Expression::Lt(b) => cmp_filter(
-            graph,
-            dataset,
-            ds_name,
-            table_alias,
-            &b.left,
-            &b.right,
-            Op::Lt,
-        ),
-        Expression::Lte(b) => cmp_filter(
-            graph,
-            dataset,
-            ds_name,
-            table_alias,
-            &b.left,
-            &b.right,
-            Op::Le,
-        ),
-        Expression::Gt(b) => cmp_filter(
-            graph,
-            dataset,
-            ds_name,
-            table_alias,
-            &b.left,
-            &b.right,
-            Op::Gt,
-        ),
-        Expression::Gte(b) => cmp_filter(
-            graph,
-            dataset,
-            ds_name,
-            table_alias,
-            &b.left,
-            &b.right,
-            Op::Ge,
-        ),
+        Expression::Eq(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Eq),
+        Expression::Neq(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Ne),
+        Expression::Lt(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Lt),
+        Expression::Lte(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Le),
+        Expression::Gt(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Gt),
+        Expression::Gte(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Ge),
         Expression::IsNull(i) => {
             let col = as_column(&i.this).ok_or_else(simple_where)?;
             Ok(vec![Filter {
-                field: resolve_dim(graph, dataset, ds_name, table_alias, col)?,
+                field: resolve_dim(graph, scope, col)?,
                 op: if i.not { Op::IsNotNull } else { Op::IsNull },
                 value: None,
                 values: vec![],
@@ -472,9 +685,7 @@ fn simple_where() -> Error {
 
 fn cmp_filter(
     graph: &SemanticGraph,
-    dataset: usize,
-    ds_name: &str,
-    table_alias: Option<&str>,
+    scope: &QueryScope,
     left: &Expression,
     right: &Expression,
     op: Op,
@@ -487,7 +698,7 @@ fn cmp_filter(
     let col = as_column(col_e).unwrap();
     let value = literal_json(lit_e).ok_or_else(simple_where)?;
     Ok(vec![Filter {
-        field: resolve_dim(graph, dataset, ds_name, table_alias, col)?,
+        field: resolve_dim(graph, scope, col)?,
         op,
         value: Some(value),
         values: vec![],
@@ -539,9 +750,7 @@ fn limit_u64(e: &Expression) -> Result<u64> {
 
 struct OrderCtx<'a> {
     graph: &'a SemanticGraph,
-    dataset: usize,
-    ds_name: &'a str,
-    table_alias: Option<&'a str>,
+    scope: &'a QueryScope,
     outputs: &'a [(String, String)],
     metrics: &'a [String],
     dimensions: &'a [String],
@@ -549,7 +758,7 @@ struct OrderCtx<'a> {
 
 fn order_field(ctx: &OrderCtx<'_>, e: &Expression) -> Result<String> {
     if let Some(arg) = take_agg(e)? {
-        return resolve_measure(ctx.graph, ctx.dataset, ctx.ds_name, ctx.table_alias, arg);
+        return resolve_measure(ctx.graph, ctx.scope, arg);
     }
     if let Some(col) = as_column(e) {
         if col.table.is_none() {
@@ -572,7 +781,7 @@ fn order_field(ctx: &OrderCtx<'_>, e: &Expression) -> Result<String> {
                 return Ok(d.clone());
             }
         }
-        return resolve_dim(ctx.graph, ctx.dataset, ctx.ds_name, ctx.table_alias, col);
+        return resolve_dim(ctx.graph, ctx.scope, col);
     }
     Err(unsupported(
         "Layer 2 ORDER BY must name a selected dimension, measure, or AGG(...)",

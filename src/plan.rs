@@ -174,12 +174,22 @@ pub(crate) struct PlannedTerm {
 /// named relationship), each with its own alias.
 pub(crate) type Node = (usize, Option<usize>);
 
-/// One join: `LEFT JOIN <to> AS to_alias ON <rel's columns from from_alias>`.
+/// Join type for a step in a leg. Layer 3 requests always use [`JoinKind::Left`];
+/// Layer 2 consumer SQL may ask for [`JoinKind::Inner`] (relational_semantics A.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum JoinKind {
+    #[default]
+    Left,
+    Inner,
+}
+
+/// One join: `<kind> JOIN <to> AS to_alias ON <rel's columns from from_alias>`.
 pub(crate) struct JoinStep {
     pub rel: usize,
     pub from_alias: String,
     pub to: usize,
     pub to_alias: String,
+    pub kind: JoinKind,
 }
 
 /// A join tree rooted at one fact. Requests over independent facts have one
@@ -740,7 +750,13 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
                 }
                 None => steps.push((
                     depth,
-                    JoinStep { rel: r, from_alias: g.datasets[rel.from].name.clone(), to: rel.to, to_alias: g.datasets[rel.to].name.clone() },
+                    JoinStep {
+                        rel: r,
+                        from_alias: g.datasets[rel.from].name.clone(),
+                        to: rel.to,
+                        to_alias: g.datasets[rel.to].name.clone(),
+                        kind: JoinKind::Left,
+                    },
                 )),
             }
         }
@@ -768,6 +784,7 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
                         from_alias,
                         to: ds,
                         to_alias,
+                        kind: JoinKind::Left,
                     },
                 ));
             }

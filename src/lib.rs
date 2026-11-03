@@ -138,6 +138,16 @@ pub fn compile(graph: &SemanticGraph, request: &Request, opts: &Options) -> Resu
         ..Default::default()
     };
     let plan = plan::plan(graph, request, &mut ctx)?;
+    finish_compile(graph, request, plan, ctx, opts)
+}
+
+pub(crate) fn finish_compile(
+    graph: &SemanticGraph,
+    request: &Request,
+    plan: plan::LogicalPlan,
+    mut ctx: graph::Ctx,
+    opts: &Options,
+) -> Result<Compiled> {
     let mut ast = lower::lower(graph, &plan, &mut ctx)?;
     // Ossie requires FILTER in expressions; engines MAY rewrite to CASE. Keep
     // native FILTER when the target supports it; otherwise lower for portability.

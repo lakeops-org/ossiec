@@ -1,8 +1,9 @@
-//! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1).
+//! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1, A.4, and consumer joins A.5–A.6).
 
 use ossiec::{DialectType, Error, Options};
 
 const SHOP: &str = include_str!("fixtures/shop/model.yaml");
+const TWO_FACTS: &str = include_str!("fixtures/two_facts_layer2.yaml");
 
 fn graph() -> ossiec::SemanticGraph {
     ossiec::from_yaml(SHOP).unwrap()
@@ -84,11 +85,135 @@ fn agg_of_expression_is_refused() {
 }
 
 #[test]
-fn joins_are_not_yet_supported() {
-    let e = ossiec::layer2_to_request(
-        &graph(),
-        "SELECT AGG(order_count) FROM orders o JOIN customers c ON o.customer_id = c.id",
+fn inner_join_customers_emits_inner_join() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let l2 = ossiec::compile_layer2(
+        &g,
+        "SELECT c.region, AGG(o.order_count) FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.region",
+        &opts,
+    )
+    .unwrap();
+    assert!(l2.sql.to_uppercase().contains("INNER JOIN"), "{}", l2.sql);
+    let l3 = ossiec::compile(
+        &g,
+        &serde_json::from_str(
+            r#"{"metrics":["orders.order_count"],"dimensions":["customers.region"]}"#,
+        )
+        .unwrap(),
+        &opts,
+    )
+    .unwrap();
+    assert_ne!(l2.sql, l3.sql);
+    assert!(l3.sql.to_uppercase().contains("LEFT JOIN"));
+}
+
+#[test]
+fn left_join_customers_matches_layer3_agg_shape() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let sql = "SELECT c.region, AGG(o.order_count) FROM orders o LEFT JOIN customers c ON o.customer_id = c.id GROUP BY c.region";
+    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    assert!(l2.sql.to_uppercase().contains("LEFT JOIN"), "{}", l2.sql);
+    let l3 = ossiec::compile(
+        &g,
+        &serde_json::from_str(
+            r#"{"metrics":["orders.order_count"],"dimensions":["customers.region"]}"#,
+        )
+        .unwrap(),
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(l2.sql, l3.sql);
+}
+
+fn two_facts_graph() -> ossiec::SemanticGraph {
+    ossiec::from_yaml(TWO_FACTS).unwrap()
+}
+
+fn two_facts_opts() -> Options {
+    Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a4_independent_measures_via_joins_match_layer3() {
+    let g = two_facts_graph();
+    let opts = two_facts_opts();
+    let sql = "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) \
+               FROM customers c \
+               LEFT JOIN orders o ON o.customer_id = c.id \
+               LEFT JOIN tickets t ON t.customer_id = c.id \
+               GROUP BY c.region";
+    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    assert!(l2.sql.contains("UNION ALL"), "{}", l2.sql);
+    let l3 = ossiec::compile(
+        &g,
+        &serde_json::from_str(
+            r#"{"metrics":["orders.order_amt","tickets.ticket_count"],"dimensions":["customers.region"]}"#,
+        )
+        .unwrap(),
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(l2.sql, l3.sql);
+}
+
+#[test]
+fn a4_comma_from_lists_independent_facts() {
+    let g = two_facts_graph();
+    let opts = two_facts_opts();
+    let sql = "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) \
+               FROM customers c, orders o, tickets t \
+               GROUP BY c.region";
+    let req = ossiec::layer2_to_request(&g, sql).unwrap();
+    assert_eq!(
+        req.metrics,
+        vec!["orders.order_amt", "tickets.ticket_count"]
+    );
+    assert_eq!(req.dimensions, vec!["customers.region"]);
+    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    let l3 = ossiec::compile(&g, &req, &opts).unwrap();
+    assert_eq!(l2.sql, l3.sql);
+}
+
+#[test]
+fn a4_refuses_dimension_not_shared_across_facts() {
+    let g = two_facts_graph();
+    let sql = "SELECT o.amount, AGG(o.order_amt), AGG(t.ticket_count) \
+               FROM customers c \
+               LEFT JOIN orders o ON o.customer_id = c.id \
+               LEFT JOIN tickets t ON t.customer_id = c.id \
+               GROUP BY o.amount";
+    let e = ossiec::compile_layer2(&g, sql, &two_facts_opts()).unwrap_err();
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("independent facts sharing")),
+        "{e}"
+    );
+}
+
+#[test]
+fn a2_a3_derived_table_in_from_is_unsupported() {
+    let g = graph();
+    let e = ossiec::compile_layer2(
+        &g,
+        "SELECT status, AGG(order_count) FROM (SELECT * FROM orders) AS o GROUP BY status",
+        &Options {
+            target: Some(DialectType::DuckDB),
+            ..Default::default()
+        },
     )
     .unwrap_err();
-    assert!(matches!(e, Error::Unsupported(_)), "{e}");
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("A.2") && m.contains("subquer")),
+        "{e}"
+    );
 }
