@@ -36,7 +36,10 @@ mod plan;
 mod sql;
 
 pub use graph::{bind, Catalog, DimensionDoc, MetricDoc, SemanticGraph};
-pub use layer2::{compile_layer2, to_request as layer2_to_request};
+pub use layer2::{
+    compile_layer2, compile_layer2_script, compile_layer2_with, define_layer2_view,
+    to_request as layer2_to_request, Layer2Catalog, Layer2Column, Layer2ColumnKind,
+};
 pub use model::Model;
 pub use plan::{Direction, Filter, MetricFilter, Nulls, Op, OrderBy, Request, TimeGrain};
 pub use polyglot_sql::DialectType;

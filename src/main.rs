@@ -19,7 +19,9 @@ OPTIONS:
     --compact          One-line SQL
     --json             Print the full compile result (SQL, dialect, warnings, hash) as JSON
 
-    compile-l2         Ossie Layer 2: SQL with AGG(measure) (Appendix A.1-A.6, incl. derived tables A.2-A.3)
+    compile-l2         Ossie Layer 2: SQL with AGG(measure) (Appendix A.1-A.6, derived tables
+                       A.2-A.3, CREATE VIEW measure relations A.7). A script may define
+                       views and end with the SELECT to compile. Views are not saved.
 ";
 
 fn main() -> ExitCode {
@@ -111,7 +113,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
         ["compile-l2", model, query] => {
             let g = graph(model)?;
             print_compiled(
-                ossiec::compile_layer2(&g, &read(query)?, &opts).map_err(|e| e.to_string())?,
+                ossiec::compile_layer2_script(&g, &read(query)?, &opts)
+                    .map_err(|e| e.to_string())?,
                 json,
             )
         }

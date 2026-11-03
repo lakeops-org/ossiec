@@ -28,6 +28,7 @@
 use polyglot_sql::expressions::Select;
 use polyglot_sql::{generate, DialectType, Expression};
 
+use super::catalog::{self, Layer2Catalog};
 use super::{
     apply_consumer_joins, apply_select_formulas, parse_stage_from, parse_stage_prep,
     parse_top_select, planned_alias_on_leg, pragma_include_unmatched, protect_inflating_joins,
@@ -143,8 +144,14 @@ pub(super) struct Compiler<'a> {
     pub to_measures: Vec<Expression>,
 }
 
-pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> Result<Compiled> {
-    let (sel, to_measures) = parse_top_select(sql_text)?;
+pub(super) fn compile(
+    graph: &SemanticGraph,
+    catalog: &Layer2Catalog,
+    sql_text: &str,
+    opts: &Options,
+) -> Result<Compiled> {
+    let (mut sel, mut to_measures) = parse_top_select(sql_text)?;
+    catalog::expand_query(catalog, &mut sel, &mut to_measures, None)?;
     let mut c = Compiler {
         graph: graph.clone(),
         opts,
@@ -187,6 +194,27 @@ pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> 
         }
     };
     render_compiled(graph, identity, ast, c.ctx, opts)
+}
+
+/// Compile a view body as a derived table and return the columns it exposes.
+pub(super) fn view_outputs(
+    graph: &SemanticGraph,
+    sel: &Select,
+    to_measures: &[Expression],
+    opts: &Options,
+) -> Result<Vec<OutCol>> {
+    let mut c = Compiler {
+        graph,
+        opts,
+        ctx: Ctx {
+            prefer: opts.prefer_dialect.clone(),
+            ..Default::default()
+        },
+        derived_count: 0,
+        flat_request: None,
+        to_measures: to_measures.to_vec(),
+    };
+    Ok(c.select(sel, 0, true, &[])?.outputs)
 }
 
 /// Substitute placeholders, innermost first, so each inner statement is
