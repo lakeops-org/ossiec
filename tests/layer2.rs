@@ -65,7 +65,8 @@ fn measure_synonym_and_where() {
 
 #[test]
 fn model_scoped_metric_is_refused() {
-    let e = ossiec::layer2_to_request(&graph(), "SELECT AGG(total_revenue) FROM orders").unwrap_err();
+    let e =
+        ossiec::layer2_to_request(&graph(), "SELECT AGG(total_revenue) FROM orders").unwrap_err();
     assert!(
         matches!(e, Error::Request(ref m) if m.contains("model-scoped")),
         "{e}"
@@ -74,7 +75,8 @@ fn model_scoped_metric_is_refused() {
 
 #[test]
 fn agg_of_expression_is_refused() {
-    let e = ossiec::layer2_to_request(&graph(), "SELECT AGG(order_count + 1) FROM orders").unwrap_err();
+    let e =
+        ossiec::layer2_to_request(&graph(), "SELECT AGG(order_count + 1) FROM orders").unwrap_err();
     assert!(
         matches!(e, Error::Request(ref m) if m.contains("measure column")),
         "{e}"

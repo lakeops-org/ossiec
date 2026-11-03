@@ -398,24 +398,60 @@ fn where_to_filters(
             )?);
             Ok(out)
         }
-        Expression::Eq(b) => {
-            cmp_filter(graph, dataset, ds_name, table_alias, &b.left, &b.right, Op::Eq)
-        }
-        Expression::Neq(b) => {
-            cmp_filter(graph, dataset, ds_name, table_alias, &b.left, &b.right, Op::Ne)
-        }
-        Expression::Lt(b) => {
-            cmp_filter(graph, dataset, ds_name, table_alias, &b.left, &b.right, Op::Lt)
-        }
-        Expression::Lte(b) => {
-            cmp_filter(graph, dataset, ds_name, table_alias, &b.left, &b.right, Op::Le)
-        }
-        Expression::Gt(b) => {
-            cmp_filter(graph, dataset, ds_name, table_alias, &b.left, &b.right, Op::Gt)
-        }
-        Expression::Gte(b) => {
-            cmp_filter(graph, dataset, ds_name, table_alias, &b.left, &b.right, Op::Ge)
-        }
+        Expression::Eq(b) => cmp_filter(
+            graph,
+            dataset,
+            ds_name,
+            table_alias,
+            &b.left,
+            &b.right,
+            Op::Eq,
+        ),
+        Expression::Neq(b) => cmp_filter(
+            graph,
+            dataset,
+            ds_name,
+            table_alias,
+            &b.left,
+            &b.right,
+            Op::Ne,
+        ),
+        Expression::Lt(b) => cmp_filter(
+            graph,
+            dataset,
+            ds_name,
+            table_alias,
+            &b.left,
+            &b.right,
+            Op::Lt,
+        ),
+        Expression::Lte(b) => cmp_filter(
+            graph,
+            dataset,
+            ds_name,
+            table_alias,
+            &b.left,
+            &b.right,
+            Op::Le,
+        ),
+        Expression::Gt(b) => cmp_filter(
+            graph,
+            dataset,
+            ds_name,
+            table_alias,
+            &b.left,
+            &b.right,
+            Op::Gt,
+        ),
+        Expression::Gte(b) => cmp_filter(
+            graph,
+            dataset,
+            ds_name,
+            table_alias,
+            &b.left,
+            &b.right,
+            Op::Ge,
+        ),
         Expression::IsNull(i) => {
             let col = as_column(&i.this).ok_or_else(simple_where)?;
             Ok(vec![Filter {
@@ -488,7 +524,9 @@ fn limit_u64(e: &Expression) -> Result<u64> {
     match e {
         Expression::Literal(l) => match l.as_ref() {
             Literal::Number(s) => s.parse::<u64>().map_err(|_| {
-                Error::Request(format!("Layer 2 LIMIT must be a non-negative integer, got {s}"))
+                Error::Request(format!(
+                    "Layer 2 LIMIT must be a non-negative integer, got {s}"
+                ))
             }),
             _ => Err(unsupported(
                 "Layer 2 LIMIT must be a non-negative integer literal",
