@@ -1,6 +1,5 @@
 //! ClickHouse rules.
 
-use polyglot_sql::expressions::DataType;
 use polyglot_sql::{transform, DialectType, Expression};
 
 use super::{internal, literal_backslashes_in_like};
@@ -67,34 +66,17 @@ pub(super) fn adapt(ast: Expression, _plan: &LogicalPlan) -> Result<Expression> 
 /// Evidence: `orphans_on_a_non_nullable_column` (without it, the guest checkout
 /// lands under segment '' instead of NULL) and `integer_ratio` (the default id
 /// `0` is counted as a customer).
-/// Applied to the rendered SQL, where types are ClickHouse's own:
-/// `SETTINGS join_use_nulls = 1` (standard LEFT JOIN NULLs), and
-/// a typed NULL needs a `Nullable` type: `CAST(NULL AS String)` fails ("Cannot
-/// convert NULL to a non-nullable type"); polyglot wraps some types but not
-/// `String`. Evidence: `unmatched_products_included`.
+///
+/// Typed `CAST(NULL AS T)` → `Nullable(T)` is left to polyglot (≥0.13.5)
+/// ([polyglot#514](https://github.com/tobilg/polyglot/issues/514)).
 pub(super) fn finish(sql: String, pretty: bool) -> Result<String> {
     let ch = DialectType::ClickHouse;
     let settings = match sql::parse("SELECT 1 SETTINGS join_use_nulls = 1", ch) {
         Ok(Expression::Select(s)) => s.settings,
         _ => return Err(Error::Internal("settings template".into())),
     };
-    let ast = sql::parse(&sql, ch)
+    let mut ast = sql::parse(&sql, ch)
         .map_err(|e| Error::Internal(format!("re-reading ClickHouse SQL: {e}")))?;
-    let mut ast = transform(ast, &|e| {
-        Ok(Some(match e {
-            Expression::Cast(mut c)
-                if matches!(c.this, Expression::Null(_))
-                    && !matches!(c.to, DataType::Nullable { .. }) =>
-            {
-                c.to = DataType::Nullable {
-                    inner: Box::new(c.to),
-                };
-                Expression::Cast(c)
-            }
-            other => other,
-        }))
-    })
-    .map_err(internal)?;
     if let Expression::Select(s) = &mut ast {
         s.settings = settings;
     }

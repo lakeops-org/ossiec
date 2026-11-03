@@ -18,7 +18,7 @@ name = "ossiec"
 path = "src/main.rs"
 
 [dependencies]
-polyglot-sql = "=0.13.4"
+polyglot-sql = "=0.13.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -31,4 +31,4 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # see .cargo/config.toml) instead of compiling DuckDB from C++ source.
 duckdb = "=1.10501.0"
 # Transpiles reference SQL (written for DuckDB) to the engine under test.
-polyglot-sql = "=0.13.4"
+polyglot-sql = "=0.13.5"

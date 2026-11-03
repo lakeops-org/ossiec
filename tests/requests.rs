@@ -176,9 +176,9 @@ fn compiles_for_every_engine_with_portable_constructs_only() {
             };
             let c =
                 ossiec::compile(&g, &req(r), &opts).unwrap_or_else(|e| panic!("{target:?}: {e}"));
-            // Constructs polyglot passes through, or emulates incorrectly, on engines that
-            // lack them (verified on polyglot-sql 0.13.4). Aggregate FILTER is kept only
-            // where the target runs it.
+            // Constructs polyglot still passes through on engines that lack them
+            // (verified on polyglot-sql 0.13.5 for BY NAME / FILTER). Aggregate FILTER
+            // is kept only where the target runs it.
             let upper = c.sql.to_uppercase();
             let keeps_filter = matches!(
                 target,
