@@ -752,9 +752,53 @@ pub const A3_SHOP_REF: &str = "SELECT d.status, AVG(m.n) \
       ON d.customer_id IS NOT DISTINCT FROM m.customer_id \
     GROUP BY d.status";
 
+/// §7.7 fold form: a sole derived `FROM` filters and projects; the outer `AGG` evaluates
+/// the passed-through measure (on shop, dataset-scoped `order_count` stands in).
+pub const S77_FOLD_SHOP: &str = "SELECT status, AGG(order_count) AS n \
+    FROM (SELECT status, order_count FROM orders WHERE customer_id IS NOT NULL) t \
+    GROUP BY status";
+
+pub const S77_FOLD_SHOP_REF: &str =
+    "SELECT status, COUNT(*) AS n FROM orders WHERE customer_id IS NOT NULL GROUP BY status";
+
+/// §7.7 fold form with an outer `WHERE` on top of the inner filter.
+pub const S77_FOLD_WHERE_SHOP: &str = "SELECT status, AGG(order_count) AS n \
+    FROM (SELECT status, order_count FROM orders WHERE customer_id IS NOT NULL) t \
+    WHERE status = 'completed' \
+    GROUP BY status";
+
+pub const S77_FOLD_WHERE_SHOP_REF: &str = "SELECT status, COUNT(*) AS n FROM orders \
+    WHERE customer_id IS NOT NULL AND status = 'completed' GROUP BY status";
+
+/// A.2 join form with an unevaluated measure passed through the derived table:
+/// the derived table only restricts (customers who ordered); the outer stage evaluates.
+pub const A2_UNEVALUATED_SHOP: &str = "SELECT o.status, AGG(t.order_count) \
+    FROM orders o \
+    JOIN (SELECT customer_id, order_count FROM orders GROUP BY customer_id) t \
+      ON o.customer_id = t.customer_id \
+    GROUP BY o.status";
+
+pub const A2_UNEVALUATED_SHOP_REF: &str =
+    "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status";
+
 pub const LAYER2_NESTED_CASES: &[(&str, &str, &str)] = &[
     ("a2_top_two_customers", A2_SHOP, A2_SHOP_REF),
     ("a3_avg_orders_per_customer", A3_SHOP, A3_SHOP_REF),
+    (
+        "s77_fold_filter_and_projection",
+        S77_FOLD_SHOP,
+        S77_FOLD_SHOP_REF,
+    ),
+    (
+        "s77_fold_with_outer_where",
+        S77_FOLD_WHERE_SHOP,
+        S77_FOLD_WHERE_SHOP_REF,
+    ),
+    (
+        "a2_unevaluated_measure_pass_through",
+        A2_UNEVALUATED_SHOP,
+        A2_UNEVALUATED_SHOP_REF,
+    ),
 ];
 
 // ---------------------------------------------------------------- engines
