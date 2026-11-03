@@ -282,7 +282,7 @@ impl Compiler<'_> {
             .map(|s| OutCol {
                 name: s.label.clone(),
                 kind: match s.item {
-                    Item::Bare((r, c)) => scope.out(r, c).kind,
+                    Item::Bare((r, c)) => scope.out(r, c).kind.clone(),
                     Item::Agg(..) => OutKind::EvaluatedMeasure,
                 },
             })
@@ -347,8 +347,22 @@ impl Scope<'_> {
             .join(", ")
     }
 
-    /// `alias.column` / `column` → indexes.
+    /// `alias.column` / `column` → indexes, for plain SQL: an unevaluated measure
+    /// (§7.7) is not a value, so only `AGG()` could read it.
     fn resolve(&self, col: &Column, graph: &crate::SemanticGraph) -> Result<ColRef> {
+        let (r, c) = self.resolve_raw(col, graph)?;
+        if matches!(self.out(r, c).kind, OutKind::UnevaluatedMeasure { .. }) {
+            return Err(unsupported(format!(
+                "Layer 2 `{}.{}` is an unevaluated measure (relational_semantics §7.7): plain SQL cannot read it, only an outer AGG() evaluates it",
+                self.rels[r].alias(),
+                self.out(r, c).name
+            )));
+        }
+        Ok((r, c))
+    }
+
+    /// `alias.column` / `column` → indexes, whatever the column is.
+    fn resolve_raw(&self, col: &Column, graph: &crate::SemanticGraph) -> Result<ColRef> {
         let name = &col.name.name;
         let find = |r: usize| {
             self.outputs(r)
@@ -411,8 +425,15 @@ impl Scope<'_> {
     /// A select / HAVING / ORDER BY item: a derived column or an aggregate of one.
     fn item(&self, e: &Expression, graph: &crate::SemanticGraph) -> Result<Item> {
         if let Some(arg) = take_agg(e)? {
-            let shown =
-                as_column(arg).map_or("the column".to_string(), |c| format!("`{}`", c.name.name));
+            let col = as_column(arg);
+            let shown = col.map_or("the column".to_string(), |c| format!("`{}`", c.name.name));
+            if let Some(Ok((r, c))) = col.map(|c| self.resolve_raw(c, graph)) {
+                if matches!(self.out(r, c).kind, OutKind::UnevaluatedMeasure { .. }) {
+                    return Err(unsupported(format!(
+                        "Layer 2 AGG() over unevaluated measure {shown} of a derived table (relational_semantics §7.7) needs a sole derived FROM (folded) or `FROM <dataset> JOIN (...) t ON ...`; joining several derived tables only reads evaluated columns"
+                    )));
+                }
+            }
             return Err(unsupported(format!(
                 "Layer 2 AGG() applies to measures of a model dataset; {shown} of a derived table is already evaluated: use AVG/SUM/COUNT/MIN/MAX over it"
             )));

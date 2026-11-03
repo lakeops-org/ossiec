@@ -27,8 +27,9 @@ use polyglot_sql::expressions::Select;
 use polyglot_sql::{generate, DialectType, Expression};
 
 use super::{
-    apply_consumer_joins, apply_select_formulas, parse_stage, parse_top_select,
-    planned_alias_on_leg, rename_consumer_outputs, unsupported, StageCfg,
+    apply_consumer_joins, apply_select_formulas, parse_stage_from, parse_stage_prep,
+    parse_top_select, planned_alias_on_leg, rename_consumer_outputs, stage_aliases, unsupported,
+    L2Formula, StageCfg,
 };
 use crate::graph::{Ctx, SemanticGraph};
 use crate::plan::{self, DerivedJoin, Request};
@@ -40,12 +41,22 @@ pub(super) const MAX_DEPTH: usize = 4;
 pub(super) const MAX_DERIVED: usize = 8;
 
 /// What a column of a stage's result is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum OutKind {
     /// A dimension / grouping column: a value of a field.
     Field,
     /// An `AGG(measure)` or SQL aggregate, already evaluated to a scalar.
     EvaluatedMeasure,
+    /// A measure passed through a select list for a later `AGG()` (§7.7), or a
+    /// query-local `TO MEASURE` item. Not a value: only an outer `AGG(t.col)`
+    /// reads it, and it evaluates `metric` (or `formula`, for `TO MEASURE`) at
+    /// the outer stage's grain.
+    UnevaluatedMeasure {
+        /// Canonical metric a pass-through names; the alias of a `TO MEASURE`.
+        metric: String,
+        /// `TO MEASURE`: the deferred composition of leaf metrics.
+        formula: Option<L2Formula>,
+    },
 }
 
 /// One consumer-visible output column of a [`Node`].
@@ -100,6 +111,9 @@ impl Relation {
                     .map(|o| match o.kind {
                         OutKind::Field => o.name.clone(),
                         OutKind::EvaluatedMeasure => format!("{} [evaluated]", o.name),
+                        OutKind::UnevaluatedMeasure { .. } => {
+                            format!("{} [unevaluated measure]", o.name)
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -117,10 +131,12 @@ pub(super) struct Compiler<'a> {
     pub derived_count: usize,
     /// The flat top-level request, when the query has no derived tables.
     flat_request: Option<Request>,
+    /// Expressions of the query's `TO MEASURE` items, by marker index.
+    pub to_measures: Vec<Expression>,
 }
 
 pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> Result<Compiled> {
-    let sel = parse_top_select(sql_text)?;
+    let (sel, to_measures) = parse_top_select(sql_text)?;
     let mut c = Compiler {
         graph,
         opts,
@@ -130,17 +146,31 @@ pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> 
         },
         derived_count: 0,
         flat_request: None,
+        to_measures,
     };
     let node = c.select(&sel, 0, false, &[])?;
     let ast = resolve(node)?;
-    // Flat queries keep their Layer 3 request as identity; nested ones hash the
-    // normalized consumer SQL.
+    // Flat queries keep their Request as identity. Nested SQL, and any query with
+    // TO MEASURE (markers only appear in the select list; fold can leave
+    // derived_count at 0), hashes the normalized consumer SQL plus formulas.
     let identity = match c.flat_request.take() {
-        Some(req) if c.derived_count == 0 => serde_json::json!(req),
+        Some(req) if c.derived_count == 0 && c.to_measures.is_empty() => serde_json::json!(req),
         _ => {
-            let text = generate(&Expression::Select(Box::new(sel)), DialectType::Generic)
-                .map_err(|e| Error::Internal(e.to_string()))?;
-            serde_json::json!({ "layer2_sql": text })
+            let render = |e: Expression| {
+                generate(&e, DialectType::Generic).map_err(|e| Error::Internal(e.to_string()))
+            };
+            let text = render(Expression::Select(Box::new(sel)))?;
+            let mut id = serde_json::json!({ "layer2_sql": text });
+            if !c.to_measures.is_empty() {
+                let tm = c
+                    .to_measures
+                    .iter()
+                    .cloned()
+                    .map(render)
+                    .collect::<Result<Vec<_>>>()?;
+                id["to_measures"] = serde_json::json!(tm);
+            }
+            id
         }
     };
     render_compiled(graph, identity, ast, c.ctx, opts)
@@ -162,6 +192,9 @@ pub(super) fn resolve(node: Node) -> Result<Expression> {
 enum Kind {
     /// `FROM <dataset> [JOIN ...]`: the semantic pipeline.
     Agg,
+    /// `AGG()` over a sole derived table (§7.7): the derived table is folded into
+    /// the stage, see [`super::fold`].
+    Fold,
     /// `FROM <derived> [JOIN <derived> ...]`: ordinary SQL over derived tables.
     Shell,
 }
@@ -176,6 +209,9 @@ fn classify(sel: &Select) -> Result<Kind> {
         .map(|e| super::as_derived(e).map(|d| d.is_some()))
         .collect::<Result<_>>()?;
     match derived.as_slice() {
+        [true] if sel.joins.is_empty() && sel.expressions.iter().any(super::fold::has_agg) => {
+            Ok(Kind::Fold)
+        }
         [true] => Ok(Kind::Shell),
         d if d.iter().any(|x| *x) => Err(unsupported(
             "Layer 2 comma-separated FROM cannot include derived tables; use JOIN (SELECT ...) t ON ...",
@@ -200,6 +236,7 @@ impl Compiler<'_> {
         }
         match classify(sel)? {
             Kind::Agg => self.agg_stage(sel, depth, derived_mode, outer),
+            Kind::Fold => self.fold(sel, depth, derived_mode, outer),
             Kind::Shell => self.shell(sel, depth, outer),
         }
     }
@@ -224,7 +261,7 @@ impl Compiler<'_> {
 
     /// An `AGG` stage: the flat request → plan → lower pipeline, plus the
     /// derived tables the consumer joined in.
-    fn agg_stage(
+    pub(super) fn agg_stage(
         &mut self,
         sel: &Select,
         depth: usize,
@@ -232,28 +269,46 @@ impl Compiler<'_> {
         outer: &[String],
     ) -> Result<Node> {
         let graph = self.graph;
-        let parsed = parse_stage(
-            graph,
-            sel,
-            &StageCfg {
-                derived: derived_mode,
-                outer,
-            },
-        )?;
-        if depth == 0 && parsed.derived.is_empty() {
-            self.flat_request = Some(parsed.request.clone());
-        }
+        let to_measures = self.to_measures.clone();
+        let cfg = StageCfg {
+            derived: derived_mode,
+            outer,
+            to_measures: &to_measures,
+        };
+        let parsed_from = parse_stage_prep(graph, sel, &cfg)?;
 
         // Nested queries see this stage's aliases as "outer" (correlation check).
         let mut inner_outer = outer.to_vec();
-        inner_outer.extend(parsed.scope_aliases.iter().cloned());
+        inner_outer.extend(stage_aliases(graph, &parsed_from));
+
+        // Compile the derived tables first: the select list may read their
+        // unevaluated measures (`AGG(t.m)`, §7.7).
+        let mut compiled: Vec<(String, Node)> = vec![];
+        let mut schemas: Vec<(String, Vec<OutCol>)> = vec![];
+        for spec in &parsed_from.derived {
+            let (placeholder, node) = self.derived(&spec.select, depth + 1, &inner_outer)?;
+            schemas.push((spec.alias.clone(), node.outputs.clone()));
+            compiled.push((placeholder, node));
+        }
+        let mut parsed = parse_stage_from(graph, sel, &cfg, parsed_from, &schemas)?;
+        // A derived JOIN attaches to a dataset that may not be named by the
+        // selected measures (grand-total AGG over a pass-through with
+        // `FROM customers JOIN (…orders…) m`). Pull those datasets into the
+        // join tree so `planned_alias_on_leg` can resolve them.
+        for spec in &parsed.derived {
+            if !parsed.request.ensure_datasets.contains(&spec.attach_ds) {
+                parsed.request.ensure_datasets.push(spec.attach_ds);
+            }
+        }
+        if depth == 0 && parsed.derived.is_empty() {
+            self.flat_request = Some(parsed.request.clone());
+        }
 
         let mut pending = vec![];
         // (placeholder, derived columns as emitted) per derived table.
         let mut prepared: Vec<(String, Vec<String>)> = vec![];
         let aggregates = !parsed.request.metrics.is_empty();
-        for spec in &parsed.derived {
-            let (placeholder, node) = self.derived(&spec.select, depth + 1, &inner_outer)?;
+        for (spec, (placeholder, node)) in parsed.derived.iter().zip(compiled) {
             let mut rel_cols = vec![];
             let mut key_idx = vec![];
             for c in &spec.cols {
@@ -272,6 +327,12 @@ impl Compiler<'_> {
                                 .join(", ")
                         ))
                     })?;
+                if matches!(node.outputs[i].kind, OutKind::UnevaluatedMeasure { .. }) {
+                    return Err(unsupported(format!(
+                        "Layer 2 derived-table JOIN ON cannot use `{}.{c}`: it is an unevaluated measure, not a value",
+                        spec.alias
+                    )));
+                }
                 rel_cols.push(node.outputs[i].name.clone());
                 key_idx.push(i);
             }
@@ -295,33 +356,40 @@ impl Compiler<'_> {
         let mut logical = plan::plan(graph, &parsed.request, &mut self.ctx)?;
         apply_consumer_joins(graph, &mut logical, &parsed.consumer_joins, &mut self.ctx)?;
         if !parsed.derived.is_empty() {
-            if logical.legs.len() != 1 {
-                return Err(unsupported(
-                    "Layer 2 derived-table JOIN with measures from independent facts (A.4) is not supported; a derived table restricts a single join tree",
-                ));
-            }
             if logical.include_unmatched {
                 return Err(unsupported(
                     "Layer 2 derived-table JOIN cannot be combined with includeUnmatched",
                 ));
             }
+            // A derived table restricts the dataset it attaches to, in every leg
+            // that reads it: independent facts (A.4) share a dimension to attach to.
             for (spec, (placeholder, rel_cols)) in parsed.derived.iter().zip(prepared) {
-                let from_alias = planned_alias_on_leg(graph, &logical.legs[0], spec.attach_ds)
-                    .ok_or_else(|| {
-                        unsupported(format!(
-                            "Layer 2 derived-table JOIN `{}`: dataset `{}` is not part of the planned query",
-                            spec.alias, graph.datasets[spec.attach_ds].name
-                        ))
-                    })?;
-                logical.legs[0].derived.push(DerivedJoin {
-                    from_alias,
-                    from_fields: spec.from_fields.clone(),
-                    rel_placeholder: placeholder,
-                    rel_alias: spec.alias.clone(),
-                    rel_cols,
-                    null_safe: spec.null_safe,
-                    kind: spec.kind,
-                });
+                let parsed_legs = logical.legs.len();
+                for leg in &mut logical.legs {
+                    let from_alias = planned_alias_on_leg(graph, leg, spec.attach_ds)
+                        .ok_or_else(|| {
+                            if parsed_legs > 1 {
+                                unsupported(format!(
+                                    "Layer 2 derived-table JOIN `{}` with measures from independent facts (A.4) needs a dataset every fact reaches; `{}` is not part of each planned leg",
+                                    spec.alias, graph.datasets[spec.attach_ds].name
+                                ))
+                            } else {
+                                unsupported(format!(
+                                    "Layer 2 derived-table JOIN `{}`: dataset `{}` is not part of the planned query",
+                                    spec.alias, graph.datasets[spec.attach_ds].name
+                                ))
+                            }
+                        })?;
+                    leg.derived.push(DerivedJoin {
+                        from_alias,
+                        from_fields: spec.from_fields.clone(),
+                        rel_placeholder: placeholder.clone(),
+                        rel_alias: spec.alias.clone(),
+                        rel_cols: rel_cols.clone(),
+                        null_safe: spec.null_safe,
+                        kind: spec.kind,
+                    });
+                }
             }
         }
         apply_select_formulas(graph, &mut logical, &parsed.measure_outputs)?;
@@ -339,6 +407,22 @@ impl Compiler<'_> {
             name: n.clone(),
             kind: OutKind::EvaluatedMeasure,
         }));
+        // Unevaluated measures: a `TO MEASURE` item is a column of the statement
+        // (evaluated at this grain) that the outer query reads as a measure; a
+        // pass-through has no column at all, only a name.
+        for u in &parsed.unevaluated {
+            let kind = OutKind::UnevaluatedMeasure {
+                metric: u.metric.clone(),
+                formula: u.formula.clone(),
+            };
+            match outputs.iter_mut().find(|o| o.name == u.name) {
+                Some(o) if u.formula.is_some() => o.kind = kind,
+                _ => outputs.push(OutCol {
+                    name: u.name.clone(),
+                    kind,
+                }),
+            }
+        }
         if derived_mode {
             check_unique_names(&outputs)?;
         }
