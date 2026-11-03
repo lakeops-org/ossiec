@@ -102,6 +102,11 @@ pub struct Options {
     /// Prefer this Ossie dialect's expressions (`TRINO`, `SNOWFLAKE`, ...) when a field or metric declares one.
     pub prefer_dialect: Option<String>,
     pub pretty: bool,
+    /// Layer 2 only: also return one-side rows no fact row reaches (products never
+    /// sold, customers who never ordered). Same switch as a Layer 3 request's
+    /// `includeUnmatched`. A comment `-- ossiec: includeUnmatched` in the SQL sets
+    /// it too. [`compile`] ignores this field; Layer 3 reads [`Request::include_unmatched`].
+    pub include_unmatched: bool,
 }
 
 impl Default for Options {
@@ -110,6 +115,7 @@ impl Default for Options {
             target: None,
             prefer_dialect: None,
             pretty: true,
+            include_unmatched: false,
         }
     }
 }

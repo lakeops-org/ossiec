@@ -502,11 +502,22 @@ fn unmatched_rows(
     for (i, e) in inputs.iter().enumerate() {
         cols.push(format!("{} AS c{i}", t.e(retarget(e))));
     }
+    // Derived joins that attach inside this subtree ride along, under the same
+    // `…__unmatched` rename as the relationship aliases (`tree_sql` renames
+    // `from_alias`). A derived join on the fact side is not in the subtree: the
+    // `NOT EXISTS` leg still applies it, so it only changes which fact rows count
+    // as reaching the grain.
+    let derived: Vec<DerivedJoin> = leg
+        .derived
+        .iter()
+        .filter(|d| subtree.contains(&d.from_alias))
+        .cloned()
+        .collect();
     let from = tree_sql(
         g,
         (grain, &g.datasets[grain].name),
         &steps,
-        &[],
+        &derived,
         &rename,
         &mut t,
         ctx,

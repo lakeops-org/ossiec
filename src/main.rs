@@ -7,12 +7,15 @@ USAGE:
     ossiec validate <model.yaml>
     ossiec describe <model.yaml>
     ossiec compile  <model.yaml> <request.json | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--compact] [--json]
-    ossiec compile-l2 <model.yaml> <query.sql | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--compact] [--json]
+    ossiec compile-l2 <model.yaml> <query.sql | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--include-unmatched] [--compact] [--json]
 
 OPTIONS:
     --dialect <name>   Target dialect: trino, snowflake, bigquery, duckdb, postgres, clickhouse,
                        starrocks, databricks, redshift, athena, mysql, ... (default: the model's source dialect)
     --prefer <name>    Prefer this Ossie dialect's expressions when a field or metric declares one
+    --include-unmatched
+                       Layer 2: also return one-side rows no fact reaches (same as a
+                       request's includeUnmatched, or `-- ossiec: includeUnmatched` in the SQL)
     --compact          One-line SQL
     --json             Print the full compile result (SQL, dialect, warnings, hash) as JSON
 
@@ -62,6 +65,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 opts.target = Some(d.parse().map_err(|_| format!("unknown dialect `{d}`"))?);
             }
             "--prefer" => opts.prefer_dialect = Some(it.next().ok_or("--prefer needs a value")?),
+            "--include-unmatched" => opts.include_unmatched = true,
             "--compact" => opts.pretty = false,
             "--json" => json = true,
             _ => pos.push(a),

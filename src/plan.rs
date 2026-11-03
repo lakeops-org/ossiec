@@ -35,7 +35,7 @@ pub struct Request {
     /// list the distinct values of `dimensions` instead.
     #[serde(default)]
     pub metrics: Vec<String>,
-    /// `dataset.field`.
+    /// `dataset.field`, or `relationship.field` when that dataset plays the role.
     #[serde(default)]
     pub dimensions: Vec<String>,
     #[serde(default)]
