@@ -93,7 +93,6 @@ impl Compiler<'_> {
                 "Layer 2 WITH / DISTINCT / QUALIFY are not implemented yet",
             ));
         }
-        let graph = self.graph;
         let from = sel.from.as_ref().expect("classified as a shell");
 
         // Relations: every item must be a derived table.
@@ -141,6 +140,7 @@ impl Compiler<'_> {
             });
             pending.push((placeholder, node));
         }
+        let graph = &self.graph;
         let scope = Scope { rels: &rels, outer };
 
         // Select list.
@@ -325,12 +325,12 @@ impl Compiler<'_> {
 
     /// A shell `FROM` item that is not a derived table.
     fn not_derived(&self, e: &Expression) -> Error {
-        match table_expr(self.graph, e) {
+        match table_expr(&self.graph, e) {
             Ok((dataset, alias)) => {
                 let alias = alias.unwrap_or_else(|| self.graph.datasets[dataset].name.clone());
                 unsupported(format!(
                     "Layer 2 outer query over derived tables cannot also read the model dataset {}: ordinary SQL does not run over raw model tables; use a derived table (SELECT ... FROM {} ...)",
-                    Relation::Dataset { dataset, alias }.describe(self.graph),
+                    Relation::Dataset { dataset, alias }.describe(&self.graph),
                     self.graph.datasets[dataset].name
                 ))
             }

@@ -125,10 +125,14 @@ impl Relation {
 /// State shared by every stage of one top-level compile: one `Ctx` (a single
 /// source-dialect decision, merged warnings), one placeholder counter.
 pub(super) struct Compiler<'a> {
-    pub graph: &'a SemanticGraph,
+    /// Clone of the caller's graph. Base `TO MEASURE` installs ephemeral
+    /// metrics here; the bound model is not mutated.
+    pub graph: SemanticGraph,
     pub opts: &'a Options,
     pub ctx: Ctx,
     pub derived_count: usize,
+    /// Next `__l2_bmN` for a query-local base measure.
+    pub(super) base_seq: usize,
     /// The flat top-level request, when the query has no derived tables.
     flat_request: Option<Request>,
     /// Expressions of the query's `TO MEASURE` items, by marker index.
@@ -138,13 +142,14 @@ pub(super) struct Compiler<'a> {
 pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> Result<Compiled> {
     let (sel, to_measures) = parse_top_select(sql_text)?;
     let mut c = Compiler {
-        graph,
+        graph: graph.clone(),
         opts,
         ctx: Ctx {
             prefer: opts.prefer_dialect.clone(),
             ..Default::default()
         },
         derived_count: 0,
+        base_seq: 0,
         flat_request: None,
         to_measures,
     };
@@ -268,18 +273,17 @@ impl Compiler<'_> {
         derived_mode: bool,
         outer: &[String],
     ) -> Result<Node> {
-        let graph = self.graph;
         let to_measures = self.to_measures.clone();
         let cfg = StageCfg {
             derived: derived_mode,
             outer,
             to_measures: &to_measures,
         };
-        let parsed_from = parse_stage_prep(graph, sel, &cfg)?;
+        let parsed_from = parse_stage_prep(&self.graph, sel, &cfg)?;
 
         // Nested queries see this stage's aliases as "outer" (correlation check).
         let mut inner_outer = outer.to_vec();
-        inner_outer.extend(stage_aliases(graph, &parsed_from));
+        inner_outer.extend(stage_aliases(&self.graph, &parsed_from));
 
         // Compile the derived tables first: the select list may read their
         // unevaluated measures (`AGG(t.m)`, §7.7).
@@ -290,7 +294,14 @@ impl Compiler<'_> {
             schemas.push((spec.alias.clone(), node.outputs.clone()));
             compiled.push((placeholder, node));
         }
-        let mut parsed = parse_stage_from(graph, sel, &cfg, parsed_from, &schemas)?;
+        let mut base_seq = self.base_seq;
+        let mut parsed =
+            parse_stage_from(&self.graph, sel, &cfg, parsed_from, &schemas, &mut base_seq)?;
+        self.base_seq = base_seq;
+        for ep in std::mem::take(&mut parsed.ephemeral) {
+            self.graph
+                .install_ephemeral_metric(&ep.name, ep.owner, ep.body)?;
+        }
         // A derived JOIN attaches to a dataset that may not be named by the
         // selected measures (grand-total AGG over a pass-through with
         // `FROM customers JOIN (…orders…) m`). Pull those datasets into the
@@ -303,6 +314,7 @@ impl Compiler<'_> {
         if depth == 0 && parsed.derived.is_empty() {
             self.flat_request = Some(parsed.request.clone());
         }
+        let graph = &self.graph;
 
         let mut pending = vec![];
         // (placeholder, derived columns as emitted) per derived table.
