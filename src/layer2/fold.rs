@@ -350,17 +350,16 @@ impl Compiler<'_> {
                 let col = as_column(e)
                     .ok_or_else(|| unsupported("Layer 2 GROUP BY must name dimension columns"))?;
                 // Prefer the derived select label, then the inner expression.
-                let measure = map
-                    .cols
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(&col.name.name))
-                    .and_then(|(_, c)| match c {
-                        Col::Inner(x) => {
-                            as_column(x).and_then(|c| bare_measure(&self.graph, &inner_scope, c))
-                        }
-                        Col::Deferred(_) | Col::Evaluated => Some(0),
-                    })
-                    .or_else(|| bare_measure(&self.graph, &inner_scope, col));
+                let measure =
+                    map.cols
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&col.name.name))
+                        .and_then(|(_, c)| match c {
+                            Col::Inner(x) => as_column(x)
+                                .and_then(|c| bare_measure(&self.graph, &inner_scope, c)),
+                            Col::Deferred(_) | Col::Evaluated => Some(0),
+                        })
+                        .or_else(|| bare_measure(&self.graph, &inner_scope, col));
                 if measure.is_some() {
                     return Err(Error::Request(format!(
                         "Layer 2 GROUP BY cannot name measure `{}`; group by dimensions only",
