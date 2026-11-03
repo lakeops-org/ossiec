@@ -307,8 +307,31 @@ impl Compiler<'_> {
         // A derived JOIN attaches to a dataset that may not be named by the
         // selected measures (grand-total AGG over a pass-through with
         // `FROM customers JOIN (…orders…) m`). Pull those datasets into the
-        // join tree so `planned_alias_on_leg` can resolve them.
+        // join tree so `planned_alias_on_leg` can resolve them — only when the
+        // attach dataset is not already required by a measure or dimension,
+        // so A.4 independent-fact stacking is not collapsed into one tree.
+        let already: std::collections::BTreeSet<usize> = parsed
+            .request
+            .metrics
+            .iter()
+            .filter_map(|m| {
+                self.graph
+                    .metric_by_name(m)
+                    .ok()
+                    .and_then(|i| self.graph.metrics[i].owner)
+            })
+            .chain(
+                parsed
+                    .request
+                    .dimensions
+                    .iter()
+                    .filter_map(|d| self.graph.field_by_name(d).ok().map(|(ds, _, _)| ds)),
+            )
+            .collect();
         for spec in &parsed.derived {
+            if already.contains(&spec.attach_ds) {
+                continue;
+            }
             if !parsed.request.ensure_datasets.contains(&spec.attach_ds) {
                 parsed.request.ensure_datasets.push(spec.attach_ds);
             }
