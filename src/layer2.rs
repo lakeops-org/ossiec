@@ -20,9 +20,10 @@
 //! `(AGG(a) / AGG(b)) TO MEASURE AS m` item (Appendix A.7 / §5.2 surface) defers a
 //! composed measure the same way. `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS m`
 //! (§5.1) defers a base measure: an ephemeral dataset-scoped metric on a clone of
-//! the graph, passed through for the outer `AGG`. Other join forms (`ASOF`,
-//! `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) and `CREATE VIEW` stay
-//! [`Error::Unsupported`].
+//! the graph, passed through for the outer `AGG`. [`define_layer2_view`] keeps a
+//! named measure relation in a session [`Layer2Catalog`] (`CREATE VIEW`); it is
+//! not written into the model. Other join forms (`ASOF`, `SEMI`/`ANTI`,
+//! `NATURAL`, `LATERAL`, …) stay [`Error::Unsupported`].
 //!
 //! **Roles.** A column qualified by a relationship name (`departs_from.city`) is a
 //! Layer 3 role: the request dimension is `relationship.field`, and the planner
@@ -55,17 +56,40 @@ use crate::plan::{
 };
 use crate::{Compiled, Error, Options, Result};
 
+mod catalog;
 mod fold;
 mod nested;
 mod shell;
 mod to_measure;
 
+pub use catalog::{
+    compile_layer2_script, define_layer2_view, Layer2Catalog, Layer2Column, Layer2ColumnKind,
+};
+
 use nested::{OutCol, OutKind};
 
 /// Compile a Layer 2 SQL query (`AGG(measure)` over model relations) to SQL.
 /// Derived tables (Appendix A.2–A.3) compile recursively; see [`nested`].
+///
+/// Views are not in scope. Register them with [`define_layer2_view`] and compile
+/// through [`compile_layer2_with`], or pass a whole script to [`compile_layer2_script`].
 pub fn compile_layer2(graph: &SemanticGraph, sql: &str, opts: &Options) -> Result<Compiled> {
-    nested::compile(graph, sql, opts)
+    compile_layer2_with(graph, &Layer2Catalog::new(), sql, opts)
+}
+
+/// [`compile_layer2`] against a session [`Layer2Catalog`] of `CREATE VIEW` relations.
+///
+/// A view name in `FROM` / `JOIN` is that view's defining `SELECT`: fields and
+/// deferred measures (`TO MEASURE`, §7.7 pass-through) are columns of the
+/// relation, and `AGG(view.measure)` evaluates the deferred formula at this
+/// query's grain.
+pub fn compile_layer2_with(
+    graph: &SemanticGraph,
+    catalog: &Layer2Catalog,
+    sql: &str,
+    opts: &Options,
+) -> Result<Compiled> {
+    nested::compile(graph, catalog, sql, opts)
 }
 
 /// After output names change (aliases, composed metrics, dimension labels),
@@ -228,6 +252,12 @@ pub(super) fn parse_top_select(sql: &str) -> Result<(Select, Vec<Expression>)> {
         .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
     match ast {
         Expression::Select(sel) => Ok((*sel, to_measures)),
+        Expression::CreateView(_) => Err(unsupported(
+            "Layer 2 CREATE VIEW is not a query; register it with define_layer2_view (or pass CREATE VIEW statements and a final SELECT to compile_layer2_script / compile-l2)",
+        )),
+        Expression::DropView(_) => Err(unsupported(
+            "Layer 2 DROP VIEW is not supported; views live in a session Layer2Catalog",
+        )),
         _ => Err(unsupported(
             "Layer 2 accepts a single SELECT (set operators are not supported)",
         )),

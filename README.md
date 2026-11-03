@@ -180,7 +180,7 @@ println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
 
 ### Layer 2 (`AGG(measure)`)
 
-Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS` join kinds (§7.6: null-extended and Cartesian rows do not inflate `AGG`); **A.2** derived tables joined into an `AGG` stage; **A.3** `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables (with `IS NOT DISTINCT FROM` join keys). Consumer aliases (`AS n`) name the output columns. `layer2_to_request` returns leaf measures of flat queries only; nested SQL is `compile_layer2` / `compile-l2` only. **§7.7** unevaluated measures: a derived table may pass a dataset-scoped measure through its select list and an outer `AGG(t.m)` evaluates it (join form, or a sole derived `FROM`, which is folded into the outer stage). **Query-local `TO MEASURE`** in a derived table's select list, consumed by an outer `AGG(t.m)`, is implemented for both `(AGG(a) / AGG(b)) TO MEASURE AS m` and a base `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS m` (unevaluated until that outer `AGG`). `CREATE VIEW` / persisted A.7 views are not.
+Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS` join kinds (§7.6: null-extended and Cartesian rows do not inflate `AGG`); **A.2** derived tables joined into an `AGG` stage; **A.3** `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables (with `IS NOT DISTINCT FROM` join keys). Consumer aliases (`AS n`) name the output columns. `layer2_to_request` returns leaf measures of flat queries only; nested SQL is `compile_layer2` / `compile-l2` only. **§7.7** unevaluated measures: a derived table may pass a dataset-scoped measure through its select list and an outer `AGG(t.m)` evaluates it (join form, or a sole derived `FROM`, which is folded into the outer stage). **Query-local `TO MEASURE`** in a derived table's select list, consumed by an outer `AGG(t.m)`, is implemented for both `(AGG(a) / AGG(b)) TO MEASURE AS m` and a base `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS m` (unevaluated until that outer `AGG`). **`CREATE VIEW` (Appendix A.7)** stores that relation in a session [`Layer2Catalog`](src/layer2/catalog.rs) (`define_layer2_view` / `compile_layer2_with`, or a `compile-l2` script). The model YAML is not modified.
 
 **Roles.** Qualify a column with the relationship name, the same form as a Layer 3 dimension: `departs_from.city`. That name may also be the JOIN alias (`JOIN airports AS departs_from`). A plain `airports.city` still takes the unique shortest path and is refused when departure and arrival both tie.
 
@@ -217,6 +217,19 @@ JOIN (SELECT c.region, SUM(o.amount) TO MEASURE AS total_revenue
       GROUP BY c.region) m ON r.region = m.region
 GROUP BY r.region;
 
+-- A.7: the same relation, named. The view is session state, not a model change.
+CREATE VIEW region_metrics AS
+SELECT c.region,
+       (AGG(o.order_amt) / AGG(t.ticket_count)) TO MEASURE AS sales_per_ticket
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+LEFT JOIN tickets t ON t.customer_id = c.id
+GROUP BY c.region;
+
+SELECT region, AGG(sales_per_ticket) AS sales_per_ticket
+FROM region_metrics
+GROUP BY region;
+
 -- A.3: ordinary aggregates over derived tables
 SELECT d.status, AVG(m.n)
 FROM (SELECT status, customer_id FROM orders GROUP BY status, customer_id) d
@@ -234,6 +247,11 @@ echo "SELECT status, AGG(order_count) FROM orders GROUP BY status" \
 
 ```rust
 let out = ossiec::compile_layer2(&graph, "SELECT AGG(order_count) FROM orders", &opts)?;
+
+let mut views = ossiec::Layer2Catalog::new();
+ossiec::define_layer2_view(&graph, &mut views, "CREATE VIEW region_metrics AS SELECT ...", &opts)?;
+let out = ossiec::compile_layer2_with(&graph, &views, "SELECT region, AGG(sales_per_ticket) FROM region_metrics GROUP BY region", &opts)?;
+// compile-l2 accepts the same script: CREATE VIEW ...; SELECT ...
 ```
 
 Model-scoped metrics are not measures (§10.3). `AGG(expr)` inside `AGG()` is refused; use `AGG(a) + AGG(b)`. Other join forms (`ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) are not implemented yet. `CROSS JOIN` takes no `ON`.
@@ -341,7 +359,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`), role-playing dimensions, `includeUnmatched` (flat and derived onto the unmatched grain). The shop forms of A.2/A.3 and §7.7 (fold, outer `WHERE`, join pass-through) also run in the engine tier (`layer2_nested_*`); `TO MEASURE` is DuckDB + compile-matrix only. |
+| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`), role-playing dimensions, `includeUnmatched` (flat and derived onto the unmatched grain), A.7 `CREATE VIEW` measure relations (session catalog, DuckDB oracle). The shop forms of A.2/A.3 and §7.7 (fold, outer `WHERE`, join pass-through) also run in the engine tier (`layer2_nested_*`); `TO MEASURE` is DuckDB + compile-matrix only. |
 
 ## Known issues
 
@@ -395,7 +413,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Role-playing dimensions (`relationship.field`, shortest path by default)
 - [x] Unmatched one-side rows (`includeUnmatched`)
 - [x] NULL placement in `orderBy`
-- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; `CREATE VIEW` / A.7 persistence not yet)
+- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog, not written into the model)
 - [ ] Publish to crates.io
 
 ## Contributing

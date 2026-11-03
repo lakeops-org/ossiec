@@ -28,7 +28,7 @@ use polyglot_sql::{parse_one, DialectType, Expression};
 use super::unsupported;
 use crate::{Error, Result};
 
-const MARKER: &str = "__l2_tm";
+pub(super) const MARKER: &str = "__l2_tm";
 
 /// `SUM` / `COUNT` / `AVG` / `MIN` / `MAX`: a base aggregate in front of `TO MEASURE`.
 pub(super) fn is_base_agg_word(name: &str) -> bool {
@@ -168,7 +168,7 @@ fn parse_item(text: &str) -> Result<Expression> {
 }
 
 /// `true` where the byte is SQL code (not in a string, quoted identifier or comment).
-fn code_mask(sql: &str) -> Vec<bool> {
+pub(super) fn code_mask(sql: &str) -> Vec<bool> {
     let b = sql.as_bytes();
     let mut mask = vec![true; b.len()];
     let mut i = 0;
