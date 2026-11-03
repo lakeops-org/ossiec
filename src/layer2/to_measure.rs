@@ -8,15 +8,19 @@
 //! ```
 //!
 //! The SQL parser does not know `TO MEASURE`, so [`extract`] cuts every
-//! `(<expr>) TO MEASURE AS <name>` item out of the text before parsing. In its
-//! place the select list gets a marker column, `__l2_tmN AS <name>`, and the
-//! expression is parsed on its own and kept at index `N`. The stage compiler
-//! recognises the marker ([`marker_index`]) and registers the item as a deferred
-//! (unevaluated) measure: an outer `AGG(derived.<name>)` evaluates the formula.
+//! `TO MEASURE AS <name>` item out of the text before parsing. In its place the
+//! select list gets a marker column, `__l2_tmN AS <name>`, and the expression is
+//! parsed on its own and kept at index `N`. The stage compiler recognises the
+//! marker ([`marker_index`]) and registers the item as a deferred (unevaluated)
+//! measure: an outer `AGG(derived.<name>)` evaluates it.
 //!
-//! Only a parenthesized expression is accepted. `SUM(x) TO MEASURE` (a raw SQL
-//! aggregate) is refused, as is any `TO MEASURE` that does not follow a
-//! parenthesized expression at the start of a select item.
+//! Two shapes are accepted, both at the start of a select item:
+//!
+//! * a parenthesized expression, `(AGG(a) / AGG(b)) TO MEASURE AS name`
+//! * one base aggregate, `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS name`
+//!   (also `(SUM(x)) TO MEASURE`)
+//!
+//! A bare column (`x TO MEASURE`) is refused.
 
 use polyglot_sql::expressions::Column;
 use polyglot_sql::{parse_one, DialectType, Expression};
@@ -26,6 +30,14 @@ use crate::{Error, Result};
 
 const MARKER: &str = "__l2_tm";
 
+/// `SUM` / `COUNT` / `AVG` / `MIN` / `MAX`: a base aggregate in front of `TO MEASURE`.
+pub(super) fn is_base_agg_word(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
+    )
+}
+
 /// The `TO MEASURE` index a marker column stands for.
 pub(super) fn marker_index(col: &Column) -> Option<usize> {
     if col.table.is_some() {
@@ -34,7 +46,7 @@ pub(super) fn marker_index(col: &Column) -> Option<usize> {
     col.name.name.strip_prefix(MARKER)?.parse().ok()
 }
 
-/// Replace every `(<expr>) TO MEASURE AS <name>` by `__l2_tmN AS <name>`.
+/// Replace every `TO MEASURE AS <name>` item by `__l2_tmN AS <name>`.
 /// Returns the rewritten SQL and the parsed expressions, indexed by `N`.
 pub(super) fn extract(sql: &str) -> Result<(String, Vec<Expression>)> {
     let code = code_mask(sql);
@@ -58,21 +70,23 @@ pub(super) fn extract(sql: &str) -> Result<(String, Vec<Expression>)> {
         }
         let shape = || {
             unsupported(
-                "Layer 2 TO MEASURE must follow a parenthesized expression at the start of a select item: `(AGG(a) / AGG(b)) TO MEASURE AS name`",
+                "Layer 2 TO MEASURE must follow SUM|COUNT|AVG|MIN|MAX(...) or a parenthesized expression at the start of a select item: `SUM(amount) TO MEASURE AS name` or `(AGG(a) / AGG(b)) TO MEASURE AS name`",
             )
         };
 
-        // The parenthesized expression before TO.
+        // The `)` that closes the expression (or the base aggregate's argument list).
         let close = prev_code(bytes, &code, to_s).ok_or_else(shape)?;
         if bytes[close] != b')' {
             return Err(shape());
         }
         let open = matching_open(bytes, &code, close).ok_or_else(shape)?;
-        if open < copied {
-            return Err(unsupported("Layer 2 TO MEASURE items cannot be nested"));
-        }
-        // What precedes `(`: the select list start (`SELECT`) or a `,`. A word
-        // there is a function name: `SUM(x) TO MEASURE` is a raw SQL aggregate.
+        // Parenthesized form: the text inside the outer parens. Base aggregate:
+        // `SUM(...)` including the function name.
+        let mut expr_lo = open;
+        let mut text_lo = open + 1;
+        let mut text_hi = close;
+        // What precedes `(`: the select list start (`SELECT`), a `,`, or a base
+        // aggregate name. Any other word is not a measure.
         match prev_code(bytes, &code, open) {
             Some(p) if bytes[p] == b',' => {}
             Some(p) if bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_' => {
@@ -80,14 +94,27 @@ pub(super) fn extract(sql: &str) -> Result<(String, Vec<Expression>)> {
                 while s > 0 && (bytes[s - 1].is_ascii_alphanumeric() || bytes[s - 1] == b'_') {
                     s -= 1;
                 }
-                if !sql[s..=p].eq_ignore_ascii_case("SELECT") {
+                let word = &sql[s..=p];
+                if word.eq_ignore_ascii_case("SELECT") {
+                    // `(...)` is the whole select item.
+                } else if is_base_agg_word(word) {
+                    expr_lo = s;
+                    text_lo = s;
+                    text_hi = close + 1;
+                } else if word.eq_ignore_ascii_case("AGG") || word.eq_ignore_ascii_case("MEASURE") {
                     return Err(unsupported(format!(
-                        "Layer 2 TO MEASURE applies to a parenthesized AGG() expression, not to the SQL aggregate `{}(...)`; write `(AGG(measure) ...) TO MEASURE AS name`",
-                        &sql[s..=p]
+                        "Layer 2 `{word}(...) TO MEASURE` must be parenthesized: `({word}(...) ...) TO MEASURE AS name`"
+                    )));
+                } else {
+                    return Err(unsupported(format!(
+                        "Layer 2 TO MEASURE accepts SUM|COUNT|AVG|MIN|MAX(...) or a parenthesized AGG() expression, not `{word}(...)`"
                     )));
                 }
             }
             _ => return Err(shape()),
+        }
+        if expr_lo < copied {
+            return Err(unsupported("Layer 2 TO MEASURE items cannot be nested"));
         }
 
         // `AS <name>` after MEASURE.
@@ -103,12 +130,12 @@ pub(super) fn extract(sql: &str) -> Result<(String, Vec<Expression>)> {
         let (name_s, name_e) = identifier_after(sql, &code, as_e)
             .ok_or_else(|| Error::Request("Layer 2 TO MEASURE needs `AS <name>`".into()))?;
 
-        let text = &sql[open + 1..close];
+        let text = &sql[text_lo..text_hi];
         let expr = parse_item(text)?;
         let n = exprs.len();
         exprs.push(expr);
 
-        out.push_str(&sql[copied..open]);
+        out.push_str(&sql[copied..expr_lo]);
         out.push_str(&format!("{MARKER}{n} AS {}", &sql[name_s..name_e]));
         copied = name_e;
         // Skip the words the alias consumed.

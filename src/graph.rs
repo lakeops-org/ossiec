@@ -35,6 +35,7 @@ pub(crate) struct Variant {
     pub ast: Expression,
 }
 
+#[derive(Clone)]
 pub(crate) struct DatasetInfo {
     pub name: String,
     pub source: Expression,
@@ -42,6 +43,7 @@ pub(crate) struct DatasetInfo {
     pub primary_key: Vec<usize>,
 }
 
+#[derive(Clone)]
 pub(crate) struct FieldInfo {
     pub name: String,
     pub variants: Vec<Variant>,
@@ -49,6 +51,7 @@ pub(crate) struct FieldInfo {
     pub is_time: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct RelInfo {
     pub name: String,
     pub from: usize,
@@ -57,6 +60,7 @@ pub(crate) struct RelInfo {
     pub to_fields: Vec<usize>,
 }
 
+#[derive(Clone)]
 pub(crate) struct MetricInfo {
     /// `metric` for model-scoped metrics, `dataset.metric` for dataset-scoped ones.
     pub name: String,
@@ -67,6 +71,7 @@ pub(crate) struct MetricInfo {
 }
 
 /// A validated, bound Ossie model, ready to compile requests against.
+#[derive(Clone)]
 pub struct SemanticGraph {
     pub(crate) model: Model,
     pub(crate) datasets: Vec<DatasetInfo>,
@@ -874,6 +879,52 @@ impl SemanticGraph {
                 other => other,
             })?;
         Ok((ds, f, role))
+    }
+
+    /// A dataset-scoped metric that exists only for this compile (a query-local
+    /// `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE`). `name` is `dataset.metric`.
+    /// The bound model is left unchanged; callers install on a clone.
+    pub(crate) fn install_ephemeral_metric(
+        &mut self,
+        name: &str,
+        owner: usize,
+        ast: Expression,
+    ) -> Result<()> {
+        if self
+            .metrics
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(name))
+        {
+            return Err(Error::Internal(format!(
+                "ephemeral metric `{name}` already exists"
+            )));
+        }
+        self.metrics.push(MetricInfo {
+            name: name.to_string(),
+            owner: Some(owner),
+            variants: vec![Variant {
+                flavor: Flavor::Portable,
+                ast: true_division(ast),
+            }],
+            unsupported: None,
+        });
+        let i = self.metrics.len() - 1;
+        match self.resolve_metric_unchecked(i, &mut Ctx::default()) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.metrics.pop();
+                Err(match e {
+                    Error::InvalidModel(v) => Error::Request(format!(
+                        "Layer 2 TO MEASURE base aggregate: {}",
+                        v.join("; ")
+                    )),
+                    Error::Unsupported(why) => {
+                        Error::Unsupported(format!("Layer 2 TO MEASURE base aggregate: {why}"))
+                    }
+                    other => other,
+                })
+            }
+        }
     }
 
     pub(crate) fn metric_by_name(&self, name: &str) -> Result<usize> {

@@ -17,8 +17,11 @@
 //! **§7.7** (unevaluated measures): a derived table may pass a dataset-scoped
 //! measure through its select list; an outer `AGG(t.m)` evaluates it. A query-local
 //! `(AGG(a) / AGG(b)) TO MEASURE AS m` item (Appendix A.7 / §5.2 surface) defers a
-//! composed measure the same way. Other join forms (`ASOF`, `SEMI`/`ANTI`,
-//! `NATURAL`, `LATERAL`, …) and `CREATE VIEW` stay [`Error::Unsupported`].
+//! composed measure the same way. `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS m`
+//! (§5.1) defers a base measure: an ephemeral dataset-scoped metric on a clone of
+//! the graph, passed through for the outer `AGG`. Other join forms (`ASOF`,
+//! `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) and `CREATE VIEW` stay
+//! [`Error::Unsupported`].
 //!
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
@@ -27,9 +30,11 @@ use std::collections::HashMap;
 
 use polyglot_sql::builder::{func, lit, Expr};
 use polyglot_sql::expressions::{
-    BinaryOp, Column, Join, JoinKind as SqlJoinKind, Literal, Select, TableRef,
+    BinaryOp, Column, Identifier, Join, JoinKind as SqlJoinKind, Literal, Select, TableRef,
 };
-use polyglot_sql::{parse_one, DialectType, Expression};
+use polyglot_sql::{
+    get_columns, parse_one, transform_all, DialectType, Expression, ExpressionWalk,
+};
 
 use crate::graph::{self, SemanticGraph};
 use crate::plan::{
@@ -107,6 +112,19 @@ pub(super) struct Layer2Parsed {
     /// Columns of this stage that are measures awaiting a later `AGG()` (§7.7):
     /// pass-through measures and query-local `TO MEASURE` items.
     pub unevaluated: Vec<UnevaluatedSpec>,
+    /// Base `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE` items to install on the
+    /// compile's graph clone before the stage is planned.
+    pub ephemeral: Vec<EphemeralMetric>,
+}
+
+/// A query-local base measure: one SQL aggregate, owned by a single dataset.
+pub(super) struct EphemeralMetric {
+    /// Canonical `dataset.metric` name.
+    pub name: String,
+    pub owner: usize,
+    pub body: Expression,
+    pub dataset: String,
+    pub bare: String,
 }
 
 /// A select-list column that stays a measure for an outer `AGG()`.
@@ -212,7 +230,14 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
             "Layer 2 derived tables (Appendix A.2–A.3) are not one Layer 3 request; use compile_layer2",
         ));
     }
-    parse_stage_from(graph, &sel, &cfg, parsed_from, &[])
+    let mut base_seq = 0usize;
+    let parsed = parse_stage_from(graph, &sel, &cfg, parsed_from, &[], &mut base_seq)?;
+    if !parsed.ephemeral.is_empty() {
+        return Err(Error::Internal(
+            "flat Layer 2 query cannot install a query-local base measure".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Clause checks and the `FROM` / `JOIN` list of one `AGG` stage.
@@ -244,6 +269,7 @@ fn parse_stage_from(
     cfg: &StageCfg<'_>,
     mut parsed_from: ParsedFrom,
     derived_outs: &[(String, Vec<OutCol>)],
+    base_seq: &mut usize,
 ) -> Result<Layer2Parsed> {
     parsed_from.scope.derived_outs = derived_outs.to_vec();
     let scope = &parsed_from.scope;
@@ -253,6 +279,7 @@ fn parse_stage_from(
     let mut measure_outputs = Vec::new();
     let mut dim_labels: Vec<(String, String)> = Vec::new();
     let mut unevaluated: Vec<UnevaluatedSpec> = Vec::new();
+    let mut ephemeral: Vec<EphemeralMetric> = Vec::new();
     // Select-list label (alias or default) → order-by / output resolution name.
     let mut outputs: Vec<(String, String)> = Vec::new();
 
@@ -271,6 +298,19 @@ fn parse_stage_from(
                     .to_measures
                     .get(n)
                     .ok_or_else(|| Error::Internal("unknown TO MEASURE marker".into()))?;
+                if let Some(ep) = classify_to_measure(graph, scope, e, base_seq)? {
+                    let metric = ep.name.clone();
+                    ephemeral.push(ep);
+                    // Pass-through: nothing is added to this stage's request. The
+                    // outer AGG evaluates the ephemeral metric at its own grain.
+                    unevaluated.push(UnevaluatedSpec {
+                        name: name.clone(),
+                        metric: metric.clone(),
+                        formula: None,
+                    });
+                    outputs.push((name, metric));
+                    continue;
+                }
                 let formula = parse_formula_or_agg(graph, scope, e)?;
                 let leaves = formula_leaves(&formula);
                 if leaves.is_empty() {
@@ -480,7 +520,173 @@ fn parse_stage_from(
         dim_labels,
         derived: parsed_from.derived,
         unevaluated,
+        ephemeral,
     })
+}
+
+/// `Some` when `e` is one base aggregate to install as a dataset metric.
+/// `None` when it is a composition of `AGG(measure)` (the caller parses that).
+fn classify_to_measure(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+    base_seq: &mut usize,
+) -> Result<Option<EphemeralMetric>> {
+    let raw = e.contains(is_base_agg_expr);
+    let measure = e.contains(is_measure_agg_expr);
+    if raw && measure {
+        return Err(unsupported(
+            "Layer 2 TO MEASURE cannot mix AGG(measure) with a raw SQL aggregate (SUM, COUNT, AVG, MIN, or MAX); use one base aggregate, or a parenthesized composition of AGG()",
+        ));
+    }
+    if raw {
+        if !is_single_base_aggregate(e) {
+            return Err(unsupported(
+                "Layer 2 TO MEASURE accepts one SUM|COUNT|AVG|MIN|MAX(...) or a parenthesized composition of AGG(measure); compound raw aggregates are not supported",
+            ));
+        }
+        let (owner, body) = base_measure_body(graph, scope, e)?;
+        let bare = format!("__l2_bm{base_seq}");
+        *base_seq += 1;
+        let dataset = graph.datasets[owner].name.clone();
+        let name = format!("{dataset}.{bare}");
+        return Ok(Some(EphemeralMetric {
+            name,
+            owner,
+            body,
+            dataset,
+            bare,
+        }));
+    }
+    if !measure {
+        return Err(unsupported(
+            "Layer 2 TO MEASURE needs one SUM|COUNT|AVG|MIN|MAX(...) or a parenthesized expression over AGG(measure)",
+        ));
+    }
+    Ok(None)
+}
+
+fn is_base_agg_expr(e: &Expression) -> bool {
+    match e {
+        Expression::Sum(_)
+        | Expression::Avg(_)
+        | Expression::Min(_)
+        | Expression::Max(_)
+        | Expression::Count(_) => true,
+        Expression::Function(f) if to_measure::is_base_agg_word(&f.name) => true,
+        Expression::AggregateFunction(f) if to_measure::is_base_agg_word(&f.name) => true,
+        _ => false,
+    }
+}
+
+fn is_measure_agg_expr(e: &Expression) -> bool {
+    match e {
+        Expression::Function(f) if is_agg_name(&f.name) => true,
+        Expression::AggregateFunction(f) if is_agg_name(&f.name) => true,
+        _ => false,
+    }
+}
+
+/// The whole item is one base aggregate, with no nested aggregate inside it.
+fn is_single_base_aggregate(e: &Expression) -> bool {
+    let e = unwrap_paren(e);
+    is_base_agg_expr(e) && e.count(is_base_agg_expr) == 1 && !e.contains(is_measure_agg_expr)
+}
+
+/// The dataset that owns the aggregate, and the metric body (field names unqualified).
+fn base_measure_body(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+) -> Result<(usize, Expression)> {
+    let e = unwrap_paren(e);
+    let mut owner: Option<usize> = None;
+    for c in get_columns(e) {
+        let Expression::Column(col) = c else {
+            continue;
+        };
+        let ds = resolve_column_dataset(graph, scope, col)?;
+        let _ = dataset_field(graph, ds, col)?;
+        match owner {
+            None => owner = Some(ds),
+            Some(o) if o != ds => {
+                return Err(unsupported(
+                    "Layer 2 TO MEASURE base aggregate must use fields of a single dataset",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let owner = match owner {
+        Some(ds) => ds,
+        None => grain_dataset(graph, scope)?,
+    };
+    let body = transform_all(e.clone(), &|node| {
+        let Expression::Column(mut c) = node else {
+            return Ok(node);
+        };
+        let canon = dataset_field(graph, owner, &c)
+            .map_err(|err| polyglot_sql::Error::InvalidInput(err.to_string()))?;
+        c.table = None;
+        c.name = Identifier::new(canon);
+        Ok(Expression::Column(c))
+    })
+    .map_err(|err| Error::Internal(format!("Layer 2 TO MEASURE base aggregate: {err}")))?;
+    Ok((owner, body))
+}
+
+fn dataset_field(graph: &SemanticGraph, ds: usize, col: &Column) -> Result<String> {
+    let ds_name = &graph.datasets[ds].name;
+    let label = match &col.table {
+        Some(t) => format!("{}.{}", t.name, col.name.name),
+        None => col.name.name.clone(),
+    };
+    match graph::lookup(
+        graph.datasets[ds].fields.iter().map(|f| f.name.as_str()),
+        &col.name.name,
+        col.name.quoted,
+    )
+    .map_err(Error::Request)?
+    {
+        Some(i) => Ok(graph.datasets[ds].fields[i].name.clone()),
+        None => {
+            let is_measure = graph.metrics.iter().any(|m| {
+                m.owner == Some(ds)
+                    && (m.name.eq_ignore_ascii_case(&col.name.name)
+                        || m.name
+                            .eq_ignore_ascii_case(&format!("{ds_name}.{}", col.name.name)))
+            });
+            if is_measure {
+                Err(unsupported(format!(
+                    "Layer 2 TO MEASURE base aggregate `{label}` is a measure on `{ds_name}`, not a field; name a field (SUM(amount)) or read the measure with AGG()"
+                )))
+            } else {
+                Err(Error::Request(format!(
+                    "Layer 2 TO MEASURE base aggregate `{label}` is not a field of `{ds_name}`"
+                )))
+            }
+        }
+    }
+}
+
+/// `COUNT(*)` (and any aggregate with no field) counts one dataset's grain.
+fn grain_dataset(graph: &SemanticGraph, scope: &QueryScope) -> Result<usize> {
+    match scope.bindings.as_slice() {
+        [one] => Ok(one.dataset),
+        [] => Err(Error::Request(
+            "Layer 2 COUNT(*) TO MEASURE needs a FROM dataset whose grain it counts".into(),
+        )),
+        many => {
+            let names = many
+                .iter()
+                .map(|b| graph.datasets[b.dataset].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(unsupported(format!(
+                "Layer 2 COUNT(*) TO MEASURE counts one dataset's grain, but FROM joins several datasets ({names}); name a column of that dataset (for example COUNT(orders.id))"
+            )))
+        }
+    }
 }
 
 /// `dataset.field` → `field`.
@@ -575,25 +781,35 @@ fn apply_consumer_joins(
     }
     for leg_i in added_reverse {
         let root = logical.legs[leg_i].root;
+        // G2 protects measures. A stage that only passes a measure through (or
+        // lists dimensions) has nothing to duplicate; the join still filters.
+        let dedup: Vec<usize> = logical
+            .terms
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| {
+                term.leg == leg_i && term.strategy == Strategy::Inline && !term.term.dup_insensitive
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if dedup.is_empty() {
+            continue;
+        }
         if graph.datasets[root].primary_key.is_empty() {
             return Err(unsupported(format!(
                 "Layer 2 fan-out join requires a primary_key on `{}` so measures stay duplicate-free (G2)",
                 graph.datasets[root].name
             )));
         }
-        for term in &mut logical.terms {
-            if term.leg != leg_i {
-                continue;
-            }
-            if term.strategy == Strategy::Inline && !term.term.dup_insensitive {
-                ctx.warn(format!(
-                    "FAN_TRAP_RISK: `{}` is computed over `{}` rows de-duplicated by primary key; a `{}` row that belongs to several groups counts in each, so groups do not add up to a grand total",
-                    term.term.key,
-                    graph.datasets[root].name,
-                    graph.datasets[root].name
-                ));
-                term.strategy = Strategy::PkDedup { grain: root };
-            }
+        for i in dedup {
+            let term = &mut logical.terms[i];
+            ctx.warn(format!(
+                "FAN_TRAP_RISK: `{}` is computed over `{}` rows de-duplicated by primary key; a `{}` row that belongs to several groups counts in each, so groups do not add up to a grand total",
+                term.term.key,
+                graph.datasets[root].name,
+                graph.datasets[root].name
+            ));
+            term.strategy = Strategy::PkDedup { grain: root };
         }
     }
     Ok(())

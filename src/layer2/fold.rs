@@ -34,8 +34,8 @@ use polyglot_sql::Expression;
 use super::nested::{Compiler, Node};
 use super::to_measure::marker_index;
 use super::{
-    as_column, as_derived, bare_measure, is_agg_name, parse_from_clause, strip_alias, unsupported,
-    unwrap_paren,
+    as_column, as_derived, bare_measure, classify_to_measure, is_agg_name, parse_from_clause,
+    strip_alias, unsupported, unwrap_paren,
 };
 use crate::{Error, Result};
 
@@ -297,23 +297,35 @@ impl Compiler<'_> {
             }
         }
 
-        // What each derived column stands for.
+        // What each derived column stands for. A base aggregate becomes a
+        // pass-through of an ephemeral metric; an AGG() composition stays deferred
+        // and expands in place of the outer AGG().
+        let scope = parse_from_clause(&self.graph, inner.from.as_ref(), &inner.joins, outer)?.scope;
         let mut cols: Vec<(String, Col)> = vec![];
+        let mut pending = vec![];
         for item in &inner.expressions {
             let (e, a) = strip_alias(item);
             let (name, col) = match (as_column(e), a) {
                 (Some(c), a) => {
                     let name = a.unwrap_or_else(|| c.name.name.clone());
                     match marker_index(c) {
-                        Some(n) => (
-                            name,
-                            Col::Deferred(
-                                self.to_measures
-                                    .get(n)
-                                    .cloned()
-                                    .ok_or_else(|| Error::Internal("TO MEASURE marker".into()))?,
-                            ),
-                        ),
+                        Some(n) => {
+                            let expr = self
+                                .to_measures
+                                .get(n)
+                                .cloned()
+                                .ok_or_else(|| Error::Internal("TO MEASURE marker".into()))?;
+                            if let Some(ep) =
+                                classify_to_measure(&self.graph, &scope, &expr, &mut self.base_seq)?
+                            {
+                                let col =
+                                    Col::Inner(Expression::qualified_column(&ep.dataset, &ep.bare));
+                                pending.push(ep);
+                                (name, col)
+                            } else {
+                                (name, Col::Deferred(expr))
+                            }
+                        }
                         None => (name, Col::Inner(e.clone())),
                     }
                 }
@@ -333,22 +345,21 @@ impl Compiler<'_> {
         // measure must still be refused.
         if let Some(gb) = &inner.group_by {
             let inner_scope =
-                parse_from_clause(self.graph, inner.from.as_ref(), &inner.joins, &[])?.scope;
+                parse_from_clause(&self.graph, inner.from.as_ref(), &inner.joins, &[])?.scope;
             for e in &gb.expressions {
                 let col = as_column(e)
                     .ok_or_else(|| unsupported("Layer 2 GROUP BY must name dimension columns"))?;
                 // Prefer the derived select label, then the inner expression.
-                let measure = map
-                    .cols
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(&col.name.name))
-                    .and_then(|(_, c)| match c {
-                        Col::Inner(x) => {
-                            as_column(x).and_then(|c| bare_measure(self.graph, &inner_scope, c))
-                        }
-                        Col::Deferred(_) | Col::Evaluated => Some(0),
-                    })
-                    .or_else(|| bare_measure(self.graph, &inner_scope, col));
+                let measure =
+                    map.cols
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&col.name.name))
+                        .and_then(|(_, c)| match c {
+                            Col::Inner(x) => as_column(x)
+                                .and_then(|c| bare_measure(&self.graph, &inner_scope, c)),
+                            Col::Deferred(_) | Col::Evaluated => Some(0),
+                        })
+                        .or_else(|| bare_measure(&self.graph, &inner_scope, col));
                 if measure.is_some() {
                     return Err(Error::Request(format!(
                         "Layer 2 GROUP BY cannot name measure `{}`; group by dimensions only",
@@ -416,6 +427,10 @@ impl Compiler<'_> {
         };
         folded.limit = sel.limit.clone();
         folded.offset = None;
+        for ep in pending {
+            self.graph
+                .install_ephemeral_metric(&ep.name, ep.owner, ep.body)?;
+        }
         self.agg_stage(&folded, depth, derived_mode, outer)
     }
 }

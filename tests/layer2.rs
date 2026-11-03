@@ -1491,6 +1491,107 @@ fn s77_refuses_inner_queries_that_cannot_fold() {
     }
 }
 
+fn base_measure_rows(sql: &str) -> Vec<(String, f64)> {
+    let c = ossiec::compile_layer2(&two_facts_graph(), sql, &two_facts_opts()).unwrap();
+    assert!(!c.sql.contains("__l2_tm"), "{}", c.sql);
+    rows_f64(duckdb_rows(&two_facts_db(), &c.sql))
+}
+
+#[test]
+fn to_measure_sum_defers_to_the_outer_agg() {
+    // The form that used to be refused. The outer AGG evaluates SUM(amount) at
+    // the orders grain: EU 60, US 5. APAC has no orders, so it is not a group.
+    let sum = "SELECT r.region, AGG(m.total_revenue) AS total_revenue \
+        FROM customers r \
+        JOIN (SELECT c.region, SUM(o.amount) TO MEASURE AS total_revenue \
+              FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
+              GROUP BY c.region) m ON r.region = m.region \
+        GROUP BY r.region";
+    let paren = sum.replace("SUM(o.amount) TO MEASURE", "(SUM(o.amount)) TO MEASURE");
+    let want = rows_f64(duckdb_rows(
+        &two_facts_db(),
+        "SELECT c.region, SUM(o.amount) \
+         FROM orders o JOIN customers c ON o.customer_id = c.id \
+         GROUP BY c.region",
+    ));
+    for (label, sql) in [("SUM", sum), ("(SUM)", paren.as_str())] {
+        let got = base_measure_rows(sql);
+        assert_eq!(got.len(), want.len(), "{label}: {got:?} vs {want:?}");
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g.0, w.0, "{label}");
+            assert!((g.1 - w.1).abs() < 1e-9, "{label}: {got:?} vs {want:?}");
+        }
+    }
+    assert_eq!(want.len(), 2, "{want:?}");
+    assert!((want.iter().find(|r| r.0 == "EU").unwrap().1 - 60.0).abs() < 1e-9);
+}
+
+#[test]
+fn to_measure_avg_is_not_the_average_of_inner_averages() {
+    // Inner grain is the customer. EU's per-customer averages are 15 and 30;
+    // the outer AGG must average the orders (20), not those averages (22.5).
+    let sql = "SELECT r.region, AGG(m.a) AS a \
+        FROM customers r \
+        JOIN (SELECT c.id, AVG(o.amount) TO MEASURE AS a \
+              FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
+              GROUP BY c.id) m ON r.id = m.id \
+        GROUP BY r.region";
+    let got = base_measure_rows(sql);
+    let eu = got.iter().find(|r| r.0 == "EU").unwrap().1;
+    assert!((eu - 20.0).abs() < 1e-9, "{got:?}");
+    assert!((eu - 22.5).abs() > 1.0, "pre-aggregated: {got:?}");
+}
+
+#[test]
+fn to_measure_count_star_counts_the_dataset_grain() {
+    let g = graph();
+    let sql = "SELECT status, AGG(n) AS n \
+        FROM (SELECT status, COUNT(*) TO MEASURE AS n FROM orders \
+              WHERE customer_id IS NOT NULL GROUP BY status) t \
+        WHERE status = 'completed' \
+        GROUP BY status";
+    let c = ossiec::compile_layer2(&g, sql, &duck()).unwrap();
+    let db = duckdb();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(
+            &db,
+            "SELECT status, COUNT(*) FROM orders \
+             WHERE customer_id IS NOT NULL AND status = 'completed' GROUP BY status"
+        )
+    );
+    let flat = ossiec::compile_layer2(
+        &g,
+        "SELECT status, AGG(order_count) AS n FROM orders \
+         WHERE customer_id IS NOT NULL AND status = 'completed' GROUP BY status",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(c.sql, flat.sql);
+}
+
+#[test]
+fn to_measure_min_max_and_count_distinct() {
+    let g = graph();
+    let sql = "SELECT status, AGG(m.lo) AS lo, AGG(m.hi) AS hi, AGG(m.buyers) AS buyers \
+        FROM (SELECT status, \
+                     MIN(amount_cents) TO MEASURE AS lo, \
+                     MAX(amount_cents) TO MEASURE AS hi, \
+                     COUNT(DISTINCT customer_id) TO MEASURE AS buyers \
+              FROM orders GROUP BY status) m \
+        GROUP BY status";
+    let c = ossiec::compile_layer2(&g, sql, &duck()).unwrap();
+    let db = duckdb();
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT status, MIN(amount_cents), MAX(amount_cents), COUNT(DISTINCT customer_id) \
+             FROM orders GROUP BY status"
+        ))
+    );
+}
+
 #[test]
 fn to_measure_refusals() {
     let g = two_facts_graph();
@@ -1502,14 +1603,20 @@ fn to_measure_refusals() {
              ON r.region = m.region GROUP BY r.region"
         )
     };
-    // A raw SQL aggregate is not a deferred AGG() composition.
+    // Not a base aggregate, and not a parenthesized AGG() composition.
     for item in [
-        "SUM(o.amount) TO MEASURE AS x",
-        "(SUM(o.amount)) TO MEASURE AS x",
+        "o.amount TO MEASURE AS x",
+        "(o.amount) TO MEASURE AS x",
         "AGG(o.order_amt) / AGG(o.order_amt) TO MEASURE AS x",
+        "(AGG(o.order_amt) + SUM(o.amount)) TO MEASURE AS x",
+        "(SUM(o.amount) + SUM(o.amount)) TO MEASURE AS x",
+        "COUNT(*) TO MEASURE AS x",
     ] {
         let m = unsupported_msg(ossiec::compile_layer2(&g, &wrap(item), &o).unwrap_err());
-        assert!(m.contains("TO MEASURE") || m.contains("AGG"), "{item}: {m}");
+        assert!(
+            m.contains("TO MEASURE") || m.contains("AGG") || m.contains("COUNT"),
+            "{item}: {m}"
+        );
     }
     // Missing name.
     let e = ossiec::compile_layer2(&g, &wrap("(AGG(o.order_amt)) TO MEASURE"), &o).unwrap_err();
@@ -1518,16 +1625,14 @@ fn to_measure_refusals() {
         "{e}"
     );
     // Top level: nothing outside could evaluate it.
-    let m = unsupported_msg(
-        ossiec::compile_layer2(
-            &g,
-            "SELECT c.region, (AGG(o.order_amt)) TO MEASURE AS x FROM customers c \
-             LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
-            &o,
-        )
-        .unwrap_err(),
-    );
-    assert!(m.contains("TO MEASURE"), "{m}");
+    for sql in [
+        "SELECT c.region, (AGG(o.order_amt)) TO MEASURE AS x FROM customers c \
+         LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
+        "SELECT o.amount, SUM(o.amount) TO MEASURE AS x FROM orders o",
+    ] {
+        let m = unsupported_msg(ossiec::compile_layer2(&g, sql, &o).unwrap_err());
+        assert!(m.contains("TO MEASURE"), "{sql}: {m}");
+    }
     // The text is only cut where it is code: a string literal is left alone.
     let e = ossiec::compile_layer2(
         &g,
@@ -1552,6 +1657,9 @@ fn s77_and_to_measure_compile_on_every_engine() {
         "SELECT r.region, AGG(m.sales_per_ticket) AS s FROM customers r \
          JOIN ({SALES_PER_TICKET}) m ON r.region = m.region GROUP BY r.region"
     );
+    let base = "SELECT status, AGG(n) AS n \
+        FROM (SELECT status, COUNT(*) TO MEASURE AS n FROM orders GROUP BY status) t \
+        GROUP BY status";
     for target in ENGINES {
         let opts = Options {
             target: Some(target),
@@ -1561,6 +1669,7 @@ fn s77_and_to_measure_compile_on_every_engine() {
             ("A.2", &g, a2),
             ("fold", &g, fold),
             ("TO MEASURE", &tf, &tm),
+            ("base TO MEASURE", &g, base),
         ] {
             let c = ossiec::compile_layer2(graph, q, &opts)
                 .unwrap_or_else(|e| panic!("{name} on {target:?}: {e}"));
