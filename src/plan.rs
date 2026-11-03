@@ -57,6 +57,13 @@ pub struct Request {
     /// the request's joins decide its rows (relational semantics §10.2).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_unmatched: bool,
+    /// Datasets that must appear in the join tree even when no selected
+    /// dimension, filter or metric names them. Used by the AGG SQL frontend so a
+    /// derived-table JOIN can attach to `FROM customers …` while the measures
+    /// live on another fact. Not part of the JSON request surface (`serde(skip)`).
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub ensure_datasets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +392,9 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
         .iter()
         .map(|(_, ds, _, role)| (*ds, *role))
         .collect();
+    for &ds in &req.ensure_datasets {
+        required.insert((ds, None));
+    }
     let mut filters = vec![];
     let is_string = |ds: usize, f: usize| {
         g.datasets[ds].fields[f]

@@ -26,12 +26,17 @@
 //! join form (`FROM orders o JOIN (...) t ON ...`) does not fold; see
 //! [`super::nested`].
 
-use polyglot_sql::expressions::{BinaryOp, Column, GroupBy, OrderBy, Ordered, Select, Where};
+use polyglot_sql::expressions::{
+    Alias, BinaryOp, Column, GroupBy, Identifier, OrderBy, Ordered, Select, Where,
+};
 use polyglot_sql::Expression;
 
 use super::nested::{Compiler, Node};
 use super::to_measure::marker_index;
-use super::{as_column, as_derived, is_agg_name, strip_alias, unsupported, unwrap_paren};
+use super::{
+    as_column, as_derived, bare_measure, is_agg_name, parse_from_clause, strip_alias, unsupported,
+    unwrap_paren,
+};
 use crate::{Error, Result};
 
 /// Does a select item contain `AGG(...)` / `MEASURE(...)` (in an arithmetic composition)?
@@ -66,32 +71,36 @@ struct FoldMap {
 }
 
 impl FoldMap {
-    /// The column a reference names, when it addresses the derived table.
-    fn lookup(&self, c: &Column) -> Result<Option<&Col>> {
+    fn missing(&self, name: &str) -> Error {
+        Error::Request(format!(
+            "derived table `{}` has no column `{name}`; it has: {}",
+            self.alias,
+            self.cols
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    /// The column a reference names on the derived table. Foreign relation
+    /// qualifiers and names the derived table does not expose are rejected: after
+    /// fold they would otherwise resolve against the inner FROM and leak.
+    fn lookup(&self, c: &Column) -> Result<&Col> {
         let name = &c.name.name;
         if let Some(t) = &c.table {
             if !t.name.eq_ignore_ascii_case(&self.alias) {
-                return Ok(None);
+                return Err(Error::Request(format!(
+                    "derived table `{}` does not expose `{}.{}`; qualify columns with `{}` or use a name from its select list",
+                    self.alias, t.name, name, self.alias
+                )));
             }
         }
-        match self
-            .cols
+        self.cols
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, c)| c)
-        {
-            Some(col) => Ok(Some(col)),
-            None if c.table.is_some() => Err(Error::Request(format!(
-                "derived table `{}` has no column `{name}`; it has: {}",
-                self.alias,
-                self.cols
-                    .iter()
-                    .map(|(n, _)| n.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))),
-            None => Ok(None),
-        }
+            .ok_or_else(|| self.missing(name))
     }
 
     fn evaluated(&self, name: &str) -> Error {
@@ -117,15 +126,14 @@ impl FoldMap {
                     return Ok(e.clone());
                 }
                 match self.lookup(c)? {
-                    None => e.clone(),
-                    Some(Col::Inner(x)) => x.clone(),
-                    Some(Col::Deferred(_)) => {
+                    Col::Inner(x) => x.clone(),
+                    Col::Deferred(_) => {
                         return Err(unsupported(format!(
                             "Layer 2 `{}.{}` is a TO MEASURE column: only AGG({0}.{1}) can read it",
                             self.alias, c.name.name
                         )))
                     }
-                    Some(Col::Evaluated) => {
+                    Col::Evaluated => {
                         return Err(unsupported(format!(
                             "Layer 2 `{}.{}` is an evaluated measure; an outer query with AGG() cannot read it as a column",
                             self.alias, c.name.name
@@ -144,6 +152,13 @@ impl FoldMap {
                 }
             }
             Expression::AggregateFunction(f) if is_agg_name(&f.name) && f.args.len() == 1 => {
+                // Reject FILTER before expanding a TO MEASURE formula (which would
+                // drop the clause and skip take_agg's check).
+                if f.filter.is_some() {
+                    return Err(unsupported(
+                        "FILTER on AGG() itself is not defined; put filters in WHERE or in the measure",
+                    ));
+                }
                 match self.agg_arg(&f.args[0])? {
                     Agg::Keep(a) => {
                         let mut n = (**f).clone();
@@ -194,16 +209,39 @@ impl FoldMap {
             return Ok(Agg::Keep(arg.clone()));
         };
         Ok(match self.lookup(c)? {
-            None => Agg::Keep(arg.clone()),
-            Some(Col::Inner(x)) => Agg::Keep(x.clone()),
-            Some(Col::Deferred(x)) => Agg::Expand(Expression::Paren(Box::new(
+            Col::Inner(x) => Agg::Keep(x.clone()),
+            Col::Deferred(x) => Agg::Expand(Expression::Paren(Box::new(
                 polyglot_sql::expressions::Paren {
                     this: x.clone(),
                     trailing_comments: vec![],
                 },
             ))),
-            Some(Col::Evaluated) => return Err(self.evaluated(&c.name.name)),
+            Col::Evaluated => return Err(self.evaluated(&c.name.name)),
         })
+    }
+
+    /// Keep the consumer-visible select label when rewriting replaces a bare
+    /// column (`s`) with its inner expression (`status`). Explicit `AS` aliases
+    /// are already preserved by [`Self::expr`]'s Alias arm.
+    fn with_label(&self, original: &Expression, rewritten: Expression) -> Expression {
+        let (inner, alias) = strip_alias(original);
+        if alias.is_some() {
+            // `expr` already rewrote inside the Alias node.
+            return rewritten;
+        }
+        let Some(c) = as_column(inner) else {
+            return rewritten;
+        };
+        let label = &c.name.name;
+        if as_column(&rewritten)
+            .is_some_and(|r| r.table.is_none() && r.name.name.eq_ignore_ascii_case(label))
+        {
+            return rewritten;
+        }
+        Expression::Alias(Box::new(Alias::new(
+            rewritten,
+            Identifier::new(label.clone()),
+        )))
     }
 }
 
@@ -291,6 +329,35 @@ impl Compiler<'_> {
         }
         let map = FoldMap { alias, cols };
 
+        // Inner GROUP BY is dropped (grain is re-evaluated), but grouping by a
+        // measure must still be refused.
+        if let Some(gb) = &inner.group_by {
+            let inner_scope =
+                parse_from_clause(self.graph, inner.from.as_ref(), &inner.joins, &[])?.scope;
+            for e in &gb.expressions {
+                let col = as_column(e)
+                    .ok_or_else(|| unsupported("Layer 2 GROUP BY must name dimension columns"))?;
+                // Prefer the derived select label, then the inner expression.
+                let measure = map
+                    .cols
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&col.name.name))
+                    .and_then(|(_, c)| match c {
+                        Col::Inner(x) => {
+                            as_column(x).and_then(|c| bare_measure(self.graph, &inner_scope, c))
+                        }
+                        Col::Deferred(_) | Col::Evaluated => Some(0),
+                    })
+                    .or_else(|| bare_measure(self.graph, &inner_scope, col));
+                if measure.is_some() {
+                    return Err(Error::Request(format!(
+                        "Layer 2 GROUP BY cannot name measure `{}`; group by dimensions only",
+                        col.name.name
+                    )));
+                }
+            }
+        }
+
         // Aliases the outer select list defines (`ORDER BY n`).
         let select_aliases: Vec<String> = sel
             .expressions
@@ -302,7 +369,10 @@ impl Compiler<'_> {
         folded.expressions = sel
             .expressions
             .iter()
-            .map(|e| map.expr(e, &[]))
+            .map(|e| {
+                let rewritten = map.expr(e, &[])?;
+                Ok(map.with_label(e, rewritten))
+            })
             .collect::<Result<_>>()?;
         folded.where_clause = match (&inner.where_clause, &sel.where_clause) {
             (None, None) => None,

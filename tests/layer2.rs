@@ -1415,3 +1415,92 @@ fn s77_and_to_measure_compile_on_every_engine() {
         }
     }
 }
+
+// ---------------------------------------------------------------- Copilot review regressions (PR #6)
+
+#[test]
+fn fold_refuses_columns_not_exposed_by_the_derived_table() {
+    for sql in [
+        // `status` is not in the derived select list.
+        "SELECT status, AGG(order_count) FROM (SELECT customer_id, order_count FROM orders) t GROUP BY status",
+        // Hidden base relation must not leak through the fold.
+        "SELECT orders.status, AGG(order_count) FROM (SELECT customer_id, order_count FROM orders) t GROUP BY orders.status",
+    ] {
+        let e = ossiec::compile_layer2(&graph(), sql, &duck()).unwrap_err();
+        assert!(
+            matches!(e, Error::Request(ref m) if m.contains("derived table")),
+            "{sql}: {e}"
+        );
+    }
+}
+
+#[test]
+fn fold_refuses_filter_on_agg_of_to_measure() {
+    let g = two_facts_graph();
+    let sql = "SELECT AGG(m.x) FILTER (WHERE true) FROM (
+        SELECT (AGG(o.order_amt)) TO MEASURE AS x FROM orders o
+      ) m";
+    let m = unsupported_msg(ossiec::compile_layer2(&g, sql, &two_facts_opts()).unwrap_err());
+    assert!(m.contains("FILTER"), "{m}");
+}
+
+#[test]
+fn fold_preserves_unaliased_derived_column_labels() {
+    // Outer query addresses the folded stage's column as `s`, not `status`.
+    let sql = "SELECT r.s FROM (
+        SELECT s, AGG(m) AS n FROM (
+          SELECT status AS s, order_count AS m FROM orders
+        ) t GROUP BY s
+      ) r";
+    let c = ossiec::compile_layer2(&graph(), sql, &duck()).unwrap();
+    let db = duckdb();
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT status FROM orders GROUP BY status"
+        ))
+    );
+}
+
+#[test]
+fn fold_refuses_inner_group_by_of_a_measure() {
+    let e = ossiec::compile_layer2(
+        &graph(),
+        "SELECT status, AGG(order_count) FROM (
+           SELECT status, order_count FROM orders GROUP BY status, order_count
+         ) t GROUP BY status",
+        &duck(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("GROUP BY cannot name measure")),
+        "{e}"
+    );
+}
+
+#[test]
+fn folded_to_measure_formulas_participate_in_request_hash() {
+    let g = graph();
+    let wrap = |n: &str| {
+        format!(
+            "SELECT AGG(t.x) FROM (SELECT (AGG(order_count) * {n}) TO MEASURE AS x FROM orders) t"
+        )
+    };
+    let a = ossiec::compile_layer2(&g, &wrap("2"), &duck()).unwrap();
+    let b = ossiec::compile_layer2(&g, &wrap("3"), &duck()).unwrap();
+    assert_ne!(a.request_hash, b.request_hash);
+}
+
+#[test]
+fn derived_join_attach_dataset_is_planned_for_grand_total() {
+    // Measure is on orders; attach is customers. Ensure customers is in the plan.
+    let sql = "SELECT AGG(m.x) FROM customers c
+        JOIN (SELECT customer_id, order_amt AS x FROM orders GROUP BY customer_id) m
+          ON c.id = m.customer_id";
+    let c = ossiec::compile_layer2(&two_facts_graph(), sql, &two_facts_opts()).unwrap();
+    let got = duckdb_rows(&two_facts_db(), &c.sql);
+    assert_eq!(got.len(), 1, "{got:?}");
+    // 10+20+30+5 = 65
+    assert_eq!(got[0][0].parse::<f64>().unwrap(), 65.0);
+}

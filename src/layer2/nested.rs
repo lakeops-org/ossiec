@@ -150,10 +150,11 @@ pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> 
     };
     let node = c.select(&sel, 0, false, &[])?;
     let ast = resolve(node)?;
-    // Flat queries keep their Layer 3 request as identity; nested ones hash the
-    // normalized consumer SQL.
+    // Flat queries keep their Request as identity. Nested SQL, and any query with
+    // TO MEASURE (markers only appear in the select list; fold can leave
+    // derived_count at 0), hashes the normalized consumer SQL plus formulas.
     let identity = match c.flat_request.take() {
-        Some(req) if c.derived_count == 0 => serde_json::json!(req),
+        Some(req) if c.derived_count == 0 && c.to_measures.is_empty() => serde_json::json!(req),
         _ => {
             let render = |e: Expression| {
                 generate(&e, DialectType::Generic).map_err(|e| Error::Internal(e.to_string()))
@@ -161,7 +162,6 @@ pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> 
             let text = render(Expression::Select(Box::new(sel)))?;
             let mut id = serde_json::json!({ "layer2_sql": text });
             if !c.to_measures.is_empty() {
-                // The select list only holds markers: the expressions are identity too.
                 let tm = c
                     .to_measures
                     .iter()
@@ -290,7 +290,16 @@ impl Compiler<'_> {
             schemas.push((spec.alias.clone(), node.outputs.clone()));
             compiled.push((placeholder, node));
         }
-        let parsed = parse_stage_from(graph, sel, &cfg, parsed_from, &schemas)?;
+        let mut parsed = parse_stage_from(graph, sel, &cfg, parsed_from, &schemas)?;
+        // A derived JOIN attaches to a dataset that may not be named by the
+        // selected measures (grand-total AGG over a pass-through with
+        // `FROM customers JOIN (…orders…) m`). Pull those datasets into the
+        // join tree so `planned_alias_on_leg` can resolve them.
+        for spec in &parsed.derived {
+            if !parsed.request.ensure_datasets.contains(&spec.attach_ds) {
+                parsed.request.ensure_datasets.push(spec.attach_ds);
+            }
+        }
         if depth == 0 && parsed.derived.is_empty() {
             self.flat_request = Some(parsed.request.clone());
         }

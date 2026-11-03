@@ -171,7 +171,7 @@ struct TableBinding {
     alias: String,
 }
 
-struct QueryScope {
+pub(super) struct QueryScope {
     bindings: Vec<TableBinding>,
     /// Aliases of derived tables in this stage's `FROM` (usable only in their ON,
     /// or as `AGG(alias.measure)` for their unevaluated measures, §7.7).
@@ -488,7 +488,11 @@ fn bare_field(dim: &str) -> &str {
 
 /// A bare column that names a dataset-scoped measure, not a field: the dataset
 /// it is a measure of (the unevaluated-measure pass-through of spec §7.7).
-fn bare_measure(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Option<usize> {
+pub(super) fn bare_measure(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    col: &Column,
+) -> Option<usize> {
     let name = &col.name.name;
     let hit = scope.bindings.iter().find(|b| {
         let ds = &graph.datasets[b.dataset].name;
@@ -810,8 +814,8 @@ fn unsupported(msg: impl Into<String>) -> Error {
     Error::Unsupported(msg.into())
 }
 
-struct ParsedFrom {
-    scope: QueryScope,
+pub(super) struct ParsedFrom {
+    pub(super) scope: QueryScope,
     consumer_joins: Vec<ConsumerJoin>,
     pub derived: Vec<DerivedSpec>,
 }
@@ -854,7 +858,7 @@ pub(super) fn as_derived(e: &Expression) -> Result<Option<(&Select, String)>> {
     }
 }
 
-fn parse_from_clause(
+pub(super) fn parse_from_clause(
     graph: &SemanticGraph,
     from: Option<&polyglot_sql::expressions::From>,
     joins: &[Join],
