@@ -94,6 +94,17 @@ fn shop_filtered_aggregate_starrocks() {
 }
 
 #[test]
+fn shop_filtered_aggregate_duckdb() {
+    golden(
+        "shop_completed_revenue_duckdb",
+        SHOP,
+        r#"{"metrics": ["completed_revenue"], "dimensions": ["customers.region"]}"#,
+        Some(DialectType::DuckDB),
+        None,
+    );
+}
+
+#[test]
 fn shop_month_grain_trino() {
     golden(
         "shop_month_grain_trino",

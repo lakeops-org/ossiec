@@ -280,7 +280,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`scale`](tests/scale.rs) | **No blow-ups.** A 121-table model binds in about 0.1 s and compiles in about 10 ms per request (unoptimized build). On Trino sf=1, each TPC-DS case must run within 3× its reference. |
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
-| [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests) without `FILTER`, determinism. |
+| [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
 
 ## Known issues
 
@@ -304,12 +304,12 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 **Engines not in the executed set, with known risks:** Doris has StarRocks' backslash-literal gap; Redshift probably has Postgres' untyped-`NULL` union issue. Neither is covered by dialect rules yet.
 
-**polyglot-sql 0.13.4 bugs, all guarded:**
+**polyglot-sql 0.13.4 bugs, still guarded where needed:**
 - its `QUALIFY` emulation produces invalid SQL;
 - it passes `UNION ALL BY NAME` and `FILTER (WHERE …)` through to engines that lack them;
 - its generic generator upper-cases function names.
 
-ossiec never emits these constructs (checked for 11 engines), and it renders with function case preserved.
+ossiec never emits `QUALIFY` / `BY NAME` / `GROUP BY ALL` (checked for 11 engines). Aggregate `FILTER` is kept only for engines that run it (DuckDB, Postgres, Trino, Athena, Databricks) and rewritten to `CASE` elsewhere. Function case is preserved.
 
 ## Using ossiec in a query engine
 
@@ -324,7 +324,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 
 - [x] Ossie `0.2` loading, validation and identifier rules
 - [x] Join-root planning, inline and primary-key de-duplicated terms, `UNION ALL` stacking
-- [x] `FILTER` lowering, time grains, metric filters, vendor-dialect preference
+- [x] `FILTER` kept where supported / CASE elsewhere, time grains, metric filters, vendor-dialect preference
 - [x] CLI: `validate`, `describe`, `compile`
 - [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse, MySQL
 - [x] TPC-DS: Ossie's example model on real data, plus official queries q3, q42, q52, q55, q98

@@ -545,9 +545,10 @@ pub fn bind(model: Model) -> Result<SemanticGraph> {
     Ok(g)
 }
 
-/// Lower `agg(x) FILTER (WHERE p)` to `agg(CASE WHEN p THEN x END)`, which every engine runs.
+/// Lower `agg(x) FILTER (WHERE p)` to `agg(CASE WHEN p THEN x END)`.
 /// The expression language allows this rewrite (`expression_language.md`, FILTER section).
-fn lower_filters(e: Expression) -> Result<Expression> {
+/// Called at compile time only for targets that lack native aggregate FILTER.
+pub(crate) fn lower_filters(e: Expression) -> Result<Expression> {
     fn case_when(p: Expression, v: Expression) -> Expression {
         let mut t = Tpl::new();
         let (p, v) = (t.e(p), t.e(v));
@@ -898,7 +899,9 @@ impl SemanticGraph {
     fn resolve_metric_unchecked(&self, m: usize, ctx: &mut Ctx) -> Result<ResolvedMetric> {
         let info = &self.metrics[m];
         let bad = |why: &str| Error::InvalidModel(vec![format!("metric `{}`: {why}", info.name)]);
-        let ast = lower_filters(ctx.pick(&info.variants).ast.clone())?;
+        // Keep FILTER on the AST until compile knows the target dialect. Engines
+        // that support it get the idiomatic form; others get a CASE rewrite.
+        let ast = ctx.pick(&info.variants).ast.clone();
         let internal = |e: polyglot_sql::Error| Error::Internal(e.to_string());
 
         // Window functions run over the grouped result, after the aggregates.
