@@ -19,7 +19,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # Bundled DuckDB is built from source for the correctness tier; the first run takes a few minutes.
+      # Prebuilt DuckDB via DUCKDB_DOWNLOAD_LIB (.cargo/config.toml). rust-cache can
+      # restore libduckdb-sys fingerprints without target/duckdb-download/*.so, which
+      # then fails linking (`unable to find library -lduckdb`). Rebuild so build.rs
+      # re-downloads / re-copies the shared library before tests link.
+      - run: cargo clean -p libduckdb-sys
       - run: cargo test --all-targets
       - run: cargo test --doc
 
@@ -33,6 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.1
       - uses: Swatinem/rust-cache@v2
+      - run: cargo clean -p libduckdb-sys
       - run: scripts/engines.sh up
       - run: cargo test --test engines -- --ignored
       - run: cargo test --test tpcds -- --ignored --skip trino_sf1_performance
