@@ -723,6 +723,40 @@ pub fn comparable(req: &ossiec::Request, mut rows: Vec<Vec<String>>) -> Vec<Vec<
     rows
 }
 
+// ------------------------------------------------- Layer 2 nested (A.2 / A.3) shop forms
+
+/// Layer 2 SQL, its reference (plain DuckDB SQL) per case: `(name, layer2, reference)`.
+pub const A2_SHOP: &str = "SELECT o.status, AGG(o.order_count) \
+    FROM orders o \
+    JOIN (SELECT customer_id, AGG(order_count) AS n \
+          FROM orders GROUP BY customer_id \
+          ORDER BY n DESC, customer_id LIMIT 2) t \
+      ON o.customer_id = t.customer_id \
+    GROUP BY o.status";
+
+pub const A2_SHOP_REF: &str = "SELECT o.status, COUNT(*) FROM orders o \
+    JOIN (SELECT customer_id FROM orders GROUP BY customer_id \
+          ORDER BY COUNT(*) DESC, customer_id LIMIT 2) t \
+      ON o.customer_id = t.customer_id \
+    GROUP BY o.status";
+
+pub const A3_SHOP: &str = "SELECT d.status, AVG(m.n) \
+    FROM (SELECT status, customer_id FROM orders GROUP BY status, customer_id) d \
+    JOIN (SELECT customer_id, AGG(order_count) AS n FROM orders GROUP BY customer_id) m \
+      ON d.customer_id IS NOT DISTINCT FROM m.customer_id \
+    GROUP BY d.status";
+
+pub const A3_SHOP_REF: &str = "SELECT d.status, AVG(m.n) \
+    FROM (SELECT status, customer_id FROM orders GROUP BY status, customer_id) d \
+    JOIN (SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id) m \
+      ON d.customer_id IS NOT DISTINCT FROM m.customer_id \
+    GROUP BY d.status";
+
+pub const LAYER2_NESTED_CASES: &[(&str, &str, &str)] = &[
+    ("a2_top_two_customers", A2_SHOP, A2_SHOP_REF),
+    ("a3_avg_orders_per_customer", A3_SHOP, A3_SHOP_REF),
+];
+
 // ---------------------------------------------------------------- engines
 
 /// Run SQL through the engine's own CLI inside its container. Every client prints

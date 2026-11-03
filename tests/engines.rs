@@ -12,7 +12,9 @@ mod common;
 
 use std::sync::Mutex;
 
-use common::{comparable, compile, duckdb, duckdb_rows, run, seed_sql, Engine, CASES};
+use common::{
+    comparable, compile, duckdb, duckdb_rows, run, seed_sql, Engine, CASES, LAYER2_NESTED_CASES,
+};
 
 static SEEDED: Mutex<Vec<Engine>> = Mutex::new(Vec::new());
 
@@ -60,6 +62,70 @@ fn sweep(engine: Engine) {
         CASES.len(),
         failures.join("\n\n")
     );
+}
+
+/// Layer 2 nested shop forms (A.2 / A.3) on `engine`, against the DuckDB reference.
+fn sweep_layer2_nested(engine: Engine) {
+    seed(engine);
+    let db = duckdb();
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let opts = ossiec::Options {
+        target: Some(engine.dialect()),
+        ..Default::default()
+    };
+    let mut failures = vec![];
+    for (name, layer2, reference) in LAYER2_NESTED_CASES {
+        let compiled = ossiec::compile_layer2(&g, layer2, &opts).unwrap();
+        let mut want = duckdb_rows(&db, reference);
+        want.sort();
+        match run(engine, &compiled.sql) {
+            Ok(mut got) => {
+                got.sort();
+                if got != want {
+                    failures.push(format!(
+                        "{name}: wrong rows\n  got:  {got:?}\n  want: {want:?}\n{}",
+                        compiled.sql
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{name}: {e}\n{}", compiled.sql)),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{engine:?}:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_postgres() {
+    sweep_layer2_nested(Engine::Postgres);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_trino() {
+    sweep_layer2_nested(Engine::Trino);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_starrocks() {
+    sweep_layer2_nested(Engine::StarRocks);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_clickhouse() {
+    sweep_layer2_nested(Engine::ClickHouse);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_mysql() {
+    sweep_layer2_nested(Engine::MySql);
 }
 
 #[test]

@@ -1,0 +1,26 @@
+# Ossie-style names for Layer 2 nested queries (Appendix A.2-A.3). DuckDB seed lives in tests/layer2.rs.
+version: "0.2.0.dev0"
+name: layer2_nested
+datasets:
+  - name: sales
+    source: sales
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: id } }
+      - { name: state_id, expression: { sql: state_id } }
+      - { name: category, expression: { sql: category }, dimension: {} }
+      - { name: amount, expression: { sql: amount } }
+      - { name: qty, expression: { sql: qty } }
+    metrics:
+      - { name: total_revenue, expression: { sql: SUM(amount) } }
+      - { name: total_quantity, expression: { sql: SUM(qty) } }
+  - name: states
+    source: states
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: id } }
+      - { name: population, expression: { sql: population } }
+    metrics:
+      - { name: total_population, expression: { sql: SUM(population) } }
+relationships:
+  - { name: sales_to_states, from: sales, to: states, from_columns: [state_id], to_columns: [id] }

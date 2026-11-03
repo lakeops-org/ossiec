@@ -43,6 +43,24 @@ pub(crate) fn supports_aggregate_filter(target: Option<DialectType>) -> bool {
     )
 }
 
+/// Engines verified to run standard `a IS NOT DISTINCT FROM b`. Everyone else
+/// gets `(a = b OR (a IS NULL AND b IS NULL))`. `None` (the statement's own
+/// generic dialect, translated downstream) stays native. The list grows only
+/// from engine-tier evidence, as above.
+pub(crate) fn supports_null_safe_eq(target: Option<DialectType>) -> bool {
+    match target {
+        None => true,
+        Some(t) => matches!(
+            t,
+            DialectType::DuckDB
+                | DialectType::PostgreSQL
+                | DialectType::Trino
+                | DialectType::Athena
+                | DialectType::Databricks
+        ),
+    }
+}
+
 /// Hook 1: rewrite the dialect-neutral AST for `target`. Runs before rendering.
 pub(crate) fn adapt(
     ast: Expression,
@@ -55,6 +73,15 @@ pub(crate) fn adapt(
         DialectType::MySQL => mysql::adapt(ast, plan),
         DialectType::PostgreSQL => postgres::adapt(ast, plan),
         DialectType::StarRocks => starrocks::adapt(ast, plan),
+        _ => Ok(ast),
+    }
+}
+
+/// Hook 1 for the Layer 2 outer SQL shell (A.3), which has no [`LogicalPlan`]:
+/// only the rules that concern ordinary aggregates over derived columns.
+pub(crate) fn adapt_shell(ast: Expression, target: DialectType) -> Result<Expression> {
+    match target {
+        DialectType::MySQL => mysql::adapt_avg(ast),
         _ => Ok(ast),
     }
 }

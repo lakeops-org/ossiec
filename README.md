@@ -180,7 +180,27 @@ println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
 
 ### Layer 2 (`AGG(measure)`)
 
-Ossie Layer 2 Appendix A.1, A.4, A.5, and A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` join kinds. `layer2_to_request` returns leaf measures only. Subqueries (A.2–A.3) and `TO MEASURE` (A.7) are not implemented yet.
+Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` join kinds; **A.2** derived tables joined into an `AGG` stage; **A.3** `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables (with `IS NOT DISTINCT FROM` join keys). Consumer aliases (`AS n`) name the output columns. `layer2_to_request` returns leaf measures of flat queries only; nested SQL is `compile_layer2` / `compile-l2` only. `TO MEASURE` (A.7) and passing an unevaluated measure through a derived table (§7.7) are not implemented yet.
+
+```sql
+-- A.2: restrict an AGG stage to the top two customers
+SELECT o.status, AGG(o.order_count)
+FROM orders o
+JOIN (SELECT customer_id, AGG(order_count) AS n
+      FROM orders GROUP BY customer_id
+      ORDER BY n DESC, customer_id LIMIT 2) t
+  ON o.customer_id = t.customer_id
+GROUP BY o.status;
+
+-- A.3: ordinary aggregates over derived tables
+SELECT d.status, AVG(m.n)
+FROM (SELECT status, customer_id FROM orders GROUP BY status, customer_id) d
+JOIN (SELECT customer_id, AGG(order_count) AS n FROM orders GROUP BY customer_id) m
+  ON d.customer_id IS NOT DISTINCT FROM m.customer_id
+GROUP BY d.status;
+```
+
+A derived table joined into an `AGG` stage must be unique on its join columns (G2), is read only in `ON`, and needs an alias on every `AGG(...)`. Nesting is limited to 4 levels and 8 derived tables per query.
 
 ```bash
 echo "SELECT status, AGG(order_count) FROM orders GROUP BY status" \
@@ -296,7 +316,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`). |
+| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`). The shop forms of A.2/A.3 also run in the engine tier (`layer2_nested_*`). |
 
 ## Known issues
 
@@ -350,7 +370,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Role-playing dimensions (`relationship.field`, shortest path by default)
 - [x] Unmatched one-side rows (`includeUnmatched`)
 - [x] NULL placement in `orderBy`
-- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1, A.4 ratios, A.5 consumer joins + fan-out, A.6; A.2–A.3/A.7 later)
+- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; A.7 and §7.7 pass-through later)
 - [ ] Publish to crates.io
 
 ## Contributing

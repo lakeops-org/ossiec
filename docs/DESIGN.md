@@ -9,7 +9,7 @@ Ossie's core spec (`0.2.0.dev0`) defines a **model**: datasets, fields, relation
 | Layer | What | ossiec |
 |---|---|---|
 | 1 | Model and expression language | Read in full |
-| 2 | SQL with `AGG(measure)` (draft, `relational_semantics.md`) | Appendix A.1; A.4 (multi-fact measures sharing dimensions and `AGG` arithmetic in the select list); A.5 (consumer joins, including unused many→one and reverse fan-out with G2 via `PkDedup`); A.6 (`INNER`/`LEFT`). A.2–A.3 and A.7 not yet. `compile_layer2` / `compile-l2`; `layer2_to_request` exposes leaf measures only. |
+| 2 | SQL with `AGG(measure)` (draft, `relational_semantics.md`) | Appendix A.1; A.4 (multi-fact measures sharing dimensions and `AGG` arithmetic in the select list); A.5 (consumer joins, including unused many→one and reverse fan-out with G2 via `PkDedup`); A.6 (`INNER`/`LEFT`). A.2 (derived table joined into an `AGG` stage) and A.3 (outer `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables), as one recursive compile. A.7 and §7.7 unevaluated-measure pass-through not yet. `compile_layer2` / `compile-l2`; `layer2_to_request` exposes leaf measures of flat queries only (nested SQL is `Unsupported` there). |
 | 3 | Wide table: metrics + dimensions + filters in, joins resolved (draft PR #246) | **This is ossiec's request format** |
 
 The planner follows the same guarantee Layer 2 states (spec §8.3, "G2"): **a measure is aggregated over its own source rows, never over rows a join duplicated.**
@@ -95,6 +95,19 @@ FROM (part) AS base
 - SQL evaluates windows after `WHERE` and `HAVING`. So when any output has a window, metric filters move to a wrapper, `SELECT * FROM (…) AS windowed WHERE "rank" <= 3`. That gives "top 3 of the full ranking" rather than "rank among the rows that survived a filter".
 - Windows see only the groups in the result. Dimension filters shape the window input, as in plain SQL.
 
+## Layer 2 nested queries (A.2–A.3)
+
+Consumer SQL with derived tables compiles by **recursion in Layer 2** ([`src/layer2/nested.rs`](../src/layer2/nested.rs)); there is no nested `Request` or `LogicalPlan`. Every `AGG` stage is the flat pipeline (request → `plan` → `lower` → FILTER lowering → dialect `adapt`) run with its own plan. This matters because `adapt` reads the plan (Postgres `string_dims`, MySQL `string_exprs`): adapting once over an assembled tree would have no single plan, and adapting an already-adapted inner AST again would apply the rules twice.
+
+1. **Placeholder relations.** A derived table in an `AGG` stage becomes a `DerivedJoin` on the planner's `Leg` (`from_alias`, `(dataset, field)` pairs, `rel_placeholder`, `rel_alias`, `rel_cols`, `null_safe`, `kind`). `lower`'s `tree_sql` emits `JOIN __ossiec_derivN AS "t" ON ...` after the relationship joins, from field indexes and column names (never prebuilt ASTs, because `tree_sql` renames aliases per part). Base, stacked and `PkDedup` parts all build their `FROM` there, so the restriction reaches every part. A post-lower rewrite of "the" `FROM` would be unsound: `lower` repeats the leg tree inside `DISTINCT` sub-selects.
+2. **Adapt per stage, substitute, finish once.** Each stage is adapted with its own plan, then placeholders are replaced bottom-up with the inner (already adapted) ASTs; the whole is rendered once and the text-level `finish` (ClickHouse `SETTINGS join_use_nulls`) runs once, on the outermost statement. One `Ctx` is threaded through the tree: one source-dialect decision, merged warnings.
+3. **Output names.** Layer 2 honors consumer aliases (`AS n`) in the compiled column names, ordering, and `string_dims`; un-aliased top-level queries keep `dataset.field` / metric names, so the parity tests are unchanged. In a derived table, dimensions default to their bare field name and every `AGG(...)` needs an alias.
+4. **G2 for derived tables.** In a stage that evaluates `AGG()`, a derived table must be **unique on its join columns** (`Node::unique_key` ⊆ join columns): a dimension-grouped stage is unique on its dimensions, an aggregate with no dimensions has one row. Otherwise the join would repeat measure input rows and the compile is refused with a G2 message. (A "join keys equal the inner `GROUP BY`" rule would wrongly refuse A.3's `d`, grouped by `category, state_id` and joined on `state_id` only; the outer shell evaluates no `AGG()`, so no uniqueness rule applies there.) `INNER` derived joins filter before `AGG` (G1); `LEFT` does not.
+5. **A.3 outer shell** ([`src/layer2/shell.rs`](../src/layer2/shell.rs)). Every `FROM` item is a derived table; the select list is derived columns and `AVG|SUM|COUNT|MIN|MAX` over one derived column (or `COUNT(*)`), `WHERE`/`HAVING` against literals, `GROUP BY` the plain columns. It is assembled with `Tpl` outside `plan`/`lower`. `AGG()` there is an error: the column is already a scalar. Join keys may use `IS NOT DISTINCT FROM`, emitted natively for DuckDB, Postgres, Trino, Athena, Databricks (and for `target: None`, whose generic SQL is translated downstream) and as `(a = b OR (a IS NULL AND b IS NULL))` everywhere else (`dialect::supports_null_safe_eq`; the list grows from engine evidence only). Derived-table keys in an A.2 `AGG` stage use the expanded form always, since that stage is lowered before the target is consulted.
+6. **Limits.** Nesting depth ≤ 4, derived tables per query ≤ 8, with structured `Unsupported` messages for: unevaluated measure (§7.7), derived column outside `ON`, correlated references, `WITH`/`DISTINCT`/set operators in a derived table, derived join over several legs.
+
+**Why not `ChildAggregate`.** duckdb-semantic_layer expands to plain SQL at bind time, which ossiec shares, but its nested LOD is model-side `AVG(SUM(...))` through correlated scalar subqueries, and its query-by-name rewrite bails out on non-base `FROM`, so it does not implement Appendix A consumer shapes. A.2–A.3 are consumer SQL whose derived tables already evaluated `AGG`; the outer `AVG` in A.3 is ordinary SQL over scalars.
+
 ## SQL construction
 
 Query skeletons are SQL templates containing only keywords, generated aliases (`d0`, `t0`, `base`) and placeholders (`__ossiec_0`). Each template is parsed by polyglot, and the placeholders are replaced with AST nodes. Model and request content never becomes SQL text: field expressions are parsed ASTs, table names become `TableRef` nodes, filter values become literal nodes, and output names become quoted identifiers.
@@ -115,7 +128,7 @@ ossiec keeps one shared generator and a thin per-dialect layer, [`src/dialect/`]
 | BigQuery: `DATE_TRUNC` week → `ISOWEEK` | Ossie's week starts on Monday; BigQuery's `WEEK` starts on Sunday. BigQuery isn't executed, so this is checked by golden SQL only |
 | Postgres, ClickHouse, StarRocks, MySQL: backslashes in `LIKE` patterns doubled (shared helper in `dialect/mod.rs`) | `like_with_a_backslash`: these engines escape with `\` by default; SQL without `ESCAPE` (Trino, DuckDB) treats it as an ordinary character |
 | MySQL: string dimensions and filters `COLLATE utf8mb4_bin` | `string_ordering` (case-insensitive grouping merged `Ada` and `ada`) and `case_sensitive_filter` (`'ada'` matched `Ada`) |
-| MySQL: `AVG` argument cast to `DOUBLE` | `averages_of_integers_and_one_side_values`: `AVG` of integers rounds to 4 decimals |
+| MySQL: `AVG` argument cast to `DOUBLE` (also for the A.3 outer shell, `adapt_shell`) | `averages_of_integers_and_one_side_values`: `AVG` of integers rounds to 4 decimals |
 
 Engine-neutral rules that came out of the same tests live in binding and planning instead:
 - **Groups never depend on which measures are asked for** (spec §8.4, closure). With dimensions, the base part always runs, even when it computes no terms, so groups come from every joined row. Evidence: `one_side_measure_dedup`, which used to drop a region whose orders had no product.
@@ -148,4 +161,6 @@ Rules apply only when a target is given. Callers that translate downstream set n
 
 | Feature | Shape it will take |
 |---|---|
-| Layer 2 subqueries (A.2–A.3) and `TO MEASURE` (A.7) | Nested compile (derived tables + non-relationship joins; A.3 also needs outer SQL aggregates). Kept as explicit `Unsupported` until then. |
+| Layer 2 `TO MEASURE` (A.7) and unevaluated-measure pass-through (§7.7: `SELECT region, total_revenue FROM v`, then an outer `AGG`) | Needs measure-typed columns to flow through derived tables. Explicit `Unsupported` (`unevaluated measure`) until then. |
+| A.2 derived joins over several facts (A.4 legs), role-played or unmatched-row plans | A `DerivedJoin` restricts one join tree; several legs or `includeUnmatched` are refused. |
+| Model-side nested aggregates (`AVG(SUM(x))`) | Not Layer 2; see "Why not `ChildAggregate`" under Layer 2 nested queries. |

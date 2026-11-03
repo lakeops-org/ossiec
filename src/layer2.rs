@@ -5,9 +5,14 @@
 //! select list), and **A.5–A.6** (consumer joins along model relationships,
 //! including unused many→one and reverse fan-out, with `INNER` vs `LEFT`) translate
 //! to the existing [`Request`] planner. [`to_request`] / [`layer2_to_request`] expose
-//! only **leaf** measures referenced inside `AGG(...)`, not composed output names.
-//! Subqueries and other join forms (A.2–A.3, A.7, `RIGHT`/`FULL`/`CROSS`/`ASOF`,
-//! …) stay [`Error::Unsupported`].
+//! only **leaf** measures referenced inside `AGG(...)`, not composed output names,
+//! and only for flat queries.
+//!
+//! **A.2–A.3** (derived tables) compile recursively in [`nested`]: every `AGG`
+//! stage is an ordinary [`Request`] → plan → lower pass, derived tables join in
+//! through the planner's `DerivedJoin`, and an outer SQL aggregate over derived
+//! tables (A.3) is a thin shell outside plan/lower. Other join forms (A.7,
+//! `RIGHT`/`FULL`/`CROSS`/`ASOF`, …) stay [`Error::Unsupported`].
 //!
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
@@ -16,7 +21,7 @@ use std::collections::HashMap;
 
 use polyglot_sql::builder::{func, lit, Expr};
 use polyglot_sql::expressions::{
-    BinaryOp, Column, Join, JoinKind as SqlJoinKind, Literal, TableRef,
+    BinaryOp, Column, Join, JoinKind as SqlJoinKind, Literal, Select, TableRef,
 };
 use polyglot_sql::{parse_one, DialectType, Expression};
 
@@ -24,24 +29,24 @@ use crate::graph::{self, SemanticGraph};
 use crate::plan::{
     self, Direction, Filter, JoinKind, JoinStep, LogicalPlan, Nulls, Op, OrderBy, Request, Strategy,
 };
-use crate::{finish_compile, Compiled, Error, Options, Result};
+use crate::{Compiled, Error, Options, Result};
+
+mod nested;
+mod shell;
 
 /// Compile a Layer 2 SQL query (`AGG(measure)` over model relations) to SQL.
+/// Derived tables (Appendix A.2–A.3) compile recursively; see [`nested`].
 pub fn compile_layer2(graph: &SemanticGraph, sql: &str, opts: &Options) -> Result<Compiled> {
-    let parsed = parse_layer2(graph, sql)?;
-    let mut ctx = crate::graph::Ctx {
-        prefer: opts.prefer_dialect.clone(),
-        ..Default::default()
-    };
-    let mut logical = plan::plan(graph, &parsed.request, &mut ctx)?;
-    apply_consumer_joins(graph, &mut logical, &parsed.consumer_joins, &mut ctx)?;
-    apply_select_formulas(graph, &mut logical, &parsed.measure_outputs)?;
-    remap_layer2_order(&mut logical, &parsed.measure_outputs);
-    finish_compile(graph, &parsed.request, logical, ctx, opts)
+    nested::compile(graph, sql, opts)
 }
 
-/// After output names change (aliases, composed metrics), align `ORDER BY` with select labels.
-fn remap_layer2_order(logical: &mut LogicalPlan, measure_outputs: &[(String, L2Formula)]) {
+/// After output names change (aliases, composed metrics, dimension labels),
+/// align `ORDER BY`, dimensions and `string_dims` with the consumer's select labels.
+fn rename_consumer_outputs(
+    logical: &mut LogicalPlan,
+    measure_outputs: &[(String, L2Formula)],
+    dim_labels: &[(String, String)],
+) {
     let mut rename: HashMap<String, String> = HashMap::new();
     for (out, formula) in measure_outputs {
         if let L2Formula::Agg(m) = formula {
@@ -50,30 +55,73 @@ fn remap_layer2_order(logical: &mut LogicalPlan, measure_outputs: &[(String, L2F
             }
         }
     }
-    if rename.is_empty() {
-        return;
+    let mut dim_rename: HashMap<String, String> = HashMap::new();
+    for (dim, label) in dim_labels {
+        if dim != label {
+            dim_rename.insert(dim.clone(), label.clone());
+        }
+    }
+    for (name, _) in &mut logical.dims {
+        if let Some(label) = dim_rename.get(name) {
+            *name = label.clone();
+        }
+    }
+    for name in &mut logical.string_dims {
+        if let Some(label) = dim_rename.get(name) {
+            *name = label.clone();
+        }
     }
     for (name, _, _) in &mut logical.order {
-        if let Some(alias) = rename.get(name) {
+        if let Some(alias) = rename.get(name).or_else(|| dim_rename.get(name)) {
             *name = alias.clone();
         }
     }
 }
 
-/// Translate Layer 2 SQL into a Layer 3 [`Request`] (join kinds are not represented).
+/// Translate Layer 2 SQL into a Layer 3 [`Request`] (join kinds are not
+/// represented). Flat queries only: derived tables (A.2–A.3) are not one request.
 pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
     Ok(parse_layer2(graph, sql)?.request)
 }
 
-struct Layer2Parsed {
-    request: Request,
+pub(super) struct Layer2Parsed {
+    pub request: Request,
     /// Join kinds from the consumer `FROM` / `JOIN` list (Appendix A.5–A.6).
-    consumer_joins: Vec<ConsumerJoin>,
+    pub consumer_joins: Vec<ConsumerJoin>,
     /// Composed select-list measures: (output column name, formula tree).
-    measure_outputs: Vec<(String, L2Formula)>,
+    pub measure_outputs: Vec<(String, L2Formula)>,
+    /// Selected dimension (`dataset.field`) and the label the consumer sees it under.
+    pub dim_labels: Vec<(String, String)>,
+    /// Derived tables joined to the stage (Appendix A.2).
+    pub derived: Vec<DerivedSpec>,
+    /// Aliases this stage's `FROM` introduces (what a nested query must not reference).
+    pub scope_aliases: Vec<String>,
 }
 
-struct ConsumerJoin {
+/// How a stage's select list is read.
+pub(super) struct StageCfg<'a> {
+    /// A derived table's columns are addressed by name from outside: dimensions
+    /// default to their bare field name and every `AGG(...)` needs an alias.
+    pub derived: bool,
+    /// Aliases of enclosing queries (to name correlated references).
+    pub outer: &'a [String],
+}
+
+/// A derived table joined to an `AGG` stage: `JOIN (<select>) alias ON ...`.
+pub(super) struct DerivedSpec {
+    pub alias: String,
+    pub select: Select,
+    pub kind: JoinKind,
+    /// Dataset the derived table attaches to (the dataset side of ON).
+    pub attach_ds: usize,
+    /// `(dataset, field)` per ON equality, attach side.
+    pub from_fields: Vec<(usize, usize)>,
+    /// Derived-table column per ON equality.
+    pub cols: Vec<String>,
+    pub null_safe: bool,
+}
+
+pub(super) struct ConsumerJoin {
     rel: usize,
     kind: JoinKind,
     reverse: bool,
@@ -85,7 +133,7 @@ struct ConsumerJoin {
 
 /// Select-list expression whose leaves are bare `AGG(measure)` references.
 #[derive(Clone)]
-enum L2Formula {
+pub(super) enum L2Formula {
     Agg(String),
     Add(Box<L2Formula>, Box<L2Formula>),
     Sub(Box<L2Formula>, Box<L2Formula>),
@@ -104,28 +152,67 @@ struct TableBinding {
 
 struct QueryScope {
     bindings: Vec<TableBinding>,
+    /// Aliases of derived tables in this stage's `FROM` (usable only in their ON).
+    derived: Vec<String>,
+    /// Aliases of enclosing queries: a reference to one is correlated.
+    outer: Vec<String>,
+}
+
+/// Parse the consumer's single top-level `SELECT`.
+pub(super) fn parse_top_select(sql: &str) -> Result<Select> {
+    let ast = parse_one(sql.trim(), DialectType::Generic)
+        .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
+    match ast {
+        Expression::Select(sel) => Ok(*sel),
+        _ => Err(unsupported(
+            "Layer 2 accepts a single SELECT (set operators are not supported)",
+        )),
+    }
 }
 
 fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
-    let ast = parse_one(sql.trim(), DialectType::Generic)
-        .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
-    let Expression::Select(sel) = ast else {
+    let sel = parse_top_select(sql)?;
+    let parsed = parse_stage(
+        graph,
+        &sel,
+        &StageCfg {
+            derived: false,
+            outer: &[],
+        },
+    )?;
+    if !parsed.derived.is_empty() {
         return Err(unsupported(
-            "Layer 2 currently accepts a single SELECT (Appendix A.1); joins and set ops come later",
+            "Layer 2 derived tables (Appendix A.2–A.3) are not one Layer 3 request; use compile_layer2",
         ));
-    };
+    }
+    Ok(parsed)
+}
+
+/// One `AGG` stage: select list, `FROM`/`JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`.
+pub(super) fn parse_stage(
+    graph: &SemanticGraph,
+    sel: &Select,
+    cfg: &StageCfg<'_>,
+) -> Result<Layer2Parsed> {
     if sel.with.is_some() || sel.distinct || sel.having.is_some() || sel.qualify.is_some() {
         return Err(unsupported(
             "Layer 2 WITH / DISTINCT / HAVING / QUALIFY are not implemented yet",
         ));
     }
 
-    let parsed_from = parse_from_clause(graph, sel.from.as_ref(), &sel.joins)?;
+    let parsed_from = parse_from_clause(graph, sel.from.as_ref(), &sel.joins, cfg.outer)?;
     let scope = &parsed_from.scope;
+    let scope_aliases: Vec<String> = scope
+        .bindings
+        .iter()
+        .flat_map(|b| [b.alias.clone(), graph.datasets[b.dataset].name.clone()])
+        .chain(scope.derived.iter().cloned())
+        .collect();
 
     let mut metrics: Vec<String> = Vec::new();
     let mut dimensions = Vec::new();
     let mut measure_outputs = Vec::new();
+    let mut dim_labels: Vec<(String, String)> = Vec::new();
     // Select-list label (alias or default) → order-by / output resolution name.
     let mut outputs: Vec<(String, String)> = Vec::new();
 
@@ -136,6 +223,11 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
                 if !metrics.contains(&leaf) {
                     metrics.push(leaf.clone());
                 }
+            }
+            if cfg.derived && alias.is_none() {
+                return Err(unsupported(
+                    "Layer 2 derived table: every AGG(...) item needs an explicit alias so the outer query can name it (e.g. AGG(order_count) AS n)",
+                ));
             }
             let out_name = alias
                 .clone()
@@ -153,8 +245,27 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
                 "Layer 2 select list may only contain AGG(measure) expressions, dimension columns, and + - * / arithmetic on AGG(...)",
             )
         })?;
-        let dim = resolve_dim(graph, scope, col)?;
-        let label = alias.unwrap_or_else(|| dim.clone());
+        let dim = match resolve_dim(graph, scope, col) {
+            Ok(d) => d,
+            Err(e) => return Err(unevaluated_measure(graph, scope, col).unwrap_or(e)),
+        };
+        // A derived table is read by column name: dimensions default to the bare
+        // field name (`customer_id`), not `orders.customer_id`.
+        let default_label = if cfg.derived {
+            bare_field(&dim).to_string()
+        } else {
+            dim.clone()
+        };
+        let label = alias.unwrap_or(default_label);
+        match dim_labels.iter().find(|(d, _)| d == &dim) {
+            Some((_, first)) if first != &label => {
+                return Err(unsupported(format!(
+                    "Layer 2 selects `{dim}` twice under different names (`{first}`, `{label}`); select it once"
+                )));
+            }
+            Some(_) => {}
+            None => dim_labels.push((dim.clone(), label.clone())),
+        }
         if !dimensions.iter().any(|d| d == &dim) {
             dimensions.push(dim.clone());
         }
@@ -167,42 +278,37 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
         ));
     }
 
-    if !metrics.is_empty() {
-        match &sel.group_by {
-            None if dimensions.is_empty() => {}
-            None => {
-                return Err(Error::Request(
-                    "Layer 2 aggregated query with dimensions needs GROUP BY".into(),
-                ));
+    // `GROUP BY` must name exactly the selected dimensions. With `AGG` it is
+    // required whenever dimensions are selected; without `AGG` it is optional
+    // (a dimension listing is one row per combination anyway: Appendix A.3's `d`).
+    match &sel.group_by {
+        None if !metrics.is_empty() && !dimensions.is_empty() => {
+            return Err(Error::Request(
+                "Layer 2 aggregated query with dimensions needs GROUP BY".into(),
+            ));
+        }
+        None => {}
+        Some(gb) => {
+            if gb.all.is_some() {
+                return Err(unsupported("GROUP BY ALL is not supported in Layer 2"));
             }
-            Some(gb) => {
-                if gb.all.is_some() {
-                    return Err(unsupported("GROUP BY ALL is not supported in Layer 2"));
-                }
-                let mut gb_dims = Vec::new();
-                for e in &gb.expressions {
-                    let col = as_column(e).ok_or_else(|| {
-                        unsupported("Layer 2 GROUP BY must name dimension columns")
-                    })?;
-                    gb_dims.push(resolve_dim(graph, scope, col)?);
-                }
-                let mut want = dimensions.clone();
-                want.sort();
-                gb_dims.sort();
-                if gb_dims != want {
-                    return Err(Error::Request(format!(
-                        "Layer 2 GROUP BY must match the selected dimensions (got [{}], selected [{}])",
-                        gb_dims.join(", "),
-                        dimensions.join(", ")
-                    )));
-                }
+            let mut gb_dims = Vec::new();
+            for e in &gb.expressions {
+                let col = as_column(e)
+                    .ok_or_else(|| unsupported("Layer 2 GROUP BY must name dimension columns"))?;
+                gb_dims.push(resolve_dim(graph, scope, col)?);
+            }
+            let mut want = dimensions.clone();
+            want.sort();
+            gb_dims.sort();
+            if gb_dims != want {
+                return Err(Error::Request(format!(
+                    "Layer 2 GROUP BY must match the selected dimensions (got [{}], selected [{}])",
+                    gb_dims.join(", "),
+                    dimensions.join(", ")
+                )));
             }
         }
-    } else if sel.group_by.is_some() {
-        return Err(Error::Request(
-            "Layer 2 GROUP BY without AGG(measure) is not used; omit GROUP BY for dimension listing"
-                .into(),
-        ));
     }
 
     let filters = match &sel.where_clause {
@@ -261,7 +367,37 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
         },
         consumer_joins: parsed_from.consumer_joins,
         measure_outputs,
+        dim_labels,
+        derived: parsed_from.derived,
+        scope_aliases,
     })
+}
+
+/// `dataset.field` → `field`.
+fn bare_field(dim: &str) -> &str {
+    dim.split_once('.').map_or(dim, |(_, f)| f)
+}
+
+/// A bare column that names a measure, not a field: the unevaluated-measure
+/// pass-through of spec §7.7, which Layer 2 does not implement.
+fn unevaluated_measure(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Option<Error> {
+    let name = &col.name.name;
+    let hit = scope.bindings.iter().find(|b| {
+        let ds = &graph.datasets[b.dataset].name;
+        let qualified_ok = col.table.as_ref().is_none_or(|t| {
+            t.name.eq_ignore_ascii_case(&b.alias) || t.name.eq_ignore_ascii_case(ds)
+        });
+        qualified_ok
+            && graph.metrics.iter().any(|m| {
+                m.owner == Some(b.dataset)
+                    && (m.name.eq_ignore_ascii_case(name)
+                        || m.name.eq_ignore_ascii_case(&format!("{ds}.{name}")))
+            })
+    })?;
+    Some(unsupported(format!(
+        "Layer 2 unevaluated measure `{name}` on `{}`: passing a measure through a select list for a later AGG() (relational_semantics §7.7) is not supported; evaluate it with AGG({name}) AS <alias>",
+        graph.datasets[hit.dataset].name
+    )))
 }
 
 fn apply_consumer_joins(
@@ -560,18 +696,63 @@ fn unsupported(msg: impl Into<String>) -> Error {
 struct ParsedFrom {
     scope: QueryScope,
     consumer_joins: Vec<ConsumerJoin>,
+    derived: Vec<DerivedSpec>,
+}
+
+/// `(SELECT ...) alias` as a `FROM` / `JOIN` item: the inner `SELECT` and its alias.
+pub(super) fn as_derived(e: &Expression) -> Result<Option<(&Select, String)>> {
+    let (sub, outer_alias) = match e {
+        Expression::Subquery(s) => (s.as_ref(), None),
+        Expression::Alias(a) => match &a.this {
+            Expression::Subquery(s) => (s.as_ref(), Some(a.alias.name.clone())),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let alias = sub
+        .alias
+        .as_ref()
+        .map(|a| a.name.clone())
+        .or(outer_alias)
+        .ok_or_else(|| Error::Request("Layer 2 derived table needs an alias".into()))?;
+    if sub.lateral {
+        return Err(unsupported(
+            "Layer 2 correlated (LATERAL) derived tables are not supported",
+        ));
+    }
+    if !sub.column_aliases.is_empty()
+        || sub.order_by.is_some()
+        || sub.limit.is_some()
+        || sub.offset.is_some()
+    {
+        return Err(unsupported(
+            "Layer 2 derived table: name output columns with AS in its select list, and put ORDER BY / LIMIT inside the subquery's SELECT",
+        ));
+    }
+    match &sub.this {
+        Expression::Select(s) => Ok(Some((s.as_ref(), alias))),
+        _ => Err(unsupported(
+            "Layer 2 derived table must be a plain SELECT (set operators and nested parentheses are not supported)",
+        )),
+    }
 }
 
 fn parse_from_clause(
     graph: &SemanticGraph,
     from: Option<&polyglot_sql::expressions::From>,
     joins: &[Join],
+    outer: &[String],
 ) -> Result<ParsedFrom> {
     let from = from.ok_or_else(|| Error::Request("Layer 2 query needs a FROM clause".into()))?;
     if from.expressions.is_empty() {
         return Err(Error::Request("Layer 2 query needs a FROM clause".into()));
     }
-    let mut scope = QueryScope { bindings: vec![] };
+    let mut scope = QueryScope {
+        bindings: vec![],
+        derived: vec![],
+        outer: outer.to_vec(),
+    };
+    let mut derived_specs: Vec<DerivedSpec> = Vec::new();
     for e in &from.expressions {
         let (dataset, alias) = table_expr(graph, e)?;
         let alias = alias.unwrap_or_else(|| graph.datasets[dataset].name.clone());
@@ -588,6 +769,12 @@ fn parse_from_clause(
     }
     let mut consumer_joins = Vec::new();
     for j in joins {
+        if let Some((select, alias)) = as_derived(&j.this)? {
+            let spec = parse_derived_join(graph, &scope, j, select, alias)?;
+            scope.derived.push(spec.alias.clone());
+            derived_specs.push(spec);
+            continue;
+        }
         let kind = consumer_join_kind(j)?;
         let on = j.on.as_ref().ok_or_else(|| {
             unsupported("Layer 2 JOIN requires an ON condition matching a model relationship")
@@ -608,6 +795,8 @@ fn parse_from_clause(
                 .chain(std::iter::once(&right_binding))
                 .cloned()
                 .collect(),
+            derived: scope.derived.clone(),
+            outer: scope.outer.clone(),
         };
         let rel = match_relationship(graph, &join_scope, &pairs)?;
         if consumer_joins.iter().any(|c: &ConsumerJoin| c.rel == rel) {
@@ -657,7 +846,104 @@ fn parse_from_clause(
     Ok(ParsedFrom {
         scope,
         consumer_joins,
+        derived: derived_specs,
     })
+}
+
+/// `JOIN (SELECT ...) t ON dataset.col = t.col AND ...` in an `AGG` stage.
+fn parse_derived_join(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    j: &Join,
+    select: &Select,
+    alias: String,
+) -> Result<DerivedSpec> {
+    let kind = consumer_join_kind(j)?;
+    if !j.using.is_empty() {
+        return Err(unsupported("Layer 2 JOIN USING is not supported; use ON"));
+    }
+    let on = j.on.as_ref().ok_or_else(|| {
+        unsupported("Layer 2 derived-table JOIN requires an ON of dataset-column = derived-column")
+    })?;
+    let taken = scope
+        .bindings
+        .iter()
+        .map(|b| &b.alias)
+        .chain(&scope.derived)
+        .any(|a| a.eq_ignore_ascii_case(&alias));
+    if taken {
+        return Err(Error::Request(format!(
+            "Layer 2 derived table alias `{alias}` collides with another relation in FROM/JOIN"
+        )));
+    }
+    let on_err = || {
+        unsupported(format!(
+            "Layer 2 derived-table JOIN ON must be AND of `<dataset column> = {alias}.<column>` (or IS NOT DISTINCT FROM)"
+        ))
+    };
+    let is_derived_col = |c: &Column| {
+        c.table
+            .as_ref()
+            .is_some_and(|t| t.name.eq_ignore_ascii_case(&alias))
+    };
+    let mut attach_ds: Option<usize> = None;
+    let mut from_fields = vec![];
+    let mut cols = vec![];
+    let mut null_safe: Option<bool> = None;
+    for (l, r, ns) in on_pairs_null_safe(on)? {
+        let (dcol, col) = match (is_derived_col(&l), is_derived_col(&r)) {
+            (true, false) => (l, r),
+            (false, true) => (r, l),
+            _ => return Err(on_err()),
+        };
+        let (ds, field) = resolve_field_ref(graph, scope, &col)?;
+        if *attach_ds.get_or_insert(ds) != ds {
+            return Err(unsupported(
+                "Layer 2 derived-table JOIN ON must attach to one dataset",
+            ));
+        }
+        if *null_safe.get_or_insert(ns) != ns {
+            return Err(unsupported(
+                "Layer 2 derived-table JOIN ON cannot mix = and IS NOT DISTINCT FROM",
+            ));
+        }
+        let f = graph.datasets[ds]
+            .fields
+            .iter()
+            .position(|f| f.name == field)
+            .expect("resolved field exists");
+        from_fields.push((ds, f));
+        cols.push(dcol.name.name.clone());
+    }
+    let attach_ds = attach_ds.ok_or_else(on_err)?;
+    Ok(DerivedSpec {
+        alias,
+        select: select.clone(),
+        kind,
+        attach_ds,
+        from_fields,
+        cols,
+        null_safe: null_safe.unwrap_or(false),
+    })
+}
+
+/// ON equalities, each flagged null-safe (`IS NOT DISTINCT FROM`) or plain `=`.
+fn on_pairs_null_safe(on: &Expression) -> Result<Vec<(Column, Column, bool)>> {
+    let pair = |l: &Expression, r: &Expression, ns: bool| -> Result<Vec<(Column, Column, bool)>> {
+        let l = as_column(l).ok_or_else(on_must_be_equalities)?;
+        let r = as_column(r).ok_or_else(on_must_be_equalities)?;
+        Ok(vec![(l.to_owned(), r.to_owned(), ns)])
+    };
+    match on {
+        Expression::Eq(b) => pair(&b.left, &b.right, false),
+        Expression::NullSafeEq(b) => pair(&b.left, &b.right, true),
+        Expression::And(a) => {
+            let mut out = on_pairs_null_safe(&a.left)?;
+            out.extend(on_pairs_null_safe(&a.right)?);
+            Ok(out)
+        }
+        _ => Err(on_must_be_equalities()),
+    }
 }
 
 fn consumer_join_kind(j: &Join) -> Result<JoinKind> {
@@ -816,6 +1102,22 @@ fn resolve_column_dataset(
                 return Ok(b.dataset);
             }
         }
+        if scope
+            .derived
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(&t.name))
+        {
+            return Err(unsupported(format!(
+                "Layer 2 derived-table column `{}.{}` may only appear in that table's JOIN ... ON (not in SELECT, WHERE, GROUP BY or ORDER BY of an AGG stage)",
+                t.name, col.name.name
+            )));
+        }
+        if scope.outer.iter().any(|a| a.eq_ignore_ascii_case(&t.name)) {
+            return Err(unsupported(format!(
+                "Layer 2 correlated subquery: `{}.{}` refers to an enclosing query; derived tables must be self-contained",
+                t.name, col.name.name
+            )));
+        }
         return Err(Error::Request(format!(
             "column `{}.{}` does not refer to a relation in FROM/JOIN",
             t.name, col.name.name
@@ -851,9 +1153,13 @@ fn table_expr(graph: &SemanticGraph, e: &Expression) -> Result<(usize, Option<St
             let (ds, _) = table_expr(graph, &a.this)?;
             Ok((ds, Some(a.alias.name.clone())))
         }
+        Expression::Subquery(_) => Err(unsupported(
+            "Layer 2 AGG stage must start FROM a model dataset; join derived tables (Appendix A.2) \
+             with JOIN (SELECT ...) t ON <dataset column> = t.<column>. A query over derived \
+             tables only (A.3) is compiled by compile_layer2, not layer2_to_request",
+        )),
         _ => Err(unsupported(
-            "Layer 2 FROM must be a model dataset (table or alias); \
-             derived tables / subqueries (Appendix A.2–A.3) are not supported yet",
+            "Layer 2 FROM must be a model dataset (table or alias) or a derived table",
         )),
     }
 }

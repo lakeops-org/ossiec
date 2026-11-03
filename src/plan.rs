@@ -199,6 +199,32 @@ pub(crate) struct JoinStep {
 pub(crate) struct Leg {
     pub root: usize,
     pub joins: Vec<JoinStep>,
+    /// Derived tables the consumer joined in (Layer 2 A.2), after `joins`.
+    pub derived: Vec<DerivedJoin>,
+}
+
+/// A derived table (an already-compiled inner query) joined onto a leg:
+/// `<kind> JOIN <rel_placeholder> AS rel_alias ON <from_fields> = <rel_cols>`.
+///
+/// Stored as field indexes and column names, never as prebuilt ASTs, because
+/// `tree_sql` renames aliases per part (base, stacked, `PkDedup`, unmatched).
+/// `rel_placeholder` is a table name that Layer 2 replaces by the compiled
+/// inner query once every stage has been lowered and dialect-adapted.
+#[derive(Debug, Clone)]
+pub(crate) struct DerivedJoin {
+    /// Alias (on the leg) of the dataset the derived table attaches to.
+    pub from_alias: String,
+    /// `(dataset, field)` of each attach-side join column.
+    pub from_fields: Vec<(usize, usize)>,
+    /// Placeholder table name, e.g. `__ossiec_deriv0`.
+    pub rel_placeholder: String,
+    /// Alias the derived table takes in this query.
+    pub rel_alias: String,
+    /// Output column names on the derived table, one per `from_fields` entry.
+    pub rel_cols: Vec<String>,
+    /// `IS NOT DISTINCT FROM` instead of `=` (NULL keys match).
+    pub null_safe: bool,
+    pub kind: JoinKind,
 }
 
 /// Everything `lower` needs; no SQL decisions are left.
@@ -798,6 +824,7 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
     Ok(Leg {
         root,
         joins: steps.into_iter().map(|(_, s)| s).collect(),
+        derived: vec![],
     })
 }
 

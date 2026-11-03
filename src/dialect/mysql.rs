@@ -21,6 +21,20 @@ use crate::Result;
 ///
 /// `NULLS FIRST/LAST` is left to polyglot (≥0.13.5), which rewrites unsupported
 /// modifiers to a leading `CASE WHEN x IS NULL …` key ([polyglot#515](https://github.com/tobilg/polyglot/issues/515)).
+/// The unrounded-`AVG` rule alone, for the Layer 2 outer shell (see [`adapt`]).
+pub(super) fn adapt_avg(ast: Expression) -> Result<Expression> {
+    transform(ast, &|e| {
+        Ok(Some(match e {
+            Expression::Avg(mut f) => {
+                f.this = cast(Expr(f.this), "DOUBLE").into_inner();
+                Expression::Avg(f)
+            }
+            other => other,
+        }))
+    })
+    .map_err(internal)
+}
+
 pub(super) fn adapt(ast: Expression, plan: &LogicalPlan) -> Result<Expression> {
     let ast = literal_backslashes_in_like(ast)?;
     let binary = match sql::parse("x COLLATE utf8mb4_bin", DialectType::Generic) {
