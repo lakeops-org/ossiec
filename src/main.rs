@@ -6,8 +6,8 @@ ossiec — compile Apache Ossie semantic models to SQL
 USAGE:
     ossiec validate <model.yaml>
     ossiec describe <model.yaml>
-    ossiec compile  <model.yaml> <request.json | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--compact] [--json]
-    ossiec compile-l2 <model.yaml> <query.sql | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--include-unmatched] [--compact] [--json]
+    ossiec compile     <model.yaml> <request.json | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--compact] [--json]
+    ossiec compile-sql <model.yaml> <query.sql | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--include-unmatched] [--compact] [--json]
 
 OPTIONS:
     --dialect <name>   Target dialect: trino, snowflake, bigquery, duckdb, postgres, clickhouse,
@@ -19,9 +19,10 @@ OPTIONS:
     --compact          One-line SQL
     --json             Print the full compile result (SQL, dialect, warnings, hash) as JSON
 
-    compile-l2         Ossie Layer 2: SQL with AGG(measure) (Appendix A.1-A.6, derived tables
-                       A.2-A.3, CREATE VIEW measure relations A.7). A script may define
-                       views and end with the SELECT to compile. Views are not saved.
+    compile            Structured request (Ossie Layer 3 surface)
+    compile-sql        Consumer SQL with AGG(measure) (Ossie Layer 2 surface); alias: compile-l2.
+                       A script may define CREATE VIEW measure relations (A.7) and end with the
+                       SELECT to compile. Views are session state, not saved into the model.
 ";
 
 fn main() -> ExitCode {
@@ -110,11 +111,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 json,
             )
         }
-        ["compile-l2", model, query] => {
+        ["compile-sql" | "compile-l2", model, query] => {
             let g = graph(model)?;
             print_compiled(
-                ossiec::compile_layer2_script(&g, &read(query)?, &opts)
-                    .map_err(|e| e.to_string())?,
+                ossiec::compile_sql_script(&g, &read(query)?, &opts).map_err(|e| e.to_string())?,
                 json,
             )
         }

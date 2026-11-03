@@ -75,7 +75,7 @@ fn sweep_layer2_nested(engine: Engine) {
     };
     let mut failures = vec![];
     for (name, layer2, reference) in LAYER2_NESTED_CASES {
-        let compiled = ossiec::compile_layer2(&g, layer2, &opts).unwrap();
+        let compiled = ossiec::compile_sql(&g, layer2, &opts).unwrap();
         let mut want = duckdb_rows(&db, reference);
         want.sort();
         match run(engine, &compiled.sql) {

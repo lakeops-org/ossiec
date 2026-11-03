@@ -1,11 +1,16 @@
-//! Ossie Layer 2 frontend: consumer SQL with `AGG(measure)` → Layer 3 request.
+//! SQL frontend for consumer queries with `AGG(measure)`.
+//!
+//! This is the **compiler front end** for Ossie's relational (Layer 2) *surface*:
+//! parse AGG SQL, then hand a [`Request`] (or nested stages) to the same
+//! `plan → lower → render` pipeline structured requests use. The module is named
+//! for that role, not for the Ossie layer number.
 //!
 //! Spec: `relational_semantics.md` (draft). Appendix **A.1** (single `FROM` relation),
 //! **A.4** (multi-fact measures sharing dimensions, plus `AGG` arithmetic in the
 //! select list), and **A.5–A.6** (consumer joins along model relationships,
 //! including unused many→one and reverse fan-out, with `INNER` / `LEFT` /
 //! `RIGHT` / `FULL` / `CROSS`, §7.6) translate
-//! to the existing [`Request`] planner. [`to_request`] / [`layer2_to_request`] expose
+//! to the existing [`Request`] planner. [`to_request`] expose
 //! only **leaf** measures referenced inside `AGG(...)`, not composed output names,
 //! and only for flat queries.
 //!
@@ -63,27 +68,27 @@ mod shell;
 mod to_measure;
 
 pub use catalog::{
-    compile_layer2_script, define_layer2_view, Layer2Catalog, Layer2Column, Layer2ColumnKind,
+    compile_script, define_layer2_view, Layer2Catalog, Layer2Column, Layer2ColumnKind,
 };
 
 use nested::{OutCol, OutKind};
 
-/// Compile a Layer 2 SQL query (`AGG(measure)` over model relations) to SQL.
+/// Compile consumer SQL with `AGG(measure)` over model relations.
 /// Derived tables (Appendix A.2–A.3) compile recursively; see [`nested`].
 ///
 /// Views are not in scope. Register them with [`define_layer2_view`] and compile
-/// through [`compile_layer2_with`], or pass a whole script to [`compile_layer2_script`].
-pub fn compile_layer2(graph: &SemanticGraph, sql: &str, opts: &Options) -> Result<Compiled> {
-    compile_layer2_with(graph, &Layer2Catalog::new(), sql, opts)
+/// through [`compile_with`], or pass a whole script to [`compile_script`].
+pub fn compile(graph: &SemanticGraph, sql: &str, opts: &Options) -> Result<Compiled> {
+    compile_with(graph, &Layer2Catalog::new(), sql, opts)
 }
 
-/// [`compile_layer2`] against a session [`Layer2Catalog`] of `CREATE VIEW` relations.
+/// [`compile`] against a session [`Layer2Catalog`] of `CREATE VIEW` relations.
 ///
 /// A view name in `FROM` / `JOIN` is that view's defining `SELECT`: fields and
 /// deferred measures (`TO MEASURE`, §7.7 pass-through) are columns of the
 /// relation, and `AGG(view.measure)` evaluates the deferred formula at this
 /// query's grain.
-pub fn compile_layer2_with(
+pub fn compile_with(
     graph: &SemanticGraph,
     catalog: &Layer2Catalog,
     sql: &str,
@@ -253,7 +258,7 @@ pub(super) fn parse_top_select(sql: &str) -> Result<(Select, Vec<Expression>)> {
     match ast {
         Expression::Select(sel) => Ok((*sel, to_measures)),
         Expression::CreateView(_) => Err(unsupported(
-            "Layer 2 CREATE VIEW is not a query; register it with define_layer2_view (or pass CREATE VIEW statements and a final SELECT to compile_layer2_script / compile-l2)",
+            "Layer 2 CREATE VIEW is not a query; register it with define_layer2_view (or pass CREATE VIEW statements and a final SELECT to compile_script / compile-l2)",
         )),
         Expression::DropView(_) => Err(unsupported(
             "Layer 2 DROP VIEW is not supported; views live in a session Layer2Catalog",

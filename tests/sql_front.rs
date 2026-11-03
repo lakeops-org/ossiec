@@ -1,4 +1,4 @@
-//! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1–A.6, §7.6 join kinds,
+//! SQL frontend: Ossie Layer 2 `AGG(measure)` surface (Appendix A.1–A.6, §7.6,
 //! role-playing dimensions, includeUnmatched, A.7 CREATE VIEW).
 
 mod common;

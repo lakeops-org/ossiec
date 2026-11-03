@@ -3,7 +3,7 @@
 //! A view is a named derived table: its select list's fields, passed-through
 //! measures and `(...) TO MEASURE` items. [`define_layer2_view`] checks the body
 //! and stores it on a [`Layer2Catalog`]. Nothing is written to the model.
-//! [`super::compile_layer2_with`] then rewrites `FROM` / `JOIN` of that name into
+//! [`super::compile_with`] then rewrites `FROM` / `JOIN` of that name into
 //! the defining `SELECT`, so `AGG(view.measure)` is the same §7.7 path as a
 //! derived table (sole `FROM` folds; a join attaches the view like Appendix A.2).
 
@@ -151,8 +151,8 @@ pub fn define_layer2_view(
 /// Compile a script: zero or more `CREATE VIEW` statements, then one `SELECT`.
 ///
 /// `compile-l2` uses this, so a file can define measure relations and query
-/// them. [`super::compile_layer2`] does not: it has an empty catalog.
-pub fn compile_layer2_script(graph: &SemanticGraph, sql: &str, opts: &Options) -> Result<Compiled> {
+/// them. [`super::compile`] does not: it has an empty catalog.
+pub fn compile_script(graph: &SemanticGraph, sql: &str, opts: &Options) -> Result<Compiled> {
     let parts = split_statements(sql);
     if parts.is_empty() {
         return Err(Error::Request("Layer 2 SQL is empty".into()));
@@ -184,7 +184,7 @@ pub fn compile_layer2_script(graph: &SemanticGraph, sql: &str, opts: &Options) -
             "Layer 2 script defines views but has no SELECT to compile".into(),
         ));
     };
-    super::compile_layer2_with(graph, &catalog, &parts[query_at], opts)
+    super::compile_with(graph, &catalog, &parts[query_at], opts)
 }
 
 /// Rewrite view names in `sel` into their defining selects. `defining` is the
