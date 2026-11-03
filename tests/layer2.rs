@@ -1,9 +1,10 @@
-//! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1, A.4, and consumer joins A.5–A.6).
+//! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1, A.4, A.5, A.6).
 
 use ossiec::{DialectType, Error, Options};
 
 const SHOP: &str = include_str!("fixtures/shop/model.yaml");
 const TWO_FACTS: &str = include_str!("fixtures/two_facts_layer2.yaml");
+const FANOUT: &str = include_str!("fixtures/fanout_layer2.yaml");
 
 fn graph() -> ossiec::SemanticGraph {
     ossiec::from_yaml(SHOP).unwrap()
@@ -197,6 +198,99 @@ fn a4_refuses_dimension_not_shared_across_facts() {
     assert!(
         matches!(e, Error::Unsupported(ref m) if m.contains("independent facts sharing")),
         "{e}"
+    );
+}
+
+#[test]
+fn a4_agg_ratio_expression_in_select() {
+    let g = two_facts_graph();
+    let opts = two_facts_opts();
+    let sql = "SELECT c.region, AGG(o.order_amt) / AGG(t.ticket_count) AS sales_per_ticket \
+               FROM customers c \
+               LEFT JOIN orders o ON o.customer_id = c.id \
+               LEFT JOIN tickets t ON t.customer_id = c.id \
+               GROUP BY c.region";
+    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    assert!(
+        l2.sql.contains('/') || l2.sql.to_uppercase().contains("NULLIF"),
+        "expected division in SQL: {}",
+        l2.sql
+    );
+    let req = ossiec::layer2_to_request(&g, sql).unwrap();
+    assert_eq!(
+        req.metrics,
+        vec!["orders.order_amt", "tickets.ticket_count"]
+    );
+}
+
+#[test]
+fn a4_agg_ratio_on_single_fact() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let sql =
+        "SELECT status, AGG(order_count) / AGG(order_count) AS ones FROM orders GROUP BY status";
+    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    assert!(l2.sql.to_uppercase().contains("COUNT"), "{}", l2.sql);
+    assert!(
+        l2.sql.contains("ones") || l2.sql.contains("\"ones\""),
+        "result should expose alias ones: {}",
+        l2.sql
+    );
+}
+
+#[test]
+fn a5_unused_inner_join_customers_compiles() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let sql =
+        "SELECT AGG(o.order_count) FROM orders o INNER JOIN customers c ON o.customer_id = c.id";
+    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    let upper = l2.sql.to_uppercase();
+    assert!(upper.contains("INNER JOIN"), "{}", l2.sql);
+    assert!(upper.contains("CUSTOMERS"), "{}", l2.sql);
+    // FROM uses the planned dataset alias; ON must match (not the consumer `o`).
+    assert!(
+        upper.contains("\"ORDERS\".CUSTOMER_ID") || upper.contains("ORDERS.CUSTOMER_ID"),
+        "ON must qualify the attach side with the planned alias: {}",
+        l2.sql
+    );
+    assert!(
+        !upper.contains("\"O\".CUSTOMER_ID") && !upper.contains(" O.CUSTOMER_ID"),
+        "ON must not use the consumer alias `o`: {}",
+        l2.sql
+    );
+}
+
+#[test]
+fn a5_reverse_fanout_join_uses_pk_dedup() {
+    let g = ossiec::from_yaml(FANOUT).unwrap();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let sql = "SELECT AGG(o.order_count) FROM orders o JOIN order_items i ON i.order_id = o.id";
+    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    let upper = l2.sql.to_uppercase();
+    assert!(
+        upper.contains("ORDER_ITEMS"),
+        "expected join to order_items: {}",
+        l2.sql
+    );
+    assert!(
+        upper.contains("DISTINCT"),
+        "expected primary-key de-duplication for fan-out (G2): {}",
+        l2.sql
+    );
+    assert!(
+        !upper.contains("\"O\".") && !upper.contains(" O."),
+        "ON/FROM must use planned aliases, not consumer `o`: {}",
+        l2.sql
     );
 }
 

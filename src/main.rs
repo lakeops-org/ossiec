@@ -16,7 +16,7 @@ OPTIONS:
     --compact          One-line SQL
     --json             Print the full compile result (SQL, dialect, warnings, hash) as JSON
 
-    compile-l2         Ossie Layer 2: SQL with AGG(measure) (Appendix A.1, A.4, A.5–A.6)
+    compile-l2         Ossie Layer 2: SQL with AGG(measure) (Appendix A.1, A.4, A.5, A.6)
 ";
 
 fn main() -> ExitCode {
