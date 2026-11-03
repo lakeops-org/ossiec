@@ -9,7 +9,7 @@ Ossie's core spec (`0.2.0.dev0`) defines a **model**: datasets, fields, relation
 | Layer | What | ossiec |
 |---|---|---|
 | 1 | Model and expression language | Read in full |
-| 2 | SQL with `AGG(measure)` (draft, `relational_semantics.md`) | Not yet |
+| 2 | SQL with `AGG(measure)` (draft, `relational_semantics.md`) | Appendix A.1 via `compile_layer2` / `compile-l2` |
 | 3 | Wide table: metrics + dimensions + filters in, joins resolved (draft PR #246) | **This is ossiec's request format** |
 
 The planner follows the same guarantee Layer 2 states (spec §8.3, "G2"): **a measure is aggregated over its own source rows, never over rows a join duplicated.**
@@ -150,4 +150,4 @@ Rules apply only when a target is given. Callers that translate downstream set n
 
 | Feature | Shape it will take |
 |---|---|
-| Layer 2 `AGG()` SQL | A frontend that produces the same plan |
+| Layer 2 consumer joins / subqueries (A.2–A.7) | Extend `layer2.rs` beyond single-relation A.1 |

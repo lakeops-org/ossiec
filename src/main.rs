@@ -7,6 +7,7 @@ USAGE:
     ossiec validate <model.yaml>
     ossiec describe <model.yaml>
     ossiec compile  <model.yaml> <request.json | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--compact] [--json]
+    ossiec compile-l2 <model.yaml> <query.sql | -> [--dialect <name>] [--prefer <OSSIE_DIALECT>] [--compact] [--json]
 
 OPTIONS:
     --dialect <name>   Target dialect: trino, snowflake, bigquery, duckdb, postgres, clickhouse,
@@ -14,6 +15,8 @@ OPTIONS:
     --prefer <name>    Prefer this Ossie dialect's expressions when a field or metric declares one
     --compact          One-line SQL
     --json             Print the full compile result (SQL, dialect, warnings, hash) as JSON
+
+    compile-l2         Ossie Layer 2: SQL with AGG(measure) over a single dataset (Appendix A.1)
 ";
 
 fn main() -> ExitCode {
@@ -96,20 +99,33 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let g = graph(model)?;
             let req: ossiec::Request =
                 serde_json::from_str(&read(request)?).map_err(|e| format!("request: {e}"))?;
-            let c = ossiec::compile(&g, &req, &opts).map_err(|e| e.to_string())?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?
-                );
-            } else {
-                for w in &c.warnings {
-                    eprintln!("warning: {w}");
-                }
-                println!("{}", c.sql);
-            }
-            Ok(())
+            print_compiled(
+                ossiec::compile(&g, &req, &opts).map_err(|e| e.to_string())?,
+                json,
+            )
+        }
+        ["compile-l2", model, query] => {
+            let g = graph(model)?;
+            print_compiled(
+                ossiec::compile_layer2(&g, &read(query)?, &opts).map_err(|e| e.to_string())?,
+                json,
+            )
         }
         _ => Err(format!("unexpected arguments\n\n{USAGE}")),
     }
+}
+
+fn print_compiled(c: ossiec::Compiled, json: bool) -> Result<(), String> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?
+        );
+    } else {
+        for w in &c.warnings {
+            eprintln!("warning: {w}");
+        }
+        println!("{}", c.sql);
+    }
+    Ok(())
 }

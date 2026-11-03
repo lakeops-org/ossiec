@@ -178,6 +178,21 @@ println!("{}", out.sql);       // the statement
 println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
 ```
 
+### Layer 2 (`AGG(measure)`)
+
+Ossie Layer 2 Appendix A.1: a single dataset, `AGG` over a dataset-scoped metric.
+
+```bash
+echo "SELECT status, AGG(order_count) FROM orders GROUP BY status" \
+  | ossiec compile-l2 shop.yaml - --dialect duckdb
+```
+
+```rust
+let out = ossiec::compile_layer2(&graph, "SELECT AGG(order_count) FROM orders", &opts)?;
+```
+
+Model-scoped metrics are not measures (§10.3). Consumer joins and subqueries (A.2–A.7) are not implemented yet.
+
 ## Requests
 
 ```jsonc
@@ -281,6 +296,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests) without `FILTER`, determinism. |
+| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** Appendix A.1 maps to the Layer 3 plan; model-scoped metrics and joins are refused. |
 
 ## Known issues
 
@@ -325,7 +341,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Ossie `0.2` loading, validation and identifier rules
 - [x] Join-root planning, inline and primary-key de-duplicated terms, `UNION ALL` stacking
 - [x] `FILTER` lowering, time grains, metric filters, vendor-dialect preference
-- [x] CLI: `validate`, `describe`, `compile`
+- [x] CLI: `validate`, `describe`, `compile`, `compile-l2`
 - [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse, MySQL
 - [x] TPC-DS: Ossie's example model on real data, plus official queries q3, q42, q52, q55, q98
 - [x] Official TPC-DS queries q3, q12, q42, q43, q52, q55, q96, q98
@@ -335,7 +351,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Role-playing dimensions (`relationship.field`, shortest path by default)
 - [x] Unmatched one-side rows (`includeUnmatched`)
 - [x] NULL placement in `orderBy`
-- [ ] Ossie Layer 2: SQL with `AGG(measure)`
+- [x] Ossie Layer 2: SQL with `AGG(measure)` (Appendix A.1; joins/subqueries later)
 - [ ] Publish to crates.io
 
 ## Contributing

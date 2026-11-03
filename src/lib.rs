@@ -29,12 +29,14 @@
 
 mod dialect;
 mod graph;
+mod layer2;
 mod lower;
 pub mod model;
 mod plan;
 mod sql;
 
 pub use graph::{bind, Catalog, DimensionDoc, MetricDoc, SemanticGraph};
+pub use layer2::{compile_layer2, to_request as layer2_to_request};
 pub use model::Model;
 pub use plan::{Direction, Filter, MetricFilter, Nulls, Op, OrderBy, Request, TimeGrain};
 pub use polyglot_sql::DialectType;
