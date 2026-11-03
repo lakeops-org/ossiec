@@ -30,7 +30,8 @@ use polyglot_sql::{generate, DialectType, Expression};
 
 use super::{
     apply_consumer_joins, apply_select_formulas, parse_stage_from, parse_stage_prep,
-    parse_top_select, planned_alias_on_leg, protect_inflating_joins, rename_consumer_outputs,
+    parse_top_select, planned_alias_on_leg, pragma_include_unmatched, protect_inflating_joins,
+    rename_consumer_outputs,
     stage_aliases, unsupported, L2Formula, StageCfg,
 };
 use crate::graph::{Ctx, SemanticGraph};
@@ -135,6 +136,8 @@ pub(super) struct Compiler<'a> {
     pub derived_count: usize,
     /// Next `__l2_bmN` for a query-local base measure.
     pub(super) base_seq: usize,
+    /// Outermost `AGG` stage also returns one-side rows no fact reaches.
+    include_unmatched: bool,
     /// The flat top-level request, when the query has no derived tables.
     flat_request: Option<Request>,
     /// Expressions of the query's `TO MEASURE` items, by marker index.
@@ -152,6 +155,7 @@ pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> 
         },
         derived_count: 0,
         base_seq: 0,
+        include_unmatched: opts.include_unmatched || pragma_include_unmatched(sql_text),
         flat_request: None,
         to_measures,
     };
@@ -176,6 +180,9 @@ pub(super) fn compile(graph: &SemanticGraph, sql_text: &str, opts: &Options) -> 
                     .map(render)
                     .collect::<Result<Vec<_>>>()?;
                 id["to_measures"] = serde_json::json!(tm);
+            }
+            if c.include_unmatched {
+                id["includeUnmatched"] = serde_json::json!(true);
             }
             id
         }
@@ -304,6 +311,12 @@ impl Compiler<'_> {
             self.graph
                 .install_ephemeral_metric(&ep.name, ep.owner, ep.body)?;
         }
+        if depth == 0 && self.include_unmatched {
+            // The outermost AGG stage (a flat query, or the outer stage of a
+            // derived join). Inner stages keep the default: the flag is about
+            // the query the caller wrote, not every nested aggregate.
+            parsed.request.include_unmatched = true;
+        }
         // A derived JOIN attaches to a dataset that may not be named by the
         // selected measures (grand-total AGG over a pass-through with
         // `FROM customers JOIN (…orders…) m`). Pull those datasets into the
@@ -395,18 +408,17 @@ impl Compiler<'_> {
         let mut logical = plan::plan(graph, &parsed.request, &mut self.ctx)?;
         apply_consumer_joins(graph, &mut logical, &parsed.consumer_joins, &mut self.ctx)?;
         if !parsed.derived.is_empty() {
-            if logical.include_unmatched {
-                return Err(unsupported(
-                    "Layer 2 derived-table JOIN cannot be combined with includeUnmatched",
-                ));
-            }
             // Attach only to legs that host the dataset. A leg that does not
             // read it stays unrestricted, so one independent fact can be filtered
             // without filtering the others. Refuse only when no leg hosts it.
+            // `includeUnmatched` is allowed: `unmatched_rows` renames subtree
+            // aliases to `…__unmatched` and repeats derived joins that attach there.
             for (spec, (placeholder, rel_cols)) in parsed.derived.iter().zip(prepared) {
                 let mut attached = false;
                 for leg in &mut logical.legs {
-                    let Some(from_alias) = planned_alias_on_leg(graph, leg, spec.attach_ds) else {
+                    let Some(from_alias) =
+                        planned_alias_on_leg(graph, leg, spec.attach_ds, spec.attach_role)
+                    else {
                         continue;
                     };
                     attached = true;
@@ -421,16 +433,23 @@ impl Compiler<'_> {
                     });
                 }
                 if !attached {
-                    let ds = &graph.datasets[spec.attach_ds].name;
+                    let attach = match spec.attach_role {
+                        Some(r) => format!(
+                            "{} via `{}`",
+                            graph.datasets[spec.attach_ds].name,
+                            graph.rels[r].name
+                        ),
+                        None => graph.datasets[spec.attach_ds].name.clone(),
+                    };
                     return Err(if logical.legs.len() > 1 {
                         unsupported(format!(
-                            "Layer 2 derived-table JOIN `{}` with measures from independent facts (A.4) needs a dataset every fact reaches; `{}` is not part of each planned leg",
-                            spec.alias, ds
+                            "Layer 2 derived-table JOIN `{}` with measures from independent facts (A.4): `{attach}` is not part of any planned leg",
+                            spec.alias
                         ))
                     } else {
                         unsupported(format!(
-                            "Layer 2 derived-table JOIN `{}`: dataset `{}` is not part of the planned query",
-                            spec.alias, ds
+                            "Layer 2 derived-table JOIN `{}`: dataset `{attach}` is not part of the planned query",
+                            spec.alias
                         ))
                     });
                 }

@@ -182,6 +182,10 @@ println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
 
 Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS` join kinds (§7.6: null-extended and Cartesian rows do not inflate `AGG`); **A.2** derived tables joined into an `AGG` stage; **A.3** `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables (with `IS NOT DISTINCT FROM` join keys). Consumer aliases (`AS n`) name the output columns. `layer2_to_request` returns leaf measures of flat queries only; nested SQL is `compile_layer2` / `compile-l2` only. **§7.7** unevaluated measures: a derived table may pass a dataset-scoped measure through its select list and an outer `AGG(t.m)` evaluates it (join form, or a sole derived `FROM`, which is folded into the outer stage). **Query-local `TO MEASURE`** in a derived table's select list, consumed by an outer `AGG(t.m)`, is implemented for both `(AGG(a) / AGG(b)) TO MEASURE AS m` and a base `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS m` (unevaluated until that outer `AGG`). `CREATE VIEW` / persisted A.7 views are not.
 
+**Roles.** Qualify a column with the relationship name, the same form as a Layer 3 dimension: `departs_from.city`. That name may also be the JOIN alias (`JOIN airports AS departs_from`). A plain `airports.city` still takes the unique shortest path and is refused when departure and arrival both tie.
+
+**`includeUnmatched`.** One-side rows no fact reaches are off unless `Options { include_unmatched: true, .. }` or a comment `-- ossiec: includeUnmatched` (or `compile-l2 --include-unmatched`). It applies to the outermost `AGG` stage, including one that joins a derived table onto the unmatched grain. Layer 3 still uses the request field; `Options.include_unmatched` does not change it.
+
 ```sql
 -- A.2: restrict an AGG stage to the top two customers
 SELECT o.status, AGG(o.order_count)
@@ -337,7 +341,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`). The shop forms of A.2/A.3 and §7.7 (fold, outer `WHERE`, join pass-through) also run in the engine tier (`layer2_nested_*`); `TO MEASURE` is DuckDB + compile-matrix only. |
+| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`), role-playing dimensions, `includeUnmatched` (flat and derived onto the unmatched grain). The shop forms of A.2/A.3 and §7.7 (fold, outer `WHERE`, join pass-through) also run in the engine tier (`layer2_nested_*`); `TO MEASURE` is DuckDB + compile-matrix only. |
 
 ## Known issues
 
@@ -391,7 +395,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Role-playing dimensions (`relationship.field`, shortest path by default)
 - [x] Unmatched one-side rows (`includeUnmatched`)
 - [x] NULL placement in `orderBy`
-- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`, done; `CREATE VIEW` / A.7 persistence not yet)
+- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; `CREATE VIEW` / A.7 persistence not yet)
 - [ ] Publish to crates.io
 
 ## Contributing

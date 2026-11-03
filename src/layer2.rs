@@ -24,6 +24,18 @@
 //! `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) and `CREATE VIEW` stay
 //! [`Error::Unsupported`].
 //!
+//! **Roles.** A column qualified by a relationship name (`departs_from.city`) is a
+//! Layer 3 role: the request dimension is `relationship.field`, and the planner
+//! joins that dataset under `dataset__relationship`. The qualifier may be the
+//! JOIN alias when that alias is the relationship name. A plain `dataset.field`
+//! still takes the unique shortest path and is refused when two paths tie.
+//!
+//! **`includeUnmatched`.** [`Options::include_unmatched`] or a comment
+//! `-- ossiec: includeUnmatched` sets [`Request::include_unmatched`] on the
+//! outermost `AGG` stage. Derived joins that attach inside the unmatched grain's
+//! subtree are renamed with it (`…__unmatched`); the fact-side probe still sees
+//! every derived join.
+//!
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
 
@@ -160,6 +172,8 @@ pub(super) struct DerivedSpec {
     /// Derived-table column per ON equality.
     pub cols: Vec<String>,
     pub null_safe: bool,
+    /// Relationship the attach columns name (`relationship.field`), if any.
+    pub attach_role: Option<usize>,
 }
 
 pub(super) struct ConsumerJoin {
@@ -171,6 +185,8 @@ pub(super) struct ConsumerJoin {
     attach_alias: String,
     other_ds: usize,
     other_alias: String,
+    /// Relationship the attach columns name, when they are `relationship.field`.
+    attach_role: Option<usize>,
 }
 
 /// Select-list expression whose leaves are bare `AGG(measure)` references.
@@ -232,13 +248,28 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
         ));
     }
     let mut base_seq = 0usize;
-    let parsed = parse_stage_from(graph, &sel, &cfg, parsed_from, &[], &mut base_seq)?;
+    let mut parsed = parse_stage_from(graph, &sel, &cfg, parsed_from, &[], &mut base_seq)?;
     if !parsed.ephemeral.is_empty() {
         return Err(Error::Internal(
             "flat Layer 2 query cannot install a query-local base measure".into(),
         ));
     }
+    if pragma_include_unmatched(sql) {
+        parsed.request.include_unmatched = true;
+    }
     Ok(parsed)
+}
+
+/// `-- ossiec: includeUnmatched` as its own `--` comment anywhere in the SQL.
+pub(super) fn pragma_include_unmatched(sql: &str) -> bool {
+    sql.lines().any(|line| {
+        let Some((_, comment)) = line.split_once("--") else {
+            return false;
+        };
+        comment
+            .trim()
+            .eq_ignore_ascii_case("ossiec: includeUnmatched")
+    })
 }
 
 /// Clause checks and the `FROM` / `JOIN` list of one `AGG` stage.
@@ -760,13 +791,14 @@ fn apply_consumer_joins(
         // ON must use the same aliases `tree_sql` uses for the leg (dataset
         // name for the root, `to_alias` for prior joins)—not the consumer SQL
         // alias (`o` vs `orders`).
-        let from_alias = planned_alias_on_leg(graph, &logical.legs[leg_i], cj.attach_ds)
-            .ok_or_else(|| {
-                unsupported(format!(
-                    "Layer 2 join on `{}`: attach dataset `{}` has no planned alias on its leg",
-                    graph.rels[rel].name, graph.datasets[cj.attach_ds].name
-                ))
-            })?;
+        let from_alias =
+            planned_alias_on_leg(graph, &logical.legs[leg_i], cj.attach_ds, cj.attach_role)
+                .ok_or_else(|| {
+                    unsupported(format!(
+                        "Layer 2 join on `{}`: attach dataset `{}` has no planned alias on its leg",
+                        graph.rels[rel].name, graph.datasets[cj.attach_ds].name
+                    ))
+                })?;
         let leg = &mut logical.legs[leg_i];
         leg.joins.push(JoinStep {
             rel: Some(rel),
@@ -831,7 +863,7 @@ fn apply_cross_join(
         ));
     }
     let root = logical.legs[0].root;
-    let on_leg = |ds: usize| planned_alias_on_leg(graph, &logical.legs[0], ds).is_some();
+    let on_leg = |ds: usize| planned_alias_on_leg(graph, &logical.legs[0], ds, None).is_some();
     if !on_leg(cj.attach_ds) && !on_leg(cj.other_ds) {
         return Err(unsupported(
             "Layer 2 CROSS JOIN cannot attach to the planned query; neither side is on the measure's join tree (relational_semantics §7.6)",
@@ -941,7 +973,7 @@ fn consumer_join_leg(
     rel: usize,
 ) -> Result<usize> {
     for (i, leg) in logical.legs.iter().enumerate() {
-        if leg_hosts_attach(graph, leg, cj.attach_ds, &cj.attach_alias) {
+        if leg_hosts_attach(graph, leg, cj.attach_ds, cj.attach_role) {
             return Ok(i);
         }
     }
@@ -957,25 +989,54 @@ fn leg_hosts_attach(
     graph: &SemanticGraph,
     leg: &plan::Leg,
     attach_ds: usize,
-    _attach_alias: &str,
+    attach_role: Option<usize>,
 ) -> bool {
-    planned_alias_on_leg(graph, leg, attach_ds).is_some()
+    planned_alias_on_leg(graph, leg, attach_ds, attach_role).is_some()
 }
 
 /// Alias `lower` will use for `ds` on this leg (`tree_sql` / `leg_sql`).
-fn planned_alias_on_leg(graph: &SemanticGraph, leg: &plan::Leg, ds: usize) -> Option<String> {
-    if leg.root == ds {
+///
+/// `role` selects the join that plays that relationship (`dataset__relationship`,
+/// or the consumer alias of a join that was added for it). Without a role, a
+/// plain dataset alias wins; a single join to `ds` is used otherwise. Several
+/// role aliases and no role is ambiguous — this returns `None` rather than the
+/// first one.
+pub(super) fn planned_alias_on_leg(
+    graph: &SemanticGraph,
+    leg: &plan::Leg,
+    ds: usize,
+    role: Option<usize>,
+) -> Option<String> {
+    if role.is_none() && leg.root == ds {
         return Some(graph.datasets[ds].name.clone());
     }
+    let mut hits = Vec::new();
     for s in &leg.joins {
         let joined = if s.reverse {
             graph.rels[s.rel.expect("reverse relationship join")].from
         } else {
             s.to
         };
-        if joined == ds {
-            return Some(s.to_alias.clone());
+        if joined != ds {
+            continue;
         }
+        if let Some(r) = role {
+            if s.rel == r {
+                return Some(s.to_alias.clone());
+            }
+            continue;
+        }
+        hits.push(s.to_alias.clone());
+    }
+    if role.is_some() {
+        return None;
+    }
+    let plain = graph.datasets[ds].name.as_str();
+    if let Some(alias) = hits.iter().find(|a| a.as_str() == plain) {
+        return Some(alias.clone());
+    }
+    if hits.len() == 1 {
+        return Some(hits[0].clone());
     }
     None
 }
@@ -1366,6 +1427,7 @@ pub(super) fn parse_from_clause(
                     rel_info.name, graph.datasets[attach_ds].name
                 ))
             })?;
+        let attach_role = on_attach_role(graph, &join_scope, &pairs, attach_ds)?;
         consumer_joins.push(ConsumerJoin {
             rel: Some(rel),
             kind,
@@ -1374,6 +1436,7 @@ pub(super) fn parse_from_clause(
             attach_alias,
             other_ds,
             other_alias: right_binding.alias.clone(),
+            attach_role,
         });
         scope.bindings.push(right_binding);
     }
@@ -1421,6 +1484,7 @@ fn parse_derived_join(
             .is_some_and(|t| t.name.eq_ignore_ascii_case(&alias))
     };
     let mut attach_ds: Option<usize> = None;
+    let mut attach_role: Option<Option<usize>> = None;
     let mut from_fields = vec![];
     let mut cols = vec![];
     let mut null_safe: Option<bool> = None;
@@ -1435,6 +1499,17 @@ fn parse_derived_join(
             return Err(unsupported(
                 "Layer 2 derived-table JOIN ON must attach to one dataset",
             ));
+        }
+        let role = column_role(graph, &col, ds)?;
+        match attach_role {
+            None => attach_role = Some(role),
+            Some(prev) if prev != role => {
+                return Err(unsupported(format!(
+                    "Layer 2 derived-table JOIN ON must attach to one role of `{}`",
+                    graph.datasets[ds].name
+                )));
+            }
+            _ => {}
         }
         if *null_safe.get_or_insert(ns) != ns {
             return Err(unsupported(
@@ -1458,6 +1533,7 @@ fn parse_derived_join(
         from_fields,
         cols,
         null_safe: null_safe.unwrap_or(false),
+        attach_role: attach_role.flatten(),
     })
 }
 
@@ -1656,6 +1732,16 @@ fn resolve_column_dataset(
             return Err(unsupported(format!(
                 "Layer 2 correlated subquery: `{}.{}` refers to an enclosing query; derived tables must be self-contained",
                 t.name, col.name.name
+            )));
+        }
+        if let Some(role) = relationship_by_name(graph, &t.name, t.quoted)? {
+            let rel = &graph.rels[role];
+            if scope.bindings.iter().any(|b| b.dataset == rel.from) {
+                return Ok(rel.to);
+            }
+            return Err(Error::Request(format!(
+                "column `{}.{}` names relationship `{}`, but dataset `{}` is not in FROM/JOIN",
+                t.name, col.name.name, rel.name, graph.datasets[rel.from].name
             )));
         }
         return Err(Error::Request(format!(
@@ -1879,10 +1965,62 @@ fn resolve_dim(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Resul
         .iter()
         .position(|f| f.name.eq_ignore_ascii_case(field))
         .ok_or_else(|| Error::Request(format!("unknown field `{field}` on dataset `{ds_name}`")))?;
-    Ok(format!(
-        "{ds_name}.{}",
-        graph.datasets[dataset].fields[f].name
-    ))
+    let field_name = &graph.datasets[dataset].fields[f].name;
+    if let Some(role) = column_role(graph, col, dataset)? {
+        return Ok(format!("{}.{}", graph.rels[role].name, field_name));
+    }
+    Ok(format!("{ds_name}.{field_name}"))
+}
+
+/// The relationship a column's qualifier names, when that relationship's `to`
+/// dataset is `dataset`. That is Layer 3's `relationship.field` role.
+fn column_role(graph: &SemanticGraph, col: &Column, dataset: usize) -> Result<Option<usize>> {
+    let Some(t) = &col.table else {
+        return Ok(None);
+    };
+    let Some(role) = relationship_by_name(graph, &t.name, t.quoted)? else {
+        return Ok(None);
+    };
+    if graph.rels[role].to == dataset {
+        Ok(Some(role))
+    } else {
+        Ok(None)
+    }
+}
+
+fn relationship_by_name(graph: &SemanticGraph, name: &str, quoted: bool) -> Result<Option<usize>> {
+    crate::graph::lookup(graph.rels.iter().map(|r| r.name.as_str()), name, quoted)
+        .map_err(Error::Request)
+}
+
+/// Role shared by every ON column of `attach_ds` (`None` when they name the dataset).
+fn on_attach_role(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    pairs: &[(Column, Column)],
+    attach_ds: usize,
+) -> Result<Option<usize>> {
+    let mut found: Option<Option<usize>> = None;
+    for (l, r) in pairs {
+        for col in [l, r] {
+            let ds = resolve_column_dataset(graph, scope, col)?;
+            if ds != attach_ds {
+                continue;
+            }
+            let role = column_role(graph, col, ds)?;
+            match found {
+                None => found = Some(role),
+                Some(prev) if prev != role => {
+                    return Err(unsupported(format!(
+                        "Layer 2 JOIN ON names `{}` both as itself and as a role; qualify every attach column the same way",
+                        graph.datasets[attach_ds].name
+                    )));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(found.flatten())
 }
 
 fn where_to_filters(
