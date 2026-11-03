@@ -52,17 +52,19 @@ wait_for() { # name timeout-seconds command...
 case "${1:-}" in
   up)
     unpause_all
+    # StarRocks is the slowest to boot (FE + BE). Start it first so it warms
+    # while the other images pull; CI has timed out waiting for port 9030.
+    start ossiec-starrocks "$STARROCKS_IMAGE"
     start ossiec-postgres "$POSTGRES_IMAGE" -e POSTGRES_PASSWORD=ossiec
     start ossiec-clickhouse "$CLICKHOUSE_IMAGE"
     start ossiec-trino "$TRINO_IMAGE"
-    start ossiec-starrocks "$STARROCKS_IMAGE"
     # local-infile: the TPC-DS tier bulk-loads CSV.
     start ossiec-mysql "$MYSQL_IMAGE" -e MYSQL_ROOT_PASSWORD=ossiec -e MYSQL_DATABASE=ossiec
     wait_for ossiec-postgres 60 psql -U postgres -c 'SELECT 1'
     wait_for ossiec-clickhouse 60 clickhouse-client --query 'SELECT 1'
     wait_for ossiec-trino 180 trino --execute 'SELECT 1 FROM memory.information_schema.schemata LIMIT 1'
     wait_for ossiec-mysql 120 mysql -uroot -possiec -e "SELECT 1"
-    wait_for ossiec-starrocks 300 bash -c \
+    wait_for ossiec-starrocks 600 bash -c \
       "mysql -h127.0.0.1 -P9030 -uroot -N -e 'SHOW BACKENDS' | grep -q true"
     ;;
   only)
