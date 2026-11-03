@@ -180,7 +180,7 @@ println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
 
 ### Layer 2 (`AGG(measure)`)
 
-Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` join kinds; **A.2** derived tables joined into an `AGG` stage; **A.3** `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables (with `IS NOT DISTINCT FROM` join keys). Consumer aliases (`AS n`) name the output columns. `layer2_to_request` returns leaf measures of flat queries only; nested SQL is `compile_layer2` / `compile-l2` only. `TO MEASURE` (A.7) and passing an unevaluated measure through a derived table (§7.7) are not implemented yet.
+Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` join kinds; **A.2** derived tables joined into an `AGG` stage; **A.3** `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables (with `IS NOT DISTINCT FROM` join keys). Consumer aliases (`AS n`) name the output columns. `layer2_to_request` returns leaf measures of flat queries only; nested SQL is `compile_layer2` / `compile-l2` only. **§7.7** unevaluated measures: a derived table may pass a dataset-scoped measure through its select list and an outer `AGG(t.m)` evaluates it (join form, or a sole derived `FROM`, which is folded into the outer stage). **Query-local `TO MEASURE`** (`(AGG(a) / AGG(b)) TO MEASURE AS m` in a derived table's select list, consumed by an outer `AGG(t.m)`) is implemented; `CREATE VIEW` / persisted A.7 views and `SUM(x) TO MEASURE` are not.
 
 ```sql
 -- A.2: restrict an AGG stage to the top two customers
@@ -191,6 +191,19 @@ JOIN (SELECT customer_id, AGG(order_count) AS n
       ORDER BY n DESC, customer_id LIMIT 2) t
   ON o.customer_id = t.customer_id
 GROUP BY o.status;
+
+-- §7.7: the measure stays a measure through the subquery; the outer AGG evaluates it
+SELECT region, AGG(order_count) FROM (SELECT region, order_count FROM orders WHERE ...) t GROUP BY region;
+
+-- Query-local TO MEASURE: a deferred ratio, evaluated by the outer AGG
+SELECT r.region, AGG(m.sales_per_ticket)
+FROM customers r
+JOIN (SELECT c.region, (AGG(o.order_amt) / AGG(t.ticket_count)) TO MEASURE AS sales_per_ticket
+      FROM customers c
+      LEFT JOIN orders o ON o.customer_id = c.id
+      LEFT JOIN tickets t ON t.customer_id = c.id
+      GROUP BY c.region) m ON r.region = m.region
+GROUP BY r.region;
 
 -- A.3: ordinary aggregates over derived tables
 SELECT d.status, AVG(m.n)
@@ -316,7 +329,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`). The shop forms of A.2/A.3 also run in the engine tier (`layer2_nested_*`). |
+| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.7 pass-through and query-local `TO MEASURE`. The shop forms of A.2/A.3 also run in the engine tier (`layer2_nested_*`). |
 
 ## Known issues
 
@@ -370,7 +383,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Role-playing dimensions (`relationship.field`, shortest path by default)
 - [x] Unmatched one-side rows (`includeUnmatched`)
 - [x] NULL placement in `orderBy`
-- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; A.7 and §7.7 pass-through later)
+- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.7 pass-through and query-local `TO MEASURE` done; `CREATE VIEW` / A.7 persistence not yet)
 - [ ] Publish to crates.io
 
 ## Contributing

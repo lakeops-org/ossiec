@@ -11,8 +11,13 @@
 //! **A.2–A.3** (derived tables) compile recursively in [`nested`]: every `AGG`
 //! stage is an ordinary [`Request`] → plan → lower pass, derived tables join in
 //! through the planner's `DerivedJoin`, and an outer SQL aggregate over derived
-//! tables (A.3) is a thin shell outside plan/lower. Other join forms (A.7,
-//! `RIGHT`/`FULL`/`CROSS`/`ASOF`, …) stay [`Error::Unsupported`].
+//! tables (A.3) is a thin shell outside plan/lower.
+//!
+//! **§7.7** (unevaluated measures): a derived table may pass a dataset-scoped
+//! measure through its select list; an outer `AGG(t.m)` evaluates it. A query-local
+//! `(AGG(a) / AGG(b)) TO MEASURE AS m` item (Appendix A.7 / §5.2 surface) defers a
+//! composed measure the same way. Other join forms (`RIGHT`/`FULL`/`CROSS`/`ASOF`,
+//! `CREATE VIEW`, …) stay [`Error::Unsupported`].
 //!
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
@@ -31,8 +36,12 @@ use crate::plan::{
 };
 use crate::{Compiled, Error, Options, Result};
 
+mod fold;
 mod nested;
 mod shell;
+mod to_measure;
+
+use nested::{OutCol, OutKind};
 
 /// Compile a Layer 2 SQL query (`AGG(measure)` over model relations) to SQL.
 /// Derived tables (Appendix A.2–A.3) compile recursively; see [`nested`].
@@ -94,8 +103,18 @@ pub(super) struct Layer2Parsed {
     pub dim_labels: Vec<(String, String)>,
     /// Derived tables joined to the stage (Appendix A.2).
     pub derived: Vec<DerivedSpec>,
-    /// Aliases this stage's `FROM` introduces (what a nested query must not reference).
-    pub scope_aliases: Vec<String>,
+    /// Columns of this stage that are measures awaiting a later `AGG()` (§7.7):
+    /// pass-through measures and query-local `TO MEASURE` items.
+    pub unevaluated: Vec<UnevaluatedSpec>,
+}
+
+/// A select-list column that stays a measure for an outer `AGG()`.
+pub(super) struct UnevaluatedSpec {
+    pub name: String,
+    /// Canonical metric for a pass-through; the alias for a `TO MEASURE` item.
+    pub metric: String,
+    /// `TO MEASURE`: the composed formula over leaf metrics.
+    pub formula: Option<L2Formula>,
 }
 
 /// How a stage's select list is read.
@@ -105,6 +124,8 @@ pub(super) struct StageCfg<'a> {
     pub derived: bool,
     /// Aliases of enclosing queries (to name correlated references).
     pub outer: &'a [String],
+    /// Expressions of the query's `TO MEASURE` items, by marker index.
+    pub to_measures: &'a [Expression],
 }
 
 /// A derived table joined to an `AGG` stage: `JOIN (<select>) alias ON ...`.
@@ -132,7 +153,7 @@ pub(super) struct ConsumerJoin {
 }
 
 /// Select-list expression whose leaves are bare `AGG(measure)` references.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum L2Formula {
     Agg(String),
     Add(Box<L2Formula>, Box<L2Formula>),
@@ -152,18 +173,24 @@ struct TableBinding {
 
 struct QueryScope {
     bindings: Vec<TableBinding>,
-    /// Aliases of derived tables in this stage's `FROM` (usable only in their ON).
+    /// Aliases of derived tables in this stage's `FROM` (usable only in their ON,
+    /// or as `AGG(alias.measure)` for their unevaluated measures, §7.7).
     derived: Vec<String>,
+    /// Output columns of those derived tables (filled once they are compiled).
+    derived_outs: Vec<(String, Vec<OutCol>)>,
     /// Aliases of enclosing queries: a reference to one is correlated.
     outer: Vec<String>,
 }
 
-/// Parse the consumer's single top-level `SELECT`.
-pub(super) fn parse_top_select(sql: &str) -> Result<Select> {
-    let ast = parse_one(sql.trim(), DialectType::Generic)
+/// Parse the consumer's single top-level `SELECT`. `TO MEASURE` items (which the
+/// SQL parser cannot read) are cut out first; the returned expressions are theirs,
+/// indexed by the marker column left in the select list (see [`to_measure`]).
+pub(super) fn parse_top_select(sql: &str) -> Result<(Select, Vec<Expression>)> {
+    let (text, to_measures) = to_measure::extract(sql.trim())?;
+    let ast = parse_one(&text, DialectType::Generic)
         .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
     match ast {
-        Expression::Select(sel) => Ok(*sel),
+        Expression::Select(sel) => Ok((*sel, to_measures)),
         _ => Err(unsupported(
             "Layer 2 accepts a single SELECT (set operators are not supported)",
         )),
@@ -171,53 +198,101 @@ pub(super) fn parse_top_select(sql: &str) -> Result<Select> {
 }
 
 fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
-    let sel = parse_top_select(sql)?;
-    let parsed = parse_stage(
-        graph,
-        &sel,
-        &StageCfg {
-            derived: false,
-            outer: &[],
-        },
-    )?;
-    if !parsed.derived.is_empty() {
+    let (sel, to_measures) = parse_top_select(sql)?;
+    let cfg = StageCfg {
+        derived: false,
+        outer: &[],
+        to_measures: &to_measures,
+    };
+    let parsed_from = parse_stage_prep(graph, &sel, &cfg)?;
+    if !parsed_from.derived.is_empty() {
         return Err(unsupported(
             "Layer 2 derived tables (Appendix A.2–A.3) are not one Layer 3 request; use compile_layer2",
         ));
     }
-    Ok(parsed)
+    parse_stage_from(graph, &sel, &cfg, parsed_from, &[])
 }
 
-/// One `AGG` stage: select list, `FROM`/`JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`.
-pub(super) fn parse_stage(
-    graph: &SemanticGraph,
-    sel: &Select,
-    cfg: &StageCfg<'_>,
-) -> Result<Layer2Parsed> {
+/// Clause checks and the `FROM` / `JOIN` list of one `AGG` stage.
+fn parse_stage_prep(graph: &SemanticGraph, sel: &Select, cfg: &StageCfg<'_>) -> Result<ParsedFrom> {
     if sel.with.is_some() || sel.distinct || sel.having.is_some() || sel.qualify.is_some() {
         return Err(unsupported(
             "Layer 2 WITH / DISTINCT / HAVING / QUALIFY are not implemented yet",
         ));
     }
+    parse_from_clause(graph, sel.from.as_ref(), &sel.joins, cfg.outer)
+}
 
-    let parsed_from = parse_from_clause(graph, sel.from.as_ref(), &sel.joins, cfg.outer)?;
-    let scope = &parsed_from.scope;
-    let scope_aliases: Vec<String> = scope
+/// Aliases a stage's `FROM` introduces: what a nested query must not reference.
+fn stage_aliases(graph: &SemanticGraph, from: &ParsedFrom) -> Vec<String> {
+    let scope = &from.scope;
+    scope
         .bindings
         .iter()
         .flat_map(|b| [b.alias.clone(), graph.datasets[b.dataset].name.clone()])
         .chain(scope.derived.iter().cloned())
-        .collect();
+        .collect()
+}
+
+/// One `AGG` stage: select list, `FROM`/`JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`.
+/// `derived_outs` are the compiled columns of the derived tables in `FROM`.
+fn parse_stage_from(
+    graph: &SemanticGraph,
+    sel: &Select,
+    cfg: &StageCfg<'_>,
+    mut parsed_from: ParsedFrom,
+    derived_outs: &[(String, Vec<OutCol>)],
+) -> Result<Layer2Parsed> {
+    parsed_from.scope.derived_outs = derived_outs.to_vec();
+    let scope = &parsed_from.scope;
 
     let mut metrics: Vec<String> = Vec::new();
     let mut dimensions = Vec::new();
     let mut measure_outputs = Vec::new();
     let mut dim_labels: Vec<(String, String)> = Vec::new();
+    let mut unevaluated: Vec<UnevaluatedSpec> = Vec::new();
     // Select-list label (alias or default) → order-by / output resolution name.
     let mut outputs: Vec<(String, String)> = Vec::new();
 
     for (idx, expr) in sel.expressions.iter().enumerate() {
         let (inner, alias) = strip_alias(expr);
+        if let Some(col) = as_column(inner) {
+            if let Some(n) = to_measure::marker_index(col) {
+                let name = alias
+                    .ok_or_else(|| Error::Request("Layer 2 TO MEASURE needs `AS <name>`".into()))?;
+                if !cfg.derived {
+                    return Err(unsupported(
+                        "Layer 2 TO MEASURE defines a measure for an outer AGG(): use it in a derived table's select list",
+                    ));
+                }
+                let e = cfg
+                    .to_measures
+                    .get(n)
+                    .ok_or_else(|| Error::Internal("unknown TO MEASURE marker".into()))?;
+                let formula = parse_formula_or_agg(graph, scope, e)?;
+                let leaves = formula_leaves(&formula);
+                if leaves.is_empty() {
+                    return Err(unsupported(
+                        "Layer 2 TO MEASURE needs an expression over AGG(measure) leaves",
+                    ));
+                }
+                for leaf in leaves {
+                    if !metrics.contains(&leaf) {
+                        metrics.push(leaf);
+                    }
+                }
+                // Evaluated physically at this grain (so the stage keeps a column),
+                // but exposed to the outer query as an unevaluated measure.
+                measure_outputs.push((name.clone(), formula.clone()));
+                outputs.push((name.clone(), name.clone()));
+                unevaluated.push(UnevaluatedSpec {
+                    metric: name.clone(),
+                    name,
+                    formula: Some(formula),
+                });
+                continue;
+            }
+        }
         if let Some(formula) = parse_measure_formula(graph, scope, inner)? {
             for leaf in formula_leaves(&formula) {
                 if !metrics.contains(&leaf) {
@@ -247,7 +322,31 @@ pub(super) fn parse_stage(
         })?;
         let dim = match resolve_dim(graph, scope, col) {
             Ok(d) => d,
-            Err(e) => return Err(unevaluated_measure(graph, scope, col).unwrap_or(e)),
+            Err(e) => {
+                // A bare measure column: §7.7 pass-through (derived tables only).
+                if let Some(ds) = bare_measure(graph, scope, col) {
+                    let ds_name = &graph.datasets[ds].name;
+                    if !cfg.derived {
+                        return Err(unsupported(format!(
+                            "Layer 2 bare measure `{}` on `{ds_name}` at the top level: only a derived table's select list may pass a measure through for an outer AGG() (relational_semantics §7.7); evaluate it with AGG({0}) AS <alias>",
+                            col.name.name
+                        )));
+                    }
+                    let metric = resolve_measure(graph, scope, inner)?;
+                    let name = alias.unwrap_or_else(|| col.name.name.clone());
+                    unevaluated.push(UnevaluatedSpec {
+                        name: name.clone(),
+                        metric: metric.clone(),
+                        formula: None,
+                    });
+                    outputs.push((name, metric));
+                    continue;
+                }
+                if col.table.is_none() && is_model_metric(graph, &col.name.name) {
+                    return Err(model_scoped(&col.name.name));
+                }
+                return Err(e);
+            }
         };
         // A derived table is read by column name: dimensions default to the bare
         // field name (`customer_id`), not `orders.customer_id`.
@@ -296,7 +395,16 @@ pub(super) fn parse_stage(
             for e in &gb.expressions {
                 let col = as_column(e)
                     .ok_or_else(|| unsupported("Layer 2 GROUP BY must name dimension columns"))?;
-                gb_dims.push(resolve_dim(graph, scope, col)?);
+                gb_dims.push(resolve_dim(graph, scope, col).map_err(|e| {
+                    if bare_measure(graph, scope, col).is_some() {
+                        Error::Request(format!(
+                            "Layer 2 GROUP BY cannot name measure `{}`; group by dimensions only",
+                            col.name.name
+                        ))
+                    } else {
+                        e
+                    }
+                })?);
             }
             let mut want = dimensions.clone();
             want.sort();
@@ -369,7 +477,7 @@ pub(super) fn parse_stage(
         measure_outputs,
         dim_labels,
         derived: parsed_from.derived,
-        scope_aliases,
+        unevaluated,
     })
 }
 
@@ -378,9 +486,9 @@ fn bare_field(dim: &str) -> &str {
     dim.split_once('.').map_or(dim, |(_, f)| f)
 }
 
-/// A bare column that names a measure, not a field: the unevaluated-measure
-/// pass-through of spec §7.7, which Layer 2 does not implement.
-fn unevaluated_measure(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Option<Error> {
+/// A bare column that names a dataset-scoped measure, not a field: the dataset
+/// it is a measure of (the unevaluated-measure pass-through of spec §7.7).
+fn bare_measure(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Option<usize> {
     let name = &col.name.name;
     let hit = scope.bindings.iter().find(|b| {
         let ds = &graph.datasets[b.dataset].name;
@@ -394,10 +502,20 @@ fn unevaluated_measure(graph: &SemanticGraph, scope: &QueryScope, col: &Column) 
                         || m.name.eq_ignore_ascii_case(&format!("{ds}.{name}")))
             })
     })?;
-    Some(unsupported(format!(
-        "Layer 2 unevaluated measure `{name}` on `{}`: passing a measure through a select list for a later AGG() (relational_semantics §7.7) is not supported; evaluate it with AGG({name}) AS <alias>",
-        graph.datasets[hit.dataset].name
-    )))
+    Some(hit.dataset)
+}
+
+fn is_model_metric(graph: &SemanticGraph, name: &str) -> bool {
+    graph
+        .metrics
+        .iter()
+        .any(|m| m.owner.is_none() && m.name.eq_ignore_ascii_case(name))
+}
+
+fn model_scoped(measure: &str) -> Error {
+    Error::Request(format!(
+        "`{measure}` is a model-scoped metric; Layer 2 only exposes dataset-scoped metrics as measures (relational_semantics §10.3)"
+    ))
 }
 
 fn apply_consumer_joins(
@@ -594,8 +712,7 @@ fn parse_measure_formula(
 ) -> Result<Option<L2Formula>> {
     let e = unwrap_paren(e);
     if let Some(measure) = take_agg(e)? {
-        let metric = resolve_measure(graph, scope, measure)?;
-        return Ok(Some(L2Formula::Agg(metric)));
+        return Ok(Some(resolve_agg(graph, scope, measure)?));
     }
     if as_column(e).is_some() {
         return Ok(None);
@@ -652,7 +769,7 @@ fn parse_formula_or_agg(
 ) -> Result<L2Formula> {
     let e = unwrap_paren(e);
     if let Some(measure) = take_agg(e)? {
-        return Ok(L2Formula::Agg(resolve_measure(graph, scope, measure)?));
+        return resolve_agg(graph, scope, measure);
     }
     parse_formula(graph, scope, e)
 }
@@ -696,7 +813,7 @@ fn unsupported(msg: impl Into<String>) -> Error {
 struct ParsedFrom {
     scope: QueryScope,
     consumer_joins: Vec<ConsumerJoin>,
-    derived: Vec<DerivedSpec>,
+    pub derived: Vec<DerivedSpec>,
 }
 
 /// `(SELECT ...) alias` as a `FROM` / `JOIN` item: the inner `SELECT` and its alias.
@@ -750,6 +867,7 @@ fn parse_from_clause(
     let mut scope = QueryScope {
         bindings: vec![],
         derived: vec![],
+        derived_outs: vec![],
         outer: outer.to_vec(),
     };
     let mut derived_specs: Vec<DerivedSpec> = Vec::new();
@@ -796,6 +914,7 @@ fn parse_from_clause(
                 .cloned()
                 .collect(),
             derived: scope.derived.clone(),
+            derived_outs: vec![],
             outer: scope.outer.clone(),
         };
         let rel = match_relationship(graph, &join_scope, &pairs)?;
@@ -1237,6 +1356,47 @@ fn as_column(e: &Expression) -> Option<&Column> {
     }
 }
 
+/// The argument of `AGG(...)`: a dataset measure, or a derived table's
+/// unevaluated measure column `AGG(t.m)` (§7.7), which stands for the metric it
+/// passes through, or for the leaves of its `TO MEASURE` formula.
+fn resolve_agg(graph: &SemanticGraph, scope: &QueryScope, arg: &Expression) -> Result<L2Formula> {
+    if let Some(col) = as_column(arg) {
+        if let Some(t) = &col.table {
+            if let Some((alias, outs)) = scope
+                .derived_outs
+                .iter()
+                .find(|(a, _)| a.eq_ignore_ascii_case(&t.name))
+            {
+                let name = &col.name.name;
+                let out = outs
+                    .iter()
+                    .find(|o| o.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        Error::Request(format!(
+                            "derived table `{alias}` has no column `{name}`; it has: {}",
+                            outs.iter()
+                                .map(|o| o.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    })?;
+                return match &out.kind {
+                    OutKind::UnevaluatedMeasure { metric, formula } => {
+                        Ok(formula.clone().unwrap_or_else(|| L2Formula::Agg(metric.clone())))
+                    }
+                    OutKind::EvaluatedMeasure => Err(unsupported(format!(
+                        "Layer 2 AGG() applies to measures; `{alias}.{name}` of a derived table is already evaluated: use it as a plain column (outer AVG/SUM/...) or pass the measure through unevaluated"
+                    ))),
+                    OutKind::Field => Err(Error::Request(format!(
+                        "AGG() argument `{alias}.{name}` is a dimension of the derived table, not a measure"
+                    ))),
+                };
+            }
+        }
+    }
+    Ok(L2Formula::Agg(resolve_measure(graph, scope, arg)?))
+}
+
 fn resolve_measure(graph: &SemanticGraph, scope: &QueryScope, arg: &Expression) -> Result<String> {
     let col = as_column(arg).ok_or_else(|| {
         Error::Request(
@@ -1415,7 +1575,12 @@ struct OrderCtx<'a> {
 
 fn order_field(ctx: &OrderCtx<'_>, e: &Expression) -> Result<String> {
     if let Some(arg) = take_agg(e)? {
-        return resolve_measure(ctx.graph, ctx.scope, arg);
+        return match resolve_agg(ctx.graph, ctx.scope, arg)? {
+            L2Formula::Agg(m) => Ok(m),
+            _ => Err(unsupported(
+                "Layer 2 ORDER BY AGG(...) of a TO MEASURE column: select it with an alias and ORDER BY the alias",
+            )),
+        };
     }
     if let Some(col) = as_column(e) {
         if col.table.is_none() {
