@@ -138,7 +138,12 @@ pub fn compile(graph: &SemanticGraph, request: &Request, opts: &Options) -> Resu
         ..Default::default()
     };
     let plan = plan::plan(graph, request, &mut ctx)?;
-    let ast = lower::lower(graph, &plan, &mut ctx)?;
+    let mut ast = lower::lower(graph, &plan, &mut ctx)?;
+    // Ossie requires FILTER in expressions; engines MAY rewrite to CASE. Keep
+    // native FILTER when the target supports it; otherwise lower for portability.
+    if !dialect::supports_aggregate_filter(opts.target) {
+        ast = graph::lower_filters(ast)?;
+    }
     let ast = match opts.target {
         Some(target) => dialect::adapt(ast, target, &plan)?,
         None => ast,

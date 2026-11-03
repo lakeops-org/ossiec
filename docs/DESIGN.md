@@ -35,7 +35,7 @@ YAML ──load──► Model ──bind──► SemanticGraph ──plan(Requ
 - **Choosing a variant**, per compile: the `prefer_dialect` entry if there is one, then portable, then ANSI, then the first vendor entry. If the chosen variants need two different vendor dialects, the request fails; one statement has one source dialect.
 - **Names** follow ANSI identifier rules (spec "Name Resolution"): bare identifiers match case-insensitively, quoted ones exactly. Field expressions see source columns. Dataset-scoped metrics see their own fields, unqualified. Model-scoped metrics see `dataset.field`. A bare reference in a model-scoped metric is accepted with a warning when exactly one dataset has that field, because the compliance fixtures use that form.
 - **Metrics are split** into aggregate *terms* and an *outer* expression over them. `SUM(a.x) / NULLIF(COUNT(DISTINCT b.y), 0)` becomes two terms and `t0 / NULLIF(t1, 0)`. Each term's field references are replaced by the field's SQL, qualified by its dataset alias (polyglot adds parentheses by precedence).
-- **`FILTER (WHERE p)` is lowered** to `CASE WHEN p THEN x END` inside the aggregate. The expression language allows this rewrite, and several engines (StarRocks, MySQL, ClickHouse, Redshift) don't support `FILTER`.
+- **`FILTER (WHERE p)` stays on the bound AST** until compile. Targets that run standard aggregate FILTER (DuckDB, Postgres, Trino, Athena, Databricks) keep it; others get the allowed rewrite to `CASE WHEN p THEN x END` (StarRocks, MySQL, ClickHouse, Redshift, BigQuery, Snowflake, and `target: None`).
 - **Window metrics** are split differently. Each window function is set aside first, so its own aggregate (the outer `SUM` of `SUM(SUM(x)) OVER (…)`) stays part of the window. Aggregates inside it become ordinary terms. Fields it names outside an aggregate (`PARTITION BY store.id`, `ORDER BY date.d`) become *dimension references*. Window functions can't be nested.
 
 ## Planning
@@ -116,8 +116,6 @@ ossiec keeps one shared generator and a thin per-dialect layer, [`src/dialect/`]
 | Postgres, ClickHouse, StarRocks, MySQL: backslashes in `LIKE` patterns doubled (shared helper in `dialect/mod.rs`) | `like_with_a_backslash`: these engines escape with `\` by default; SQL without `ESCAPE` (Trino, DuckDB) treats it as an ordinary character |
 | MySQL: string dimensions and filters `COLLATE utf8mb4_bin` | `string_ordering` (case-insensitive grouping merged `Ada` and `ada`) and `case_sensitive_filter` (`'ada'` matched `Ada`) |
 | MySQL: `AVG` argument cast to `DOUBLE` | `averages_of_integers_and_one_side_values`: `AVG` of integers rounds to 4 decimals |
-| MySQL: `NULLS FIRST/LAST` → leading `CASE WHEN x IS NULL THEN 1 ELSE 0 END` key | TPC-DS `q12`: MySQL has no `NULLS LAST` syntax and polyglot drops it ([polyglot#515](https://github.com/tobilg/polyglot/issues/515)) |
-| ClickHouse: `CAST(NULL AS T)` → `CAST(NULL AS Nullable(T))` (`finish`) | `unmatched_products_included`: `Cannot convert NULL to a non-nullable type`; polyglot wraps some types only ([polyglot#514](https://github.com/tobilg/polyglot/issues/514)) |
 
 Engine-neutral rules that came out of the same tests live in binding and planning instead:
 - **Groups never depend on which measures are asked for** (spec §8.4, closure). With dimensions, the base part always runs, even when it computes no terms, so groups come from every joined row. Evidence: `one_side_measure_dedup`, which used to drop a region whose orders had no product.
