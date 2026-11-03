@@ -130,24 +130,23 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
         Some(w) => where_to_filters(graph, dataset, &ds_name, alias.as_deref(), &w.this)?,
     };
 
+    let order_ctx = OrderCtx {
+        graph,
+        dataset,
+        ds_name: &ds_name,
+        table_alias: alias.as_deref(),
+        outputs: &outputs,
+        metrics: &metrics,
+        dimensions: &dimensions,
+    };
     let order_by = match &sel.order_by {
         None => vec![],
         Some(ob) => ob
             .expressions
             .iter()
             .map(|o| {
-                let field = order_field(
-                    graph,
-                    dataset,
-                    &ds_name,
-                    alias.as_deref(),
-                    &o.this,
-                    &outputs,
-                    &metrics,
-                    &dimensions,
-                )?;
                 Ok(OrderBy {
-                    field,
+                    field: order_field(&order_ctx, &o.this)?,
                     direction: if o.desc {
                         Direction::Desc
                     } else {
@@ -538,39 +537,42 @@ fn limit_u64(e: &Expression) -> Result<u64> {
     }
 }
 
-fn order_field(
-    graph: &SemanticGraph,
+struct OrderCtx<'a> {
+    graph: &'a SemanticGraph,
     dataset: usize,
-    ds_name: &str,
-    table_alias: Option<&str>,
-    e: &Expression,
-    outputs: &[(String, String)],
-    metrics: &[String],
-    dimensions: &[String],
-) -> Result<String> {
+    ds_name: &'a str,
+    table_alias: Option<&'a str>,
+    outputs: &'a [(String, String)],
+    metrics: &'a [String],
+    dimensions: &'a [String],
+}
+
+fn order_field(ctx: &OrderCtx<'_>, e: &Expression) -> Result<String> {
     if let Some(arg) = take_agg(e)? {
-        return resolve_measure(graph, dataset, ds_name, table_alias, arg);
+        return resolve_measure(ctx.graph, ctx.dataset, ctx.ds_name, ctx.table_alias, arg);
     }
     if let Some(col) = as_column(e) {
         if col.table.is_none() {
             let n = &col.name.name;
-            if let Some((_, req)) = outputs.iter().find(|(label, _)| label == n) {
+            if let Some((_, req)) = ctx.outputs.iter().find(|(label, _)| label == n) {
                 return Ok(req.clone());
             }
-            if let Some(m) = metrics
+            if let Some(m) = ctx
+                .metrics
                 .iter()
                 .find(|m| m.as_str() == n || m.ends_with(&format!(".{n}")))
             {
                 return Ok(m.clone());
             }
-            if let Some(d) = dimensions
+            if let Some(d) = ctx
+                .dimensions
                 .iter()
                 .find(|d| d.as_str() == n || d.ends_with(&format!(".{n}")))
             {
                 return Ok(d.clone());
             }
         }
-        return resolve_dim(graph, dataset, ds_name, table_alias, col);
+        return resolve_dim(ctx.graph, ctx.dataset, ctx.ds_name, ctx.table_alias, col);
     }
     Err(unsupported(
         "Layer 2 ORDER BY must name a selected dimension, measure, or AGG(...)",
