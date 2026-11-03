@@ -1,6 +1,7 @@
 //! Ossie Layer 2 `AGG(measure)` frontend (Appendix A.1–A.6, §7.6 join kinds,
 //! role-playing dimensions, includeUnmatched).
 
+mod common;
 
 use common::{
     duckdb, duckdb_rows, A2_SHOP, A2_SHOP_REF, A3_SHOP, A3_SHOP_REF, LAYER2_NESTED_CASES,

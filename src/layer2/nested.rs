@@ -31,8 +31,7 @@ use polyglot_sql::{generate, DialectType, Expression};
 use super::{
     apply_consumer_joins, apply_select_formulas, parse_stage_from, parse_stage_prep,
     parse_top_select, planned_alias_on_leg, pragma_include_unmatched, protect_inflating_joins,
-    rename_consumer_outputs,
-    stage_aliases, unsupported, L2Formula, StageCfg,
+    rename_consumer_outputs, stage_aliases, unsupported, L2Formula, StageCfg,
 };
 use crate::graph::{Ctx, SemanticGraph};
 use crate::plan::{self, DerivedJoin, Request};
@@ -436,8 +435,7 @@ impl Compiler<'_> {
                     let attach = match spec.attach_role {
                         Some(r) => format!(
                             "{} via `{}`",
-                            graph.datasets[spec.attach_ds].name,
-                            graph.rels[r].name
+                            graph.datasets[spec.attach_ds].name, graph.rels[r].name
                         ),
                         None => graph.datasets[spec.attach_ds].name.clone(),
                     };

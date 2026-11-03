@@ -1021,7 +1021,7 @@ pub(super) fn planned_alias_on_leg(
             continue;
         }
         if let Some(r) = role {
-            if s.rel == r {
+            if s.rel == Some(r) {
                 return Some(s.to_alias.clone());
             }
             continue;
@@ -1327,6 +1327,7 @@ pub(super) fn parse_from_clause(
                     select: select.clone(),
                     kind,
                     attach_ds,
+                    attach_role: None,
                     from_fields: vec![],
                     cols: vec![],
                     null_safe: false,
@@ -1371,6 +1372,7 @@ pub(super) fn parse_from_clause(
                 attach_alias: attach.alias.clone(),
                 other_ds: right_ds,
                 other_alias: right_binding.alias.clone(),
+                attach_role: None,
             });
             scope.bindings.push(right_binding);
             continue;
