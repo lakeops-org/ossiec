@@ -148,16 +148,40 @@ pub(crate) fn finish_compile(
     mut ctx: graph::Ctx,
     opts: &Options,
 ) -> Result<Compiled> {
-    let mut ast = lower::lower(graph, &plan, &mut ctx)?;
+    let ast = lower_stage(graph, &plan, &mut ctx, opts)?;
+    render_compiled(graph, serde_json::json!(request), ast, ctx, opts)
+}
+
+/// One plan to its dialect-adapted AST: lower, FILTER lowering, per-engine rules.
+/// Layer 2 nesting runs this once per stage (each with its own plan) and renders
+/// once, over the substituted whole.
+pub(crate) fn lower_stage(
+    graph: &SemanticGraph,
+    plan: &plan::LogicalPlan,
+    ctx: &mut graph::Ctx,
+    opts: &Options,
+) -> Result<polyglot_sql::Expression> {
+    let mut ast = lower::lower(graph, plan, ctx)?;
     // Ossie requires FILTER in expressions; engines MAY rewrite to CASE. Keep
     // native FILTER when the target supports it; otherwise lower for portability.
     if !dialect::supports_aggregate_filter(opts.target) {
         ast = graph::lower_filters(ast)?;
     }
-    let ast = match opts.target {
-        Some(target) => dialect::adapt(ast, target, &plan)?,
-        None => ast,
-    };
+    match opts.target {
+        Some(target) => dialect::adapt(ast, target, plan),
+        None => Ok(ast),
+    }
+}
+
+/// Render a finished AST. `request` is the part of the identity that varies
+/// per query: a Layer 3 request, or normalized Layer 2 SQL.
+pub(crate) fn render_compiled(
+    graph: &SemanticGraph,
+    request: serde_json::Value,
+    ast: polyglot_sql::Expression,
+    ctx: graph::Ctx,
+    opts: &Options,
+) -> Result<Compiled> {
     let (source_name, source) = ctx.source_dialect()?;
     let target = opts.target.unwrap_or(source);
     let mut sql = sql::render(&ast, source, target, opts.pretty)?;

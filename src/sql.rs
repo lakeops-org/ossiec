@@ -153,3 +153,55 @@ pub(crate) fn render(
         .map_err(|e| Error::Unsupported(format!("cannot render SQL for {target:?}: {e}")))?;
     Ok(out.join(";\n"))
 }
+
+/// `table.name`, both quoted: a column of a derived table the compiler named itself.
+pub(crate) fn qualified_quoted_col(table: &str, name: &str) -> Expression {
+    let mut e = quoted_col(name);
+    if let Expression::Column(c) = &mut e {
+        c.table = Some(Identifier::quoted(table));
+    }
+    e
+}
+
+/// A table reference named `placeholder` under `alias`: stands in for a derived
+/// table until [`substitute_relation`] swaps in the compiled inner query.
+pub(crate) fn placeholder_relation(placeholder: &str, alias: &str) -> Expression {
+    let mut t = polyglot_sql::expressions::TableRef::new(placeholder);
+    t.alias = Some(Identifier::quoted(alias));
+    Expression::Table(Box::new(t))
+}
+
+/// Replace every placeholder relation `placeholder` in `ast` by `(inner) AS alias`.
+/// The alias is the one the placeholder was given.
+pub(crate) fn substitute_relation(
+    ast: Expression,
+    placeholder: &str,
+    inner: &Expression,
+) -> Result<Expression> {
+    transform(ast, &|e| {
+        Ok(Some(match e {
+            Expression::Table(t) if t.schema.is_none() && t.name.name == placeholder => {
+                let alias = t
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| Identifier::quoted(placeholder));
+                derived(inner.clone(), alias)
+            }
+            other => other,
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// `a IS NOT DISTINCT FROM b` where `native`, else the portable
+/// `(a = b OR (a IS NULL AND b IS NULL))`.
+pub(crate) fn null_safe_eq(a: Expression, b: Expression, native: bool) -> Result<Expression> {
+    let mut t = Tpl::new();
+    let (x, y) = (t.e(a), t.e(b));
+    t.push(&if native {
+        format!("{x} IS NOT DISTINCT FROM {y}")
+    } else {
+        format!("({x} = {y} OR ({x} IS NULL AND {y} IS NULL))")
+    });
+    t.build()
+}

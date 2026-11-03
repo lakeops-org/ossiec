@@ -18,7 +18,9 @@ use polyglot_sql::expressions::Identifier;
 use polyglot_sql::{get_columns, transform, DialectType, Expression};
 
 use crate::graph::{Ctx, SemanticGraph, TERM};
-use crate::plan::{Direction, JoinKind, JoinStep, Leg, LogicalPlan, Nulls, Strategy, OUT_DIM};
+use crate::plan::{
+    DerivedJoin, Direction, JoinKind, JoinStep, Leg, LogicalPlan, Nulls, Strategy, OUT_DIM,
+};
 use crate::sql::{self, Tpl};
 use crate::Result;
 
@@ -165,12 +167,14 @@ enum Part {
     Dedup { grain: usize },
 }
 
-/// `FROM <start> <kind> JOIN ... ON ...` for `steps`, with every alias passed
-/// through `rename`. Returns the SQL text (with placeholders) to append to `t`.
+/// `FROM <start> <kind> JOIN ... ON ...` for `steps` then the leg's derived
+/// tables, with every alias passed through `rename`. Returns the SQL text (with
+/// placeholders) to append to `t`.
 fn tree_sql(
     g: &SemanticGraph,
     start: (usize, &str),
     steps: &[&JoinStep],
+    derived: &[DerivedJoin],
     rename: &dyn Fn(&str) -> String,
     t: &mut Tpl,
     ctx: &mut Ctx,
@@ -207,6 +211,34 @@ fn tree_sql(
         };
         out.push_str(&format!(" {kw} {to} ON {}", conds.join(" AND ")));
     }
+    // Derived tables (Layer 2 A.2) come last: their ON reads attach-side
+    // fields, which relationship joins may have just introduced. Every part
+    // (base, stacked, de-duplicated) builds its FROM here, so all get the
+    // same restriction.
+    for d in derived {
+        let rel = t.e(sql::placeholder_relation(&d.rel_placeholder, &d.rel_alias));
+        let conds: Vec<String> = d
+            .from_fields
+            .iter()
+            .zip(&d.rel_cols)
+            .map(|(&(ds, f), col)| {
+                let a = t.e(g.field_sql_as(ds, f, &rename(&d.from_alias), ctx));
+                let b = t.e(sql::qualified_quoted_col(&d.rel_alias, col));
+                if d.null_safe {
+                    // Written out (not `IS NOT DISTINCT FROM`): this stage is
+                    // lowered before its target dialect is consulted.
+                    format!("({a} = {b} OR ({a} IS NULL AND {b} IS NULL))")
+                } else {
+                    format!("{a} = {b}")
+                }
+            })
+            .collect();
+        let kw = match d.kind {
+            JoinKind::Left => "LEFT JOIN",
+            JoinKind::Inner => "INNER JOIN",
+        };
+        out.push_str(&format!(" {kw} {rel} ON {}", conds.join(" AND ")));
+    }
     out
 }
 
@@ -217,6 +249,7 @@ fn leg_sql(g: &SemanticGraph, leg: &Leg, t: &mut Tpl, ctx: &mut Ctx) -> String {
         g,
         (leg.root, &g.datasets[leg.root].name),
         &steps,
+        &leg.derived,
         &|a| a.to_string(),
         t,
         ctx,
@@ -464,6 +497,7 @@ fn unmatched_rows(
         g,
         (grain, &g.datasets[grain].name),
         &steps,
+        &[],
         &rename,
         &mut t,
         ctx,
