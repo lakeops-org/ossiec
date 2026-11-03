@@ -5,10 +5,10 @@ SELECT
   base.t0 - lagInFrame(toNullable(base.t0), 1) OVER (ORDER BY base.d0 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "revenue_change"
 FROM (
   SELECT
-    CAST(dateTrunc('month', "orders".order_date) AS DATE) AS d0,
+    CAST(dateTrunc('month', "orders".order_date) AS Nullable(DATE)) AS d0,
     SUM("orders".amount_cents / 100.0) AS t0
   FROM orders AS "orders"
   GROUP BY
-    CAST(dateTrunc('month', "orders".order_date) AS DATE)
+    CAST(dateTrunc('month', "orders".order_date) AS Nullable(DATE))
 ) AS base
 SETTINGS join_use_nulls = 1

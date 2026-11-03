@@ -116,8 +116,6 @@ ossiec keeps one shared generator and a thin per-dialect layer, [`src/dialect/`]
 | Postgres, ClickHouse, StarRocks, MySQL: backslashes in `LIKE` patterns doubled (shared helper in `dialect/mod.rs`) | `like_with_a_backslash`: these engines escape with `\` by default; SQL without `ESCAPE` (Trino, DuckDB) treats it as an ordinary character |
 | MySQL: string dimensions and filters `COLLATE utf8mb4_bin` | `string_ordering` (case-insensitive grouping merged `Ada` and `ada`) and `case_sensitive_filter` (`'ada'` matched `Ada`) |
 | MySQL: `AVG` argument cast to `DOUBLE` | `averages_of_integers_and_one_side_values`: `AVG` of integers rounds to 4 decimals |
-| MySQL: `NULLS FIRST/LAST` → leading `CASE WHEN x IS NULL THEN 1 ELSE 0 END` key | TPC-DS `q12`: MySQL has no `NULLS LAST` syntax and polyglot drops it ([polyglot#515](https://github.com/tobilg/polyglot/issues/515)) |
-| ClickHouse: `CAST(NULL AS T)` → `CAST(NULL AS Nullable(T))` (`finish`) | `unmatched_products_included`: `Cannot convert NULL to a non-nullable type`; polyglot wraps some types only ([polyglot#514](https://github.com/tobilg/polyglot/issues/514)) |
 
 Engine-neutral rules that came out of the same tests live in binding and planning instead:
 - **Groups never depend on which measures are asked for** (spec §8.4, closure). With dimensions, the base part always runs, even when it computes no terms, so groups come from every joined row. Evidence: `one_side_measure_dedup`, which used to drop a region whose orders had no product.
