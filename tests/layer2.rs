@@ -671,17 +671,70 @@ fn a2_refuses_set_operator_and_distinct_inside_derived_table() {
 }
 
 #[test]
-fn a2_refuses_derived_join_over_independent_facts() {
+fn a2_derived_join_restricts_only_the_fact_that_hosts_it() {
+    // Top two customers by order amount are 1 and 2 (both EU; US customer 3 is
+    // out). The join attaches to `orders` only, so ticket counts stay complete
+    // and neither measure is repeated by the other fact's rows.
     let g = two_facts_graph();
     let sql = "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) \
                FROM customers c \
                LEFT JOIN orders o ON o.customer_id = c.id \
                LEFT JOIN tickets t ON t.customer_id = c.id \
-               JOIN (SELECT customer_id, AGG(order_amt) AS n FROM orders GROUP BY customer_id) d \
+               JOIN (SELECT customer_id, AGG(order_amt) AS n FROM orders \
+                     GROUP BY customer_id ORDER BY n DESC, customer_id LIMIT 2) d \
                  ON o.customer_id = d.customer_id \
                GROUP BY c.region";
-    let m = unsupported_msg(ossiec::compile_layer2(&g, sql, &two_facts_opts()).unwrap_err());
-    assert!(m.contains("independent facts"), "{m}");
+    let c = ossiec::compile_layer2(&g, sql, &two_facts_opts()).unwrap();
+    let db = two_facts_db();
+    let got = sorted(duckdb_rows(&db, &c.sql));
+    let want = sorted(duckdb_rows(
+        &db,
+        "SELECT region, MAX(order_amt), COALESCE(MAX(ticket_count), 0) FROM (
+            SELECT c.region AS region, SUM(o.amount) AS order_amt, NULL::BIGINT AS ticket_count
+            FROM orders o
+            LEFT JOIN customers c ON o.customer_id = c.id
+            JOIN (SELECT customer_id FROM orders GROUP BY customer_id
+                  ORDER BY SUM(amount) DESC, customer_id LIMIT 2) d
+              ON o.customer_id = d.customer_id
+            GROUP BY c.region
+            UNION ALL
+            SELECT c.region, NULL, COUNT(*)
+            FROM tickets t
+            LEFT JOIN customers c ON t.customer_id = c.id
+            GROUP BY c.region
+         ) GROUP BY region",
+    ));
+    assert_eq!(got, want, "{}", c.sql);
+    // EU 60 / 3 tickets; US and APAC keep their tickets and contribute no orders.
+    let row = |region: &str, amt: &str, tickets: &str| -> Vec<String> {
+        vec![region.into(), amt.into(), tickets.into()]
+    };
+    assert_eq!(
+        got,
+        vec![
+            row("APAC", "NULL", "1.000000"),
+            row("EU", "60.000000", "3.000000"),
+            row("US", "NULL", "3.000000"),
+        ]
+    );
+    // One tree would fan orders through tickets: customer 2's amount is doubled
+    // (EU orders 90) and customer 1's ticket is doubled (EU tickets 4), and the
+    // inner join drops US and APAC.
+    let naive = sorted(duckdb_rows(
+        &db,
+        "SELECT c.region, SUM(o.amount), COUNT(t.id)
+         FROM customers c
+         LEFT JOIN orders o ON o.customer_id = c.id
+         LEFT JOIN tickets t ON t.customer_id = c.id
+         JOIN (SELECT customer_id FROM orders GROUP BY customer_id
+               ORDER BY SUM(amount) DESC, customer_id LIMIT 2) d
+           ON o.customer_id = d.customer_id
+         GROUP BY c.region",
+    ));
+    assert_ne!(
+        got, naive,
+        "derived join must not inflate across facts: {naive:?}"
+    );
 }
 
 #[test]
