@@ -178,17 +178,29 @@ fn tree_sql(
     let mut out = format!(" FROM {}", t.e(g.source_as(start.0, &rename(start.1))));
     for step in steps {
         let r = &g.rels[step.rel];
-        let to = t.e(g.source_as(step.to, &rename(&step.to_alias)));
-        let conds: Vec<String> = r
-            .from_fields
-            .iter()
-            .zip(&r.to_fields)
-            .map(|(&ff, &tf)| {
-                let a = g.field_sql_as(r.from, ff, &rename(&step.from_alias), ctx);
-                let b = g.field_sql_as(step.to, tf, &rename(&step.to_alias), ctx);
-                format!("{} = {}", t.e(a), t.e(b))
-            })
-            .collect();
+        let joined_ds = if step.reverse { r.from } else { step.to };
+        let to = t.e(g.source_as(joined_ds, &rename(&step.to_alias)));
+        let conds: Vec<String> = if step.reverse {
+            r.from_fields
+                .iter()
+                .zip(&r.to_fields)
+                .map(|(&ff, &tf)| {
+                    let a = g.field_sql_as(r.to, tf, &rename(&step.from_alias), ctx);
+                    let b = g.field_sql_as(r.from, ff, &rename(&step.to_alias), ctx);
+                    format!("{} = {}", t.e(a), t.e(b))
+                })
+                .collect()
+        } else {
+            r.from_fields
+                .iter()
+                .zip(&r.to_fields)
+                .map(|(&ff, &tf)| {
+                    let a = g.field_sql_as(r.from, ff, &rename(&step.from_alias), ctx);
+                    let b = g.field_sql_as(step.to, tf, &rename(&step.to_alias), ctx);
+                    format!("{} = {}", t.e(a), t.e(b))
+                })
+                .collect()
+        };
         let kw = match step.kind {
             JoinKind::Left => "LEFT JOIN",
             JoinKind::Inner => "INNER JOIN",

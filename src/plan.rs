@@ -190,6 +190,8 @@ pub(crate) struct JoinStep {
     pub to: usize,
     pub to_alias: String,
     pub kind: JoinKind,
+    /// Consumer joined along `rel.from` while the attach side is `rel.to` (fan-out).
+    pub reverse: bool,
 }
 
 /// A join tree rooted at one fact. Requests over independent facts have one
@@ -756,6 +758,7 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
                         to: rel.to,
                         to_alias: g.datasets[rel.to].name.clone(),
                         kind: JoinKind::Left,
+                        reverse: false,
                     },
                 )),
             }
@@ -785,6 +788,7 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
                         to: ds,
                         to_alias,
                         kind: JoinKind::Left,
+                        reverse: false,
                     },
                 ));
             }

@@ -1,21 +1,29 @@
 //! Ossie Layer 2 frontend: consumer SQL with `AGG(measure)` → Layer 3 request.
 //!
-//! Spec: `relational_semantics.md` (draft). Appendix **A.1** (single `FROM` relation)
-//! and **A.5–A.6** (consumer joins along model relationships, `INNER` vs `LEFT`)
-//! translate to the existing [`Request`] planner; join kinds are patched onto the
-//! planned join path before lowering. Appendix **A.4** (measures from independent
-//! facts sharing dimensions) maps to the same multi-leg [`Request`] planner.
+//! Spec: `relational_semantics.md` (draft). Appendix **A.1** (single `FROM` relation),
+//! **A.4** (multi-fact measures sharing dimensions, plus `AGG` arithmetic in the
+//! select list), and **A.5–A.6** (consumer joins along model relationships,
+//! including unused many→one and reverse fan-out, with `INNER` vs `LEFT`) translate
+//! to the existing [`Request`] planner. [`to_request`] / [`layer2_to_request`] expose
+//! only **leaf** measures referenced inside `AGG(...)`, not composed output names.
 //! Subqueries and other join forms (A.2–A.3, A.7, `RIGHT`/`FULL`/`CROSS`/`ASOF`,
 //! …) stay [`Error::Unsupported`].
 //!
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
 
-use polyglot_sql::expressions::{Column, Join, JoinKind as SqlJoinKind, Literal, TableRef};
+use std::collections::HashMap;
+
+use polyglot_sql::builder::{func, lit, Expr};
+use polyglot_sql::expressions::{
+    BinaryOp, Column, Join, JoinKind as SqlJoinKind, Literal, TableRef,
+};
 use polyglot_sql::{parse_one, DialectType, Expression};
 
-use crate::graph::SemanticGraph;
-use crate::plan::{self, Direction, Filter, JoinKind, Nulls, Op, OrderBy, Request};
+use crate::graph::{self, SemanticGraph};
+use crate::plan::{
+    self, Direction, Filter, JoinKind, JoinStep, LogicalPlan, Nulls, Op, OrderBy, Request, Strategy,
+};
 use crate::{finish_compile, Compiled, Error, Options, Result};
 
 /// Compile a Layer 2 SQL query (`AGG(measure)` over model relations) to SQL.
@@ -26,8 +34,30 @@ pub fn compile_layer2(graph: &SemanticGraph, sql: &str, opts: &Options) -> Resul
         ..Default::default()
     };
     let mut logical = plan::plan(graph, &parsed.request, &mut ctx)?;
-    patch_consumer_joins(graph, &mut logical, &parsed.consumer_joins)?;
+    apply_consumer_joins(graph, &mut logical, &parsed.consumer_joins, &mut ctx)?;
+    apply_select_formulas(graph, &mut logical, &parsed.measure_outputs)?;
+    remap_layer2_order(&mut logical, &parsed.measure_outputs);
     finish_compile(graph, &parsed.request, logical, ctx, opts)
+}
+
+/// After output names change (aliases, composed metrics), align `ORDER BY` with select labels.
+fn remap_layer2_order(logical: &mut LogicalPlan, measure_outputs: &[(String, L2Formula)]) {
+    let mut rename: HashMap<String, String> = HashMap::new();
+    for (out, formula) in measure_outputs {
+        if let L2Formula::Agg(m) = formula {
+            if out != m {
+                rename.insert(m.clone(), out.clone());
+            }
+        }
+    }
+    if rename.is_empty() {
+        return;
+    }
+    for (name, _, _) in &mut logical.order {
+        if let Some(alias) = rename.get(name) {
+            *name = alias.clone();
+        }
+    }
 }
 
 /// Translate Layer 2 SQL into a Layer 3 [`Request`] (join kinds are not represented).
@@ -37,13 +67,32 @@ pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
 
 struct Layer2Parsed {
     request: Request,
-    /// Join kinds from the consumer `FROM` / `JOIN` list (Appendix A.6).
+    /// Join kinds from the consumer `FROM` / `JOIN` list (Appendix A.5–A.6).
     consumer_joins: Vec<ConsumerJoin>,
+    /// Composed select-list measures: (output column name, formula tree).
+    measure_outputs: Vec<(String, L2Formula)>,
 }
 
 struct ConsumerJoin {
     rel: usize,
     kind: JoinKind,
+    reverse: bool,
+    attach_ds: usize,
+    attach_alias: String,
+    other_ds: usize,
+    other_alias: String,
+}
+
+/// Select-list expression whose leaves are bare `AGG(measure)` references.
+#[derive(Clone)]
+enum L2Formula {
+    Agg(String),
+    Add(Box<L2Formula>, Box<L2Formula>),
+    Sub(Box<L2Formula>, Box<L2Formula>),
+    Mul(Box<L2Formula>, Box<L2Formula>),
+    Div(Box<L2Formula>, Box<L2Formula>),
+    NullIf(Box<L2Formula>, Box<L2Formula>),
+    Lit(serde_json::Value),
 }
 
 /// One dataset in the consumer `FROM` / `JOIN` list and its SQL alias.
@@ -74,36 +123,42 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
     let parsed_from = parse_from_clause(graph, sel.from.as_ref(), &sel.joins)?;
     let scope = &parsed_from.scope;
 
-    let mut metrics = Vec::new();
+    let mut metrics: Vec<String> = Vec::new();
     let mut dimensions = Vec::new();
-    // Select-list label (alias or default) → Layer 3 request field name.
+    let mut measure_outputs = Vec::new();
+    // Select-list label (alias or default) → order-by / output resolution name.
     let mut outputs: Vec<(String, String)> = Vec::new();
 
-    for expr in &sel.expressions {
-        let (inner, out_name) = strip_alias(expr);
-        match take_agg(inner)? {
-            Some(measure) => {
-                let metric = resolve_measure(graph, scope, measure)?;
-                let label = out_name.clone().unwrap_or_else(|| metric.clone());
-                if !metrics.iter().any(|m| m == &metric) {
-                    metrics.push(metric.clone());
+    for (idx, expr) in sel.expressions.iter().enumerate() {
+        let (inner, alias) = strip_alias(expr);
+        if let Some(formula) = parse_measure_formula(graph, scope, inner)? {
+            for leaf in formula_leaves(&formula) {
+                if !metrics.contains(&leaf) {
+                    metrics.push(leaf.clone());
                 }
-                outputs.push((label, metric));
             }
-            None => {
-                let col = as_column(inner).ok_or_else(|| {
-                    unsupported(
-                        "Layer 2 select list may only contain AGG(measure) and dimension columns",
-                    )
-                })?;
-                let dim = resolve_dim(graph, scope, col)?;
-                let label = out_name.unwrap_or_else(|| dim.clone());
-                if !dimensions.iter().any(|d| d == &dim) {
-                    dimensions.push(dim.clone());
-                }
-                outputs.push((label, dim));
-            }
+            let out_name = alias
+                .clone()
+                .unwrap_or_else(|| default_measure_name(&formula, idx));
+            let order_ref = match &formula {
+                L2Formula::Agg(m) => m.clone(),
+                _ => out_name.clone(),
+            };
+            measure_outputs.push((out_name.clone(), formula));
+            outputs.push((out_name.clone(), order_ref));
+            continue;
         }
+        let col = as_column(inner).ok_or_else(|| {
+            unsupported(
+                "Layer 2 select list may only contain AGG(measure) expressions, dimension columns, and + - * / arithmetic on AGG(...)",
+            )
+        })?;
+        let dim = resolve_dim(graph, scope, col)?;
+        let label = alias.unwrap_or_else(|| dim.clone());
+        if !dimensions.iter().any(|d| d == &dim) {
+            dimensions.push(dim.clone());
+        }
+        outputs.push((label, dim));
     }
 
     if metrics.is_empty() && dimensions.is_empty() {
@@ -205,36 +260,297 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
             ..Default::default()
         },
         consumer_joins: parsed_from.consumer_joins,
+        measure_outputs,
     })
 }
 
-fn patch_consumer_joins(
+fn apply_consumer_joins(
     graph: &SemanticGraph,
-    logical: &mut plan::LogicalPlan,
+    logical: &mut LogicalPlan,
     consumer: &[ConsumerJoin],
+    ctx: &mut graph::Ctx,
 ) -> Result<()> {
-    let planned: std::collections::BTreeSet<usize> = logical
-        .legs
-        .iter()
-        .flat_map(|leg| leg.joins.iter().map(|s| s.rel))
-        .collect();
+    let mut added_reverse: Vec<usize> = vec![];
     for cj in consumer {
-        if !planned.contains(&cj.rel) {
-            return Err(unsupported(format!(
-                "Layer 2 join on relationship `{}` is not on the resolved join path; \
-                 Appendix A.5 fan-out or joins the planner does not use need more work",
-                graph.rels[cj.rel].name
-            )));
+        let mut patched = false;
+        for leg in &mut logical.legs {
+            for step in &mut leg.joins {
+                if step.rel == cj.rel {
+                    step.kind = cj.kind;
+                    patched = true;
+                }
+            }
+        }
+        if patched {
+            continue;
+        }
+        let leg_i = consumer_join_leg(graph, logical, cj)?;
+        // ON must use the same aliases `tree_sql` uses for the leg (dataset
+        // name for the root, `to_alias` for prior joins)—not the consumer SQL
+        // alias (`o` vs `orders`).
+        let from_alias = planned_alias_on_leg(graph, &logical.legs[leg_i], cj.attach_ds)
+            .ok_or_else(|| {
+                unsupported(format!(
+                    "Layer 2 join on `{}`: attach dataset `{}` has no planned alias on its leg",
+                    graph.rels[cj.rel].name, graph.datasets[cj.attach_ds].name
+                ))
+            })?;
+        let leg = &mut logical.legs[leg_i];
+        leg.joins.push(JoinStep {
+            rel: cj.rel,
+            from_alias,
+            to: cj.other_ds,
+            to_alias: cj.other_alias.clone(),
+            kind: cj.kind,
+            reverse: cj.reverse,
+        });
+        if cj.reverse {
+            added_reverse.push(leg_i);
         }
     }
-    for leg in &mut logical.legs {
-        for step in &mut leg.joins {
-            if let Some(cj) = consumer.iter().find(|c| c.rel == step.rel) {
-                step.kind = cj.kind;
+    for leg_i in added_reverse {
+        let root = logical.legs[leg_i].root;
+        if graph.datasets[root].primary_key.is_empty() {
+            return Err(unsupported(format!(
+                "Layer 2 fan-out join requires a primary_key on `{}` so measures stay duplicate-free (G2)",
+                graph.datasets[root].name
+            )));
+        }
+        for term in &mut logical.terms {
+            if term.leg != leg_i {
+                continue;
+            }
+            if term.strategy == Strategy::Inline && !term.term.dup_insensitive {
+                ctx.warn(format!(
+                    "FAN_TRAP_RISK: `{}` is computed over `{}` rows de-duplicated by primary key; a `{}` row that belongs to several groups counts in each, so groups do not add up to a grand total",
+                    term.term.key,
+                    graph.datasets[root].name,
+                    graph.datasets[root].name
+                ));
+                term.strategy = Strategy::PkDedup { grain: root };
             }
         }
     }
     Ok(())
+}
+
+fn consumer_join_leg(
+    graph: &SemanticGraph,
+    logical: &LogicalPlan,
+    cj: &ConsumerJoin,
+) -> Result<usize> {
+    for (i, leg) in logical.legs.iter().enumerate() {
+        if leg_hosts_attach(graph, leg, cj.attach_ds, &cj.attach_alias) {
+            return Ok(i);
+        }
+    }
+    Err(unsupported(format!(
+        "Layer 2 join on relationship `{}` cannot attach to the planned query; no leg includes `{}` as `{}`",
+        graph.rels[cj.rel].name,
+        graph.datasets[cj.attach_ds].name,
+        cj.attach_alias
+    )))
+}
+
+fn leg_hosts_attach(
+    graph: &SemanticGraph,
+    leg: &plan::Leg,
+    attach_ds: usize,
+    _attach_alias: &str,
+) -> bool {
+    planned_alias_on_leg(graph, leg, attach_ds).is_some()
+}
+
+/// Alias `lower` will use for `ds` on this leg (`tree_sql` / `leg_sql`).
+fn planned_alias_on_leg(graph: &SemanticGraph, leg: &plan::Leg, ds: usize) -> Option<String> {
+    if leg.root == ds {
+        return Some(graph.datasets[ds].name.clone());
+    }
+    for s in &leg.joins {
+        let joined = if s.reverse {
+            graph.rels[s.rel].from
+        } else {
+            s.to
+        };
+        if joined == ds {
+            return Some(s.to_alias.clone());
+        }
+    }
+    None
+}
+
+fn apply_select_formulas(
+    _graph: &SemanticGraph,
+    logical: &mut LogicalPlan,
+    measure_outputs: &[(String, L2Formula)],
+) -> Result<()> {
+    if measure_outputs.is_empty() {
+        return Ok(());
+    }
+    let metric_outers: HashMap<String, Expression> = logical.outputs.iter().cloned().collect();
+    let mut outputs = Vec::with_capacity(measure_outputs.len());
+    for (name, formula) in measure_outputs {
+        let expr = formula_to_expr(formula, &metric_outers)?;
+        outputs.push((name.clone(), graph::true_division(expr)));
+    }
+    logical.outputs = outputs;
+    Ok(())
+}
+
+fn formula_to_expr(
+    formula: &L2Formula,
+    metrics: &HashMap<String, Expression>,
+) -> Result<Expression> {
+    Ok(match formula {
+        L2Formula::Agg(m) => metrics.get(m).cloned().ok_or_else(|| {
+            Error::Request(format!("internal: missing planned output for metric `{m}`"))
+        })?,
+        L2Formula::Add(l, r) => Expression::Add(Box::new(BinaryOp::new(
+            formula_to_expr(l, metrics)?,
+            formula_to_expr(r, metrics)?,
+        ))),
+        L2Formula::Sub(l, r) => Expression::Sub(Box::new(BinaryOp::new(
+            formula_to_expr(l, metrics)?,
+            formula_to_expr(r, metrics)?,
+        ))),
+        L2Formula::Mul(l, r) => Expression::Mul(Box::new(BinaryOp::new(
+            formula_to_expr(l, metrics)?,
+            formula_to_expr(r, metrics)?,
+        ))),
+        L2Formula::Div(l, r) => Expression::Div(Box::new(BinaryOp::new(
+            formula_to_expr(l, metrics)?,
+            formula_to_expr(r, metrics)?,
+        ))),
+        L2Formula::NullIf(l, r) => func(
+            "NULLIF",
+            [
+                Expr(formula_to_expr(l, metrics)?),
+                Expr(formula_to_expr(r, metrics)?),
+            ],
+        )
+        .into_inner(),
+        L2Formula::Lit(v) => literal_expr(v)?,
+    })
+}
+
+fn literal_expr(v: &serde_json::Value) -> Result<Expression> {
+    match v {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Expression::Literal(Literal::Number(i.to_string()).into()))
+            } else {
+                Ok(Expression::Literal(Literal::Number(n.to_string()).into()))
+            }
+        }
+        serde_json::Value::String(s) => Ok(Expression::Literal(Literal::String(s.clone()).into())),
+        serde_json::Value::Bool(b) => Ok(lit(*b).into_inner()),
+        serde_json::Value::Null => Ok(Expression::Null(polyglot_sql::expressions::Null)),
+        _ => Err(unsupported(
+            "Layer 2 only supports numeric and string literals in AGG expressions",
+        )),
+    }
+}
+
+fn parse_measure_formula(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+) -> Result<Option<L2Formula>> {
+    let e = unwrap_paren(e);
+    if let Some(measure) = take_agg(e)? {
+        let metric = resolve_measure(graph, scope, measure)?;
+        return Ok(Some(L2Formula::Agg(metric)));
+    }
+    if as_column(e).is_some() {
+        return Ok(None);
+    }
+    Ok(Some(parse_formula(graph, scope, e)?))
+}
+
+fn parse_formula(graph: &SemanticGraph, scope: &QueryScope, e: &Expression) -> Result<L2Formula> {
+    let e = unwrap_paren(e);
+    match e {
+        Expression::Add(b) => Ok(L2Formula::Add(
+            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
+            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+        )),
+        Expression::Sub(b) => Ok(L2Formula::Sub(
+            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
+            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+        )),
+        Expression::Mul(b) => Ok(L2Formula::Mul(
+            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
+            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+        )),
+        Expression::Div(b) => Ok(L2Formula::Div(
+            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
+            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+        )),
+        Expression::Function(f)
+            if f.name.eq_ignore_ascii_case("NULLIF") && f.args.len() == 2 =>
+        {
+            Ok(L2Formula::NullIf(
+                Box::new(parse_formula_or_agg(graph, scope, &f.args[0])?),
+                Box::new(parse_formula_or_agg(graph, scope, &f.args[1])?),
+            ))
+        }
+        Expression::Literal(l) => {
+            let v = literal_json(&Expression::Literal(l.clone())).ok_or_else(|| {
+                unsupported("Layer 2 AGG expressions only support numeric literals")
+            })?;
+            Ok(L2Formula::Lit(v))
+        }
+        Expression::Column(_) => Err(unsupported(
+            "Layer 2 measure expressions must use AGG(measure) leaves, not bare columns",
+        )),
+        _ => Err(unsupported(
+            "Layer 2 AGG expressions allow + - * /, parentheses, numeric literals, and NULLIF(...); other functions are not supported",
+        )),
+    }
+}
+
+fn parse_formula_or_agg(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+) -> Result<L2Formula> {
+    let e = unwrap_paren(e);
+    if let Some(measure) = take_agg(e)? {
+        return Ok(L2Formula::Agg(resolve_measure(graph, scope, measure)?));
+    }
+    parse_formula(graph, scope, e)
+}
+
+fn unwrap_paren(e: &Expression) -> &Expression {
+    match e {
+        Expression::Paren(p) => unwrap_paren(&p.this),
+        other => other,
+    }
+}
+
+fn formula_leaves(f: &L2Formula) -> Vec<String> {
+    match f {
+        L2Formula::Agg(m) => vec![m.clone()],
+        L2Formula::Add(l, r)
+        | L2Formula::Sub(l, r)
+        | L2Formula::Mul(l, r)
+        | L2Formula::Div(l, r)
+        | L2Formula::NullIf(l, r) => {
+            let mut v = formula_leaves(l);
+            v.extend(formula_leaves(r));
+            v.sort();
+            v.dedup();
+            v
+        }
+        L2Formula::Lit(_) => vec![],
+    }
+}
+
+fn default_measure_name(f: &L2Formula, idx: usize) -> String {
+    match f {
+        L2Formula::Agg(m) => m.clone(),
+        _ => format!("__l2_{idx}"),
+    }
 }
 
 fn unsupported(msg: impl Into<String>) -> Error {
@@ -300,7 +616,42 @@ fn parse_from_clause(
                 graph.rels[rel].name
             )));
         }
-        consumer_joins.push(ConsumerJoin { rel, kind });
+        let rel_info = &graph.rels[rel];
+        let from_in_scope = scope.bindings.iter().any(|b| b.dataset == rel_info.from);
+        let to_in_scope = scope.bindings.iter().any(|b| b.dataset == rel_info.to);
+        let forward = from_in_scope && right_ds == rel_info.to;
+        let reverse = to_in_scope && right_ds == rel_info.from;
+        if forward == reverse {
+            return Err(unsupported(format!(
+                "Layer 2 JOIN on `{}` is ambiguous; one side must already be in FROM/JOIN",
+                rel_info.name
+            )));
+        }
+        let (attach_ds, other_ds) = if reverse {
+            (rel_info.to, rel_info.from)
+        } else {
+            (rel_info.from, rel_info.to)
+        };
+        let attach_alias = scope
+            .bindings
+            .iter()
+            .find(|b| b.dataset == attach_ds)
+            .map(|b| b.alias.clone())
+            .ok_or_else(|| {
+                Error::Request(format!(
+                    "Layer 2 JOIN on `{}`: attach dataset `{}` must already be in scope",
+                    rel_info.name, graph.datasets[attach_ds].name
+                ))
+            })?;
+        consumer_joins.push(ConsumerJoin {
+            rel,
+            kind,
+            reverse,
+            attach_ds,
+            attach_alias,
+            other_ds,
+            other_alias: right_binding.alias.clone(),
+        });
         scope.bindings.push(right_binding);
     }
     Ok(ParsedFrom {

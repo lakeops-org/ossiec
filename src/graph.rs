@@ -180,7 +180,7 @@ fn vendor_dialect(name: &str) -> Option<DialectType> {
 /// precision for money), the numerator is cast to DOUBLE. A non-literal
 /// divisor is wrapped in `NULLIF(…, 0)`, so dividing by zero gives NULL on every engine.
 /// Evidence: engine case `integer_ratio`.
-fn true_division(ast: Expression) -> Expression {
+pub(crate) fn true_division(ast: Expression) -> Expression {
     use polyglot_sql::expressions::Literal;
     let fractional = |e: &Expression| matches!(e, Expression::Literal(l) if matches!(l.as_ref(), Literal::Number(n) if n.contains(['.', 'e', 'E'])));
     use polyglot_sql::builder::{cast, func, lit, Expr};

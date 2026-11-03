@@ -9,7 +9,7 @@ Ossie's core spec (`0.2.0.dev0`) defines a **model**: datasets, fields, relation
 | Layer | What | ossiec |
 |---|---|---|
 | 1 | Model and expression language | Read in full |
-| 2 | SQL with `AGG(measure)` (draft, `relational_semantics.md`) | Appendix A.1, A.4 (multi-fact measures sharing dimensions), and consumer joins A.5–A.6 (`INNER`/`LEFT` on model relationships) via `compile_layer2` / `compile-l2` |
+| 2 | SQL with `AGG(measure)` (draft, `relational_semantics.md`) | Appendix A.1; A.4 (multi-fact measures sharing dimensions and `AGG` arithmetic in the select list); A.5 (consumer joins, including unused many→one and reverse fan-out with G2 via `PkDedup`); A.6 (`INNER`/`LEFT`). A.2–A.3 and A.7 not yet. `compile_layer2` / `compile-l2`; `layer2_to_request` exposes leaf measures only. |
 | 3 | Wide table: metrics + dimensions + filters in, joins resolved (draft PR #246) | **This is ossiec's request format** |
 
 The planner follows the same guarantee Layer 2 states (spec §8.3, "G2"): **a measure is aggregated over its own source rows, never over rows a join duplicated.**
