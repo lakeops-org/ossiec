@@ -32,13 +32,14 @@ jobs:
     # Large images (StarRocks all-in-one is ~5 GB); runs after the fast job passes.
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo clean -p libduckdb-sys
-      - run: scripts/engines.sh up
+      # StarRocks all-in-one occasionally needs a cold restart on GitHub runners.
+      - run: scripts/engines.sh up || { scripts/engines.sh down; scripts/engines.sh up; }
       - run: cargo test --test engines -- --ignored
       - run: cargo test --test tpcds -- --ignored --skip trino_sf1_performance
       - if: always()

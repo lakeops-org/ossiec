@@ -134,6 +134,10 @@ fn validation_rules() {
             "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}]}\nmetrics:\n  - {name: m, expression: {sql: COUNT(*)}}\n",
             "must be a dataset-scoped metric",
         ),
+        (
+            "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}, {name: s, expression: {sql: s}}]}\n  - {name: b, source: u, fields: [{name: y, expression: {sql: y}}]}\nmetrics:\n  - {name: m, expression: {sql: \"SUM(a.x) FILTER (WHERE b.y = 1)\"}}\n",
+            "FILTER (WHERE",
+        ),
     ];
     for (body, want) in cases {
         let got = invalid(&format!("{HEAD}{body}"));

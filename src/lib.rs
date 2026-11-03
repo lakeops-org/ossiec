@@ -29,12 +29,14 @@
 
 mod dialect;
 mod graph;
+mod layer2;
 mod lower;
 pub mod model;
 mod plan;
 mod sql;
 
 pub use graph::{bind, Catalog, DimensionDoc, MetricDoc, SemanticGraph};
+pub use layer2::{compile_layer2, to_request as layer2_to_request};
 pub use model::Model;
 pub use plan::{Direction, Filter, MetricFilter, Nulls, Op, OrderBy, Request, TimeGrain};
 pub use polyglot_sql::DialectType;
@@ -136,6 +138,16 @@ pub fn compile(graph: &SemanticGraph, request: &Request, opts: &Options) -> Resu
         ..Default::default()
     };
     let plan = plan::plan(graph, request, &mut ctx)?;
+    finish_compile(graph, request, plan, ctx, opts)
+}
+
+pub(crate) fn finish_compile(
+    graph: &SemanticGraph,
+    request: &Request,
+    plan: plan::LogicalPlan,
+    mut ctx: graph::Ctx,
+    opts: &Options,
+) -> Result<Compiled> {
     let mut ast = lower::lower(graph, &plan, &mut ctx)?;
     // Ossie requires FILTER in expressions; engines MAY rewrite to CASE. Keep
     // native FILTER when the target supports it; otherwise lower for portability.

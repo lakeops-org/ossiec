@@ -18,7 +18,7 @@ use polyglot_sql::expressions::Identifier;
 use polyglot_sql::{get_columns, transform, DialectType, Expression};
 
 use crate::graph::{Ctx, SemanticGraph, TERM};
-use crate::plan::{Direction, JoinStep, Leg, LogicalPlan, Nulls, Strategy, OUT_DIM};
+use crate::plan::{Direction, JoinKind, JoinStep, Leg, LogicalPlan, Nulls, Strategy, OUT_DIM};
 use crate::sql::{self, Tpl};
 use crate::Result;
 
@@ -165,7 +165,7 @@ enum Part {
     Dedup { grain: usize },
 }
 
-/// `FROM <start> LEFT JOIN ... ON ...` for `steps`, with every alias passed
+/// `FROM <start> <kind> JOIN ... ON ...` for `steps`, with every alias passed
 /// through `rename`. Returns the SQL text (with placeholders) to append to `t`.
 fn tree_sql(
     g: &SemanticGraph,
@@ -189,7 +189,11 @@ fn tree_sql(
                 format!("{} = {}", t.e(a), t.e(b))
             })
             .collect();
-        out.push_str(&format!(" LEFT JOIN {to} ON {}", conds.join(" AND ")));
+        let kw = match step.kind {
+            JoinKind::Left => "LEFT JOIN",
+            JoinKind::Inner => "INNER JOIN",
+        };
+        out.push_str(&format!(" {kw} {to} ON {}", conds.join(" AND ")));
     }
     out
 }
