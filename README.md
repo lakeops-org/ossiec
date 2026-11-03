@@ -329,7 +329,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.7 pass-through and query-local `TO MEASURE`. The shop forms of A.2/A.3 also run in the engine tier (`layer2_nested_*`). |
+| [`layer2`](tests/layer2.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.7 pass-through and query-local `TO MEASURE`. The shop forms of A.2/A.3 and §7.7 (fold, outer `WHERE`, join pass-through) also run in the engine tier (`layer2_nested_*`); `TO MEASURE` is DuckDB + compile-matrix only. |
 
 ## Known issues
 

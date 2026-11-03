@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::{duckdb, duckdb_rows, A2_SHOP, A2_SHOP_REF, A3_SHOP, A3_SHOP_REF};
+use common::{
+    duckdb, duckdb_rows, A2_SHOP, A2_SHOP_REF, A3_SHOP, A3_SHOP_REF, LAYER2_NESTED_CASES,
+};
 use ossiec::{DialectType, Error, Options};
 
 const SHOP: &str = include_str!("fixtures/shop/model.yaml");
@@ -451,6 +453,21 @@ fn a2_unevaluated_measure_passes_through_inner_select() {
     let unused = sql.replace("AGG(t.order_count)", "AGG(o.order_count)");
     let c = ossiec::compile_layer2(&graph(), &unused, &duck()).unwrap();
     assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want);
+}
+
+#[test]
+fn layer2_nested_cases_match_their_references_on_duckdb() {
+    // The engine tier's shop cases (A.2, A.3, §7.7), checked here without Docker.
+    let db = duckdb();
+    for (name, layer2, reference) in LAYER2_NESTED_CASES {
+        let c = ossiec::compile_layer2(&graph(), layer2, &duck()).unwrap();
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(&db, reference)),
+            "{name}: {}",
+            c.sql
+        );
+    }
 }
 
 #[test]

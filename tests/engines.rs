@@ -64,7 +64,7 @@ fn sweep(engine: Engine) {
     );
 }
 
-/// Layer 2 nested shop forms (A.2 / A.3) on `engine`, against the DuckDB reference.
+/// Layer 2 nested shop forms (A.2 / A.3 / §7.7) on `engine`, against the DuckDB reference.
 fn sweep_layer2_nested(engine: Engine) {
     seed(engine);
     let db = duckdb();
