@@ -345,7 +345,7 @@ impl Compiler<'_> {
         // measure must still be refused.
         if let Some(gb) = &inner.group_by {
             let inner_scope =
-                parse_from_clause(self.graph, inner.from.as_ref(), &inner.joins, &[])?.scope;
+                parse_from_clause(&self.graph, inner.from.as_ref(), &inner.joins, &[])?.scope;
             for e in &gb.expressions {
                 let col = as_column(e)
                     .ok_or_else(|| unsupported("Layer 2 GROUP BY must name dimension columns"))?;
@@ -356,11 +356,11 @@ impl Compiler<'_> {
                     .find(|(n, _)| n.eq_ignore_ascii_case(&col.name.name))
                     .and_then(|(_, c)| match c {
                         Col::Inner(x) => {
-                            as_column(x).and_then(|c| bare_measure(self.graph, &inner_scope, c))
+                            as_column(x).and_then(|c| bare_measure(&self.graph, &inner_scope, c))
                         }
                         Col::Deferred(_) | Col::Evaluated => Some(0),
                     })
-                    .or_else(|| bare_measure(self.graph, &inner_scope, col));
+                    .or_else(|| bare_measure(&self.graph, &inner_scope, col));
                 if measure.is_some() {
                     return Err(Error::Request(format!(
                         "Layer 2 GROUP BY cannot name measure `{}`; group by dimensions only",
