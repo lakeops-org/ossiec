@@ -26,6 +26,23 @@ use polyglot_sql::{DialectType, Expression};
 use crate::plan::LogicalPlan;
 use crate::{Error, Result};
 
+/// Engines verified to run standard `agg(...) FILTER (WHERE …)`.
+/// Everyone else (and `target: None`) gets the CASE rewrite: polyglot still
+/// passes FILTER through to engines that lack it (StarRocks, MySQL, ClickHouse,
+/// Redshift, BigQuery, Snowflake, …).
+pub(crate) fn supports_aggregate_filter(target: Option<DialectType>) -> bool {
+    matches!(
+        target,
+        Some(
+            DialectType::DuckDB
+                | DialectType::PostgreSQL
+                | DialectType::Trino
+                | DialectType::Athena
+                | DialectType::Databricks
+        )
+    )
+}
+
 /// Hook 1: rewrite the dialect-neutral AST for `target`. Runs before rendering.
 pub(crate) fn adapt(
     ast: Expression,

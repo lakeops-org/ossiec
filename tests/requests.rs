@@ -177,12 +177,36 @@ fn compiles_for_every_engine_with_portable_constructs_only() {
             let c =
                 ossiec::compile(&g, &req(r), &opts).unwrap_or_else(|e| panic!("{target:?}: {e}"));
             // Constructs polyglot still passes through on engines that lack them
-            // (verified on polyglot-sql 0.13.5 for BY NAME / FILTER). ossiec must never emit them.
+            // (verified on polyglot-sql 0.13.5 for BY NAME / FILTER). Aggregate FILTER
+            // is kept only where the target runs it.
             let upper = c.sql.to_uppercase();
-            for construct in ["FILTER(", "QUALIFY", "BY NAME", "GROUP BY ALL"] {
+            let keeps_filter = matches!(
+                target,
+                DialectType::DuckDB
+                    | DialectType::PostgreSQL
+                    | DialectType::Trino
+                    | DialectType::Athena
+                    | DialectType::Databricks
+            );
+            for construct in ["QUALIFY", "BY NAME", "GROUP BY ALL"] {
                 assert!(
                     !upper.contains(construct),
                     "{target:?} emitted {construct}:\n{}",
+                    c.sql
+                );
+            }
+            if keeps_filter {
+                if r.contains("completed_revenue") {
+                    assert!(
+                        upper.contains("FILTER("),
+                        "{target:?} should keep FILTER for completed_revenue:\n{}",
+                        c.sql
+                    );
+                }
+            } else {
+                assert!(
+                    !upper.contains("FILTER("),
+                    "{target:?} emitted FILTER(:\n{}",
                     c.sql
                 );
             }
