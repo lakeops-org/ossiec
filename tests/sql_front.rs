@@ -46,6 +46,31 @@ fn model_qualified_relations_compile_the_same_as_bare_ones() {
             "SELECT t.status, AGG(t.order_count) \
              FROM (SELECT status, order_count FROM orders) t GROUP BY t.status",
         ),
+        // Three-part columns, in every clause that reads one.
+        (
+            "SELECT shop.orders.status, AGG(shop.orders.order_count) FROM shop.orders \
+             WHERE shop.orders.status = 'completed' GROUP BY shop.orders.status \
+             ORDER BY shop.orders.status",
+            "SELECT orders.status, AGG(orders.order_count) FROM orders \
+             WHERE orders.status = 'completed' GROUP BY orders.status \
+             ORDER BY orders.status",
+        ),
+        (
+            "SELECT SHOP.customers.region, AGG(shop.orders.order_count) FROM shop.orders \
+             LEFT JOIN shop.customers ON shop.orders.customer_id = shop.customers.id \
+             GROUP BY shop.customers.region",
+            "SELECT customers.region, AGG(orders.order_count) FROM orders \
+             LEFT JOIN customers ON orders.customer_id = customers.id \
+             GROUP BY customers.region",
+        ),
+        (
+            "SELECT t.status, AGG(t.n) FROM (SELECT shop.orders.status, \
+             COUNT(shop.orders.id) TO MEASURE AS n FROM shop.orders \
+             GROUP BY shop.orders.status) t GROUP BY t.status",
+            "SELECT t.status, AGG(t.n) FROM (SELECT orders.status, \
+             COUNT(orders.id) TO MEASURE AS n FROM orders \
+             GROUP BY orders.status) t GROUP BY t.status",
+        ),
     ] {
         assert_eq!(
             ossiec::compile_layer2(&g, qualified, &opts).unwrap().sql,
@@ -53,6 +78,55 @@ fn model_qualified_relations_compile_the_same_as_bare_ones() {
             "{qualified}"
         );
     }
+}
+
+/// A view's body goes through the same names as a query.
+#[test]
+fn model_qualified_columns_work_in_a_view_body() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let compile = |body: &str| {
+        let mut catalog = Layer2Catalog::new();
+        ossiec::define_layer2_view(&g, &mut catalog, &format!("CREATE VIEW v AS {body}"), &opts)
+            .unwrap();
+        ossiec::compile_layer2_with(
+            &g,
+            &catalog,
+            "SELECT status, AGG(n) FROM v GROUP BY status",
+            &opts,
+        )
+        .unwrap()
+        .sql
+    };
+    assert_eq!(
+        compile(
+            "SELECT shop.orders.status, COUNT(shop.orders.id) TO MEASURE AS n \
+             FROM shop.orders GROUP BY shop.orders.status"
+        ),
+        compile(
+            "SELECT orders.status, COUNT(orders.id) TO MEASURE AS n \
+             FROM orders GROUP BY orders.status"
+        ),
+    );
+}
+
+/// Only the model's own name qualifies a column.
+#[test]
+fn columns_qualified_by_another_schema_are_refused() {
+    let g = graph();
+    let e = ossiec::compile_layer2(
+        &g,
+        "SELECT other.orders.status, AGG(order_count) FROM orders GROUP BY other.orders.status",
+        &Options::default(),
+    )
+    .expect_err("another schema");
+    assert!(
+        matches!(e, Error::Unsupported(_) | Error::Request(_)),
+        "{e}"
+    );
 }
 
 #[test]
