@@ -64,7 +64,9 @@ fn sweep(engine: Engine) {
     );
 }
 
-/// Layer 2 nested shop forms (A.2 / A.3 / §7.7) on `engine`, against the DuckDB reference.
+/// Layer 2 nested shop forms on `engine`, against the DuckDB reference.
+/// Cases live in [`common::LAYER2_NESTED_CASES`] (A.2 / A.3 / §7.7 / base
+/// `TO MEASURE` / `includeUnmatched`+derived / A.7 script).
 fn sweep_layer2_nested(engine: Engine) {
     seed(engine);
     let db = duckdb();
@@ -74,21 +76,26 @@ fn sweep_layer2_nested(engine: Engine) {
         ..Default::default()
     };
     let mut failures = vec![];
-    for (name, layer2, reference) in LAYER2_NESTED_CASES {
-        let compiled = ossiec::compile_sql(&g, layer2, &opts).unwrap();
-        let mut want = duckdb_rows(&db, reference);
+    for case in LAYER2_NESTED_CASES {
+        let compiled = if case.script {
+            ossiec::compile_sql_script(&g, case.sql, &opts)
+        } else {
+            ossiec::compile_sql(&g, case.sql, &opts)
+        }
+        .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+        let mut want = duckdb_rows(&db, case.reference);
         want.sort();
         match run(engine, &compiled.sql) {
             Ok(mut got) => {
                 got.sort();
                 if got != want {
                     failures.push(format!(
-                        "{name}: wrong rows\n  got:  {got:?}\n  want: {want:?}\n{}",
-                        compiled.sql
+                        "{}: wrong rows\n  got:  {got:?}\n  want: {want:?}\n{}",
+                        case.name, compiled.sql
                     ));
                 }
             }
-            Err(e) => failures.push(format!("{name}: {e}\n{}", compiled.sql)),
+            Err(e) => failures.push(format!("{}: {e}\n{}", case.name, compiled.sql)),
         }
     }
     assert!(
