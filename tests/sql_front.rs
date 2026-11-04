@@ -16,6 +16,69 @@ fn graph() -> ossiec::SemanticGraph {
     ossiec::from_yaml(SHOP).unwrap()
 }
 
+/// §11.2: a model's relations live in one schema named after the model, so
+/// `shop.orders` means the same as `orders`, in any part of the query.
+#[test]
+fn model_qualified_relations_compile_the_same_as_bare_ones() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    for (qualified, bare) in [
+        (
+            "SELECT status, AGG(order_count) FROM shop.orders GROUP BY status",
+            "SELECT status, AGG(order_count) FROM orders GROUP BY status",
+        ),
+        (
+            "SELECT orders.status, AGG(orders.order_count) FROM SHOP.orders GROUP BY orders.status",
+            "SELECT orders.status, AGG(orders.order_count) FROM orders GROUP BY orders.status",
+        ),
+        (
+            "SELECT c.region, AGG(o.order_count) FROM shop.orders o \
+             LEFT JOIN shop.customers c ON o.customer_id = c.id GROUP BY c.region",
+            "SELECT c.region, AGG(o.order_count) FROM orders o \
+             LEFT JOIN customers c ON o.customer_id = c.id GROUP BY c.region",
+        ),
+        (
+            "SELECT t.status, AGG(t.order_count) \
+             FROM (SELECT status, order_count FROM shop.orders) t GROUP BY t.status",
+            "SELECT t.status, AGG(t.order_count) \
+             FROM (SELECT status, order_count FROM orders) t GROUP BY t.status",
+        ),
+    ] {
+        assert_eq!(
+            ossiec::compile_layer2(&g, qualified, &opts).unwrap().sql,
+            ossiec::compile_layer2(&g, bare, &opts).unwrap().sql,
+            "{qualified}"
+        );
+    }
+}
+
+#[test]
+fn relations_outside_the_model_are_refused() {
+    let g = graph();
+    let opts = Options::default();
+    for sql in [
+        "SELECT AGG(order_count) FROM other.orders",
+        "SELECT AGG(order_count) FROM prod.shop.orders",
+    ] {
+        let e = ossiec::compile_layer2(&g, sql, &opts)
+            .err()
+            .unwrap_or_else(|| panic!("accepted: {sql}"));
+        assert!(
+            matches!(e, Error::Unsupported(ref m) if m.contains("`shop.dataset`")),
+            "{sql}: {e}"
+        );
+    }
+    let e = ossiec::compile_layer2(&g, "SELECT AGG(order_count) FROM shop.nope", &opts)
+        .expect_err("unknown dataset");
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("unknown Layer 2 relation")),
+        "{e}"
+    );
+}
+
 #[test]
 fn a1_status_order_count_matches_layer3() {
     let g = graph();

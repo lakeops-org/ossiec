@@ -1836,10 +1836,16 @@ fn table_expr(graph: &SemanticGraph, e: &Expression) -> Result<(usize, Option<St
 }
 
 fn resolve_table(graph: &SemanticGraph, t: &TableRef) -> Result<(usize, Option<String>)> {
-    if t.schema.is_some() || t.catalog.is_some() {
-        return Err(unsupported(
-            "Layer 2 FROM should name a model dataset, not a catalog.schema.table",
-        ));
+    // A model's relations live in one schema named after the model (§11.2).
+    let model = &graph.model().name;
+    let in_model = t
+        .schema
+        .as_ref()
+        .is_none_or(|s| s.name.eq_ignore_ascii_case(model));
+    if t.catalog.is_some() || !in_model {
+        return Err(unsupported(format!(
+            "Layer 2 FROM should name a model dataset, as `dataset` or `{model}.dataset`, not a catalog.schema.table",
+        )));
     }
     let name = &t.name.name;
     let ds = graph
