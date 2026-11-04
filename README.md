@@ -353,7 +353,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 |---|---|
 | [`correctness`](tests/correctness.rs) | **The numbers are right.** 31 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
 | [`engines`](tests/engines.rs) | **Every engine agrees.** The same 31 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1, ClickHouse 26.8 and MySQL 8.4 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
-| [`tpcds`](tests/tpcds.rs) | **Real data, and the benchmark's own SQL.**<br>• **Apache Ossie's TPC-DS example model, unchanged,** on generated TPC-DS data: all its metric kinds, including the de-duplicated `store_productivity` and the window metrics.<br>• **Official TPC-DS queries q3, q12, q42, q43, q52, q55, q96 and q98**, expressed as ossiec requests and compared row by row with TPC-DS's own query text.<br>26 cases, including multi-hop joins, composite keys, date roles, store-and-web independent facts and unmatched items, on DuckDB (sf=0.1, 288k `store_sales` rows), Trino (`tpcds.tiny`), Postgres, StarRocks and ClickHouse. Each reference runs on the same engine, so data-generator differences cancel out. |
+| [`tpcds`](tests/tpcds.rs) | **Real data, and the benchmark's own SQL.**<br>• **Apache Ossie's TPC-DS example model, unchanged,** on generated TPC-DS data: all its metric kinds, including the de-duplicated `store_productivity` and the window metrics.<br>• **Official TPC-DS queries q3, q7, q12, q42, q43, q52, q55, q96 and q98**, expressed as ossiec requests and compared row by row with TPC-DS's own query text.<br>26 cases, including multi-hop joins, composite keys, date roles, store-and-web independent facts and unmatched items, on DuckDB (sf=0.1, 288k `store_sales` rows), Trino (`tpcds.tiny`), Postgres, StarRocks and ClickHouse. Each reference runs on the same engine, so data-generator differences cancel out. |
 | [`fuzz`](tests/fuzz.rs) | **Cases nobody wrote.** Random requests compared with an independent reference generated from the spec's own evaluation strategy, on all six engines. |
 | [`scale`](tests/scale.rs) | **No blow-ups.** A 121-table model binds in about 0.1 s and compiles in about 10 ms per request (unoptimized build). On Trino sf=1, each TPC-DS case must run within 3× its reference. |
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
@@ -405,8 +405,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] `FILTER` kept where supported / CASE elsewhere, time grains, metric filters, vendor-dialect preference
 - [x] CLI: `validate`, `describe`, `compile`, `compile-sql`
 - [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse, MySQL
-- [x] TPC-DS: Ossie's example model on real data, plus official queries q3, q42, q52, q55, q98
-- [x] Official TPC-DS queries q3, q12, q42, q43, q52, q55, q96, q98
+- [x] TPC-DS: Ossie's example model on real data, plus official queries q3, q7, q42, q52, q55, q98
+- [x] Official TPC-DS queries q3, q7, q12, q42, q43, q52, q55, q96, q98
 - [ ] More official TPC-DS queries (many of the 99 need constructs no semantic request expresses: correlated subqueries, cross-channel set operations)
 - [x] Window metrics (cumulative, rank, period-over-period)
 - [x] Independent facts across shared dimensions

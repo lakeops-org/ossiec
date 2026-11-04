@@ -4,8 +4,8 @@
 //!   metrics (including the de-duplicated and window ones) against hand-written
 //!   reference SQL.
 //! - **Official TPC-DS queries** (`fixtures/tpcds/sweep_model.yaml`): requests that
-//!   express q3, q42, q52, q55 and q98, compared with the benchmark's own SQL from
-//!   DuckDB's `tpcds_queries()`.
+//!   express q3, q7, q12, q42, q43, q52, q55, q96 and q98, compared with the
+//!   benchmark's own SQL from DuckDB's `tpcds_queries()`.
 //!
 //! Ground truth always runs on the *same* engine as ossiec's query (reference SQL
 //! is written for DuckDB and transpiled), so differences between engines' data
@@ -365,6 +365,22 @@ const CASES: &[Case] = &[
         reference: Reference::Official(3),
     },
     Case {
+        name: "q7",
+        model: SWEEP,
+        request: r#"{"metrics": ["avg_quantity", "avg_list_price", "avg_coupon_amt", "avg_sales_price"],
+            "dimensions": ["item.i_item_id"],
+            "filters": [
+                {"field": "customer_demographics.cd_gender", "op": "=", "value": "M"},
+                {"field": "customer_demographics.cd_marital_status", "op": "=", "value": "S"},
+                {"field": "customer_demographics.cd_education_status", "op": "=", "value": "College"},
+                {"field": "promotion.channel_email_or_event_n", "op": "=", "value": 1},
+                {"field": "date_dim.d_year", "op": "=", "value": 2000}
+            ],
+            "orderBy": [{"field": "item.i_item_id"}],
+            "limit": 100}"#,
+        reference: Reference::Official(7),
+    },
+    Case {
         name: "q42",
         model: SWEEP,
         request: r#"{"metrics": ["total_sales"], "dimensions": ["date_dim.d_year", "item.i_category_id", "item.i_category"],
@@ -472,10 +488,12 @@ fn graph_for(model: &str, engine: Engine) -> ossiec::SemanticGraph {
     ossiec::from_yaml(&model.replace("tpcds.public.", prefix)).unwrap()
 }
 
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 12] = [
     "web_sales",
     "time_dim",
     "household_demographics",
+    "customer_demographics",
+    "promotion",
     "store_sales",
     "date_dim",
     "item",
