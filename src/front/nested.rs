@@ -150,7 +150,7 @@ pub(super) fn compile(
     sql_text: &str,
     opts: &Options,
 ) -> Result<Compiled> {
-    let (mut sel, mut to_measures) = parse_top_select(sql_text)?;
+    let (mut sel, mut to_measures) = parse_top_select(graph, sql_text)?;
     catalog::expand_query(catalog, &mut sel, &mut to_measures, None)?;
     let mut c = Compiler {
         graph: graph.clone(),

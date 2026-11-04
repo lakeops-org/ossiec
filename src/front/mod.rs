@@ -50,7 +50,8 @@ use std::collections::HashMap;
 
 use polyglot_sql::builder::{func, lit, Expr};
 use polyglot_sql::expressions::{
-    BinaryOp, Column, Identifier, Join, JoinKind as SqlJoinKind, Literal, Select, TableRef,
+    BinaryOp, Column, DotAccess, Identifier, Join, JoinKind as SqlJoinKind, Literal, Select,
+    TableRef,
 };
 use polyglot_sql::{
     get_columns, parse_one, transform_all, DialectType, Expression, ExpressionWalk,
@@ -255,10 +256,14 @@ pub(super) struct QueryScope {
 /// Parse the consumer's single top-level `SELECT`. `TO MEASURE` items (which the
 /// SQL parser cannot read) are cut out first; the returned expressions are theirs,
 /// indexed by the marker column left in the select list (see [`to_measure`]).
-pub(super) fn parse_top_select(sql: &str) -> Result<(Select, Vec<Expression>)> {
+pub(super) fn parse_top_select(
+    graph: &SemanticGraph,
+    sql: &str,
+) -> Result<(Select, Vec<Expression>)> {
     let (text, to_measures) = to_measure::extract(sql.trim())?;
     let ast = parse_one(&text, DialectType::Generic)
         .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
+    let (ast, to_measures) = strip_model_from_columns(graph, ast, to_measures)?;
     match ast {
         Expression::Select(sel) => Ok((*sel, to_measures)),
         Expression::CreateView(_) => Err(unsupported(
@@ -273,8 +278,45 @@ pub(super) fn parse_top_select(sql: &str) -> Result<(Select, Vec<Expression>)> {
     }
 }
 
+/// `model.dataset.field` is `dataset.field` (§11.2). The parser reads it as a dot
+/// access on the column `model.dataset`, so turn that form into a column here,
+/// before any clause looks at it.
+pub(super) fn strip_model_from_columns(
+    graph: &SemanticGraph,
+    ast: Expression,
+    to_measures: Vec<Expression>,
+) -> Result<(Expression, Vec<Expression>)> {
+    let model = &graph.model().name;
+    let strip = |e: Expression| {
+        transform_all(e, &|node| {
+            Ok(match node {
+                Expression::Dot(d) => match *d {
+                    DotAccess {
+                        this: Expression::Column(mut c),
+                        field,
+                        ..
+                    } if c
+                        .table
+                        .as_ref()
+                        .is_some_and(|t| t.name.eq_ignore_ascii_case(model)) =>
+                    {
+                        c.table = Some(c.name);
+                        c.name = field;
+                        Expression::Column(c)
+                    }
+                    other => Expression::Dot(Box::new(other)),
+                },
+                other => other,
+            })
+        })
+        .map_err(|e| Error::Internal(format!("Layer 2 model-qualified column: {e}")))
+    };
+    let to_measures = to_measures.into_iter().map(strip).collect::<Result<_>>()?;
+    Ok((strip(ast)?, to_measures))
+}
+
 fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
-    let (sel, to_measures) = parse_top_select(sql)?;
+    let (sel, to_measures) = parse_top_select(graph, sql)?;
     let cfg = StageCfg {
         derived: false,
         outer: &[],

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use duckdb::types::Value;
 use duckdb::Connection;
 use ossiec::{DialectType, Options};
+use polyglot_sql::{TokenType, Tokenizer};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Cell {
@@ -40,8 +41,16 @@ impl Cell {
     }
 }
 
+/// A case must not return NaN or an infinity, so neither ever matches.
 fn close(a: f64, e: f64) -> bool {
-    (a - e).abs() <= 1e-9 * a.abs().max(e.abs()).max(1.0)
+    a.is_finite() && e.is_finite() && (a - e).abs() <= 1e-9 * a.abs().max(e.abs()).max(1.0)
+}
+
+/// An approximate value against an exact expected one takes no tolerance. The
+/// shortest decimal that round-trips the float must be the expected value, so a
+/// float that only rounds to it doesn't match.
+fn equals_exact(a: f64, exact: &str) -> bool {
+    a.is_finite() && (if a == 0.0 { 0.0 } else { a }).to_string() == exact
 }
 
 /// Both NULL, or equal: exact numerics exactly, approximate ones within the
@@ -50,7 +59,7 @@ fn cells_match(got: &Cell, want: &Cell) -> bool {
     match (got, want) {
         (Cell::Exact(g), Cell::Approx(w)) => g.parse().is_ok_and(|g| close(g, *w)),
         (Cell::Approx(g), Cell::Approx(w)) => close(*g, *w),
-        (Cell::Approx(g), Cell::Exact(w)) => w.parse().is_ok_and(|w: f64| *g == w),
+        (Cell::Approx(g), Cell::Exact(w)) => equals_exact(*g, w),
         _ => got == want,
     }
 }
@@ -67,21 +76,56 @@ fn results_match(got: &[Vec<Cell>], want: &[Vec<Cell>], ordered: bool) -> bool {
     if ordered {
         return got.iter().zip(want).all(|(g, w)| rows_match(g, w));
     }
-    let mut unmatched: Vec<&Vec<Cell>> = got.iter().collect();
-    want.iter().all(|w| {
-        unmatched
-            .iter()
-            .position(|g| rows_match(g, w))
-            .map(|i| unmatched.swap_remove(i))
-            .is_some()
+    // A tolerance isn't transitive, so a row can match several: look for a full
+    // pairing rather than taking the first match.
+    let mut paired: Vec<Option<usize>> = vec![None; got.len()];
+    (0..want.len()).all(|w| {
+        let mut seen = vec![false; got.len()];
+        pair_row(w, got, want, &mut paired, &mut seen)
     })
 }
 
+/// Kuhn's augmenting path: pair expected row `w`, moving earlier pairs if needed.
+fn pair_row(
+    w: usize,
+    got: &[Vec<Cell>],
+    want: &[Vec<Cell>],
+    paired: &mut Vec<Option<usize>>,
+    seen: &mut Vec<bool>,
+) -> bool {
+    for g in 0..got.len() {
+        if seen[g] || !rows_match(&got[g], &want[w]) {
+            continue;
+        }
+        seen[g] = true;
+        let free = match paired[g] {
+            None => true,
+            Some(other) => pair_row(other, got, want, paired, seen),
+        };
+        if free {
+            paired[g] = Some(w);
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the query itself has `ORDER BY`. Tokens, so comments and strings don't
+/// count and line breaks do not matter. A subquery's doesn't fix the result order.
 fn has_order_by(query: &str) -> bool {
-    query
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("--"))
-        .any(|l| l.to_ascii_uppercase().contains("ORDER BY"))
+    let tokens = Tokenizer::default_config().tokenize(query).unwrap();
+    let mut depth = 0;
+    tokens.iter().enumerate().any(|(i, t)| {
+        match t.token_type {
+            TokenType::LParen => depth += 1,
+            TokenType::RParen => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+            && (t.token_type == TokenType::OrderBy
+                || (t.token_type == TokenType::Order
+                    && tokens.get(i + 1).map(|n| n.token_type) == Some(TokenType::By)))
+    })
 }
 
 fn run(db: &Connection, sql: &str) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
@@ -205,7 +249,57 @@ fn comparison_follows_the_suite_rules() {
         true
     ));
 
-    // Only a real clause counts, not the case's comment header.
+    // A full pairing exists even though the first row matches both expected rows.
+    let approx = |x: f64| vec![Cell::Approx(x)];
+    assert!(results_match(
+        &[approx(0.0), approx(1.5e-9)],
+        &[approx(0.75e-9), approx(0.0)],
+        false
+    ));
+    assert!(!results_match(
+        &[approx(0.0), approx(0.0)],
+        &[approx(0.0), approx(1.5e-9)],
+        false
+    ));
+
+    // NaN and infinities never match, whichever side has them.
+    assert!(!cells_match(
+        &Cell::Approx(f64::INFINITY),
+        &Cell::Approx(1.0)
+    ));
+    assert!(!cells_match(
+        &Cell::Approx(1.0),
+        &Cell::Approx(f64::INFINITY)
+    ));
+    assert!(!cells_match(
+        &Cell::Approx(f64::INFINITY),
+        &Cell::Approx(f64::INFINITY)
+    ));
+    assert!(!cells_match(
+        &Cell::Approx(f64::NAN),
+        &Cell::Approx(f64::NAN)
+    ));
+    assert!(!cells_match(&Cell::Approx(f64::INFINITY), &exact("1")));
+
+    // An exact expected value is compared exactly, even beyond a float's integers.
+    assert!(cells_match(
+        &Cell::Approx(9_007_199_254_740_992.0),
+        &exact("9007199254740992")
+    ));
+    assert!(!cells_match(
+        &Cell::Approx(9_007_199_254_740_992.0),
+        &exact("9007199254740993")
+    ));
+    assert!(cells_match(&Cell::Approx(0.1), &exact("0.1")));
+    assert!(cells_match(&Cell::Approx(-0.0), &exact("0")));
+
+    // Only the query's own clause counts.
     assert!(has_order_by("SELECT 1\nORDER BY 1"));
+    assert!(has_order_by("SELECT 1\nORDER\n  BY 1"));
+    assert!(has_order_by("SELECT 1 ORDER -- why\n BY 1"));
     assert!(!has_order_by("-- tests ORDER BY\nSELECT 1"));
+    assert!(!has_order_by("SELECT 1 /* ORDER BY */"));
+    assert!(!has_order_by("SELECT 1 -- ORDER BY 1"));
+    assert!(!has_order_by("SELECT 'ORDER BY' AS x"));
+    assert!(!has_order_by("SELECT x FROM (SELECT 1 AS x ORDER BY 1) t"));
 }
