@@ -1,11 +1,11 @@
 //! Postgres rules.
 
 use polyglot_sql::builder::{cast, Expr};
-use polyglot_sql::{transform, DialectType, Expression};
+use polyglot_sql::expressions::CollationExpr;
+use polyglot_sql::{transform, Expression};
 
 use super::{internal, literal_backslashes_in_like};
 use crate::plan::LogicalPlan;
-use crate::sql;
 use crate::Result;
 
 /// - **Typed NULLs in stacked parts.** Postgres types `UNION` branches pairwise,
@@ -34,16 +34,12 @@ pub(super) fn adapt(ast: Expression, plan: &LogicalPlan) -> Result<Expression> {
                 a.this = cast(Expr(a.this), ty).into_inner();
             }
         } else if a.alias.quoted && plan.string_dims.iter().any(|d| d == name) {
-            // Parse a COLLATE node once, then put the output expression inside it.
-            if let Ok(Expression::Collation(mut c)) =
-                sql::parse("x COLLATE \"C\"", DialectType::Generic)
-            {
-                c.this = std::mem::replace(
-                    &mut a.this,
-                    Expression::Null(polyglot_sql::expressions::Null),
-                );
-                a.this = Expression::Collation(c);
-            }
+            a.this = Expression::Collation(Box::new(CollationExpr {
+                this: a.this,
+                collation: "C".into(),
+                quoted: false,
+                double_quoted: true,
+            }));
         }
         Ok(Some(Expression::Alias(a)))
     })

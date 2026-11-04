@@ -559,6 +559,16 @@ pub const CASES: &[Case] = &[
         prefer: false,
     },
     Case {
+        // The last period has no next row: NULL, not the type's default.
+        name: "change_to_next_period",
+        request: r#"{"metrics": ["total_revenue", "revenue_change_to_next"], "dimensions": ["orders.order_date"],
+            "timeGrain": "month", "orderBy": [{"field": "orders.order_date"}]}"#,
+        reference: "SELECT m, r, LEAD(r, 1) OVER (ORDER BY m) - r
+            FROM (SELECT DATE_TRUNC('month', order_date) AS m, SUM(amount_cents / 100.0) AS r FROM orders GROUP BY 1)
+            ORDER BY m",
+        prefer: false,
+    },
+    Case {
         name: "rank_filter_after_window",
         request: r#"{"metrics": ["revenue_rank_in_region", "total_revenue"], "dimensions": ["customers.region", "products.category"],
             "metricFilters": [{"metric": "revenue_rank_in_region", "op": "=", "value": 1}]}"#,

@@ -1,5 +1,6 @@
 //! ClickHouse rules.
 
+use polyglot_sql::expressions::{WindowFrame, WindowFrameBound, WindowFrameKind};
 use polyglot_sql::{transform, DialectType, Expression};
 
 use super::{internal, literal_backslashes_in_like};
@@ -19,13 +20,6 @@ use crate::{Error, Result};
 /// Plus backslashes in `LIKE` patterns (see `literal_backslashes_in_like`).
 pub(super) fn adapt(ast: Expression, _plan: &LogicalPlan) -> Result<Expression> {
     let ast = literal_backslashes_in_like(ast)?;
-    let full_frame = match sql::parse(
-        "SUM(1) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
-        DialectType::Generic,
-    ) {
-        Ok(Expression::WindowFunction(w)) => w.over.frame,
-        _ => return Err(Error::Internal("frame template".into())),
-    };
     transform(ast, &|e| {
         let Expression::WindowFunction(mut w) = e else {
             return Ok(Some(e));
@@ -52,7 +46,15 @@ pub(super) fn adapt(ast: Expression, _plan: &LogicalPlan) -> Result<Expression> 
         w.this = t
             .build()
             .map_err(|e| polyglot_sql::Error::internal(e.to_string()))?;
-        w.over.frame = full_frame.clone();
+        w.over.frame = Some(WindowFrame {
+            kind: WindowFrameKind::Rows,
+            start: WindowFrameBound::UnboundedPreceding,
+            end: Some(WindowFrameBound::UnboundedFollowing),
+            exclude: None,
+            kind_text: None,
+            start_side_text: None,
+            end_side_text: None,
+        });
         Ok(Some(Expression::WindowFunction(w)))
     })
     .map_err(internal)
