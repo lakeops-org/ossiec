@@ -207,6 +207,29 @@ fn clickhouse_lag_keeps_standard_null_semantics() {
 }
 
 #[test]
+fn clickhouse_lead_keeps_standard_null_semantics() {
+    golden(
+        "shop_revenue_change_to_next_clickhouse",
+        SHOP,
+        r#"{"metrics": ["revenue_change_to_next"], "dimensions": ["orders.order_date"], "timeGrain": "month"}"#,
+        Some(DialectType::ClickHouse),
+        None,
+    );
+}
+
+#[test]
+fn mysql_collates_string_dimensions_and_filters() {
+    golden(
+        "shop_string_collation_mysql",
+        SHOP,
+        r#"{"metrics": ["total_revenue"], "dimensions": ["customers.segment"],
+            "filters": [{"field": "customers.region", "op": "IN", "values": ["EU", "US"]}]}"#,
+        Some(DialectType::MySQL),
+        None,
+    );
+}
+
+#[test]
 fn bigquery_week_starts_on_monday() {
     golden(
         "shop_week_grain_bigquery",
