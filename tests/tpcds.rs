@@ -236,9 +236,9 @@ const CASES: &[Case] = &[
                LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk
              ), r AS (SELECT cat, SUM(sr_return_amt) AS ret FROM j GROUP BY cat),
              s AS (
-               SELECT cat, SUM(ss_ext_sales_price) AS sales FROM (
-                 SELECT DISTINCT cat, ss_item_sk, ss_ticket_number, ss_ext_sales_price FROM j WHERE ss_item_sk IS NOT NULL
-               ) AS per_sale GROUP BY cat
+               SELECT i.i_category AS cat, SUM(ss.ss_ext_sales_price) AS sales
+               FROM store_sales ss LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk
+               GROUP BY i.i_category
              )
              SELECT r.cat, r.ret, s.sales FROM r LEFT JOIN s ON COALESCE(r.cat, '~') = COALESCE(s.cat, '~')",
         ),
