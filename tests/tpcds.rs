@@ -641,6 +641,24 @@ fn load(engine: Engine, duck: &Connection) {
         args.extend(load);
         sh(&args.iter().map(String::as_str).collect::<Vec<_>>());
     }
+    if engine == Engine::MySql {
+        // Without keys MySQL plans the benchmark's comma joins as cross joins over
+        // customer_demographics: q7's reference took 16 minutes, not under a second.
+        let keys: String = [
+            ("customer", "c_customer_sk"),
+            ("customer_address", "ca_address_sk"),
+            ("customer_demographics", "cd_demo_sk"),
+            ("date_dim", "d_date_sk"),
+            ("household_demographics", "hd_demo_sk"),
+            ("item", "i_item_sk"),
+            ("promotion", "p_promo_sk"),
+            ("store", "s_store_sk"),
+            ("time_dim", "t_time_sk"),
+        ]
+        .map(|(t, k)| format!("ALTER TABLE {t} ADD PRIMARY KEY ({k});\n"))
+        .concat();
+        common::run(engine, &keys).unwrap_or_else(|e| panic!("adding keys on MySQL: {e}"));
+    }
 }
 
 /// DuckDB sorts NULLs last; StarRocks and MySQL sort them first on ASC. Spell
@@ -716,6 +734,11 @@ fn sweep(engine: Engine) {
                 if engine == Engine::ClickHouse {
                     // References use LEFT JOINs too; give them standard NULL semantics.
                     reference = format!("SET join_use_nulls = 1;\n{reference}");
+                }
+                if engine == Engine::MySql {
+                    // The official SQL's AVG of integers would round to 4 decimals
+                    // (q26: 20.6667, not 20.666667). ossiec's own SQL casts to DOUBLE.
+                    reference = format!("SET div_precision_increment = 30;\n{reference}");
                 }
                 match (
                     run_in(engine, &compiled.sql, ("memory", "tpcds")),
