@@ -19,7 +19,7 @@ fn errors_name_the_problem_and_the_choices() {
         (r#"{"metrics": []}"#, "at least one metric or dimension"),
         (
             r#"{"metrics": ["revenue"]}"#,
-            "unknown metric `revenue`; available: orders.order_count, total_revenue",
+            "unknown metric `revenue`; available: orders.order_count, products.stock_units, total_revenue",
         ),
         (
             r#"{"metrics": ["total_revenue"], "dimensions": ["orders.nope"]}"#,

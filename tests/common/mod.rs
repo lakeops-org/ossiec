@@ -781,24 +781,127 @@ pub const A2_UNEVALUATED_SHOP: &str = "SELECT o.status, AGG(t.order_count) \
 pub const A2_UNEVALUATED_SHOP_REF: &str =
     "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status";
 
-pub const LAYER2_NESTED_CASES: &[(&str, &str, &str)] = &[
-    ("a2_top_two_customers", A2_SHOP, A2_SHOP_REF),
-    ("a3_avg_orders_per_customer", A3_SHOP, A3_SHOP_REF),
-    (
-        "s77_fold_filter_and_projection",
-        S77_FOLD_SHOP,
-        S77_FOLD_SHOP_REF,
-    ),
-    (
-        "s77_fold_with_outer_where",
-        S77_FOLD_WHERE_SHOP,
-        S77_FOLD_WHERE_SHOP_REF,
-    ),
-    (
-        "a2_unevaluated_measure_pass_through",
-        A2_UNEVALUATED_SHOP,
-        A2_UNEVALUATED_SHOP_REF,
-    ),
+/// Base `COUNT(*) TO MEASURE` folded through a sole derived `FROM` (shop).
+pub const BASE_TO_MEASURE_SHOP: &str = "SELECT status, AGG(n) AS n \
+    FROM (SELECT status, COUNT(*) TO MEASURE AS n FROM orders \
+          WHERE customer_id IS NOT NULL GROUP BY status) t \
+    WHERE status = 'completed' \
+    GROUP BY status";
+
+pub const BASE_TO_MEASURE_SHOP_REF: &str = "SELECT status, COUNT(*) AS n FROM orders \
+    WHERE customer_id IS NOT NULL AND status = 'completed' GROUP BY status";
+
+/// `includeUnmatched` with a derived join on the product grain. Product 13
+/// (stock 7, never sold) is kept by the filter and appears under a NULL region.
+pub const UNMATCHED_DERIVED_SHOP: &str = "-- ossiec: includeUnmatched\n\
+    SELECT customers.region, AGG(products.stock_units) \
+    FROM orders \
+    LEFT JOIN customers ON orders.customer_id = customers.id \
+    LEFT JOIN products ON orders.product_id = products.id \
+    JOIN (SELECT id FROM products WHERE stock > 0 GROUP BY id) t \
+      ON products.id = t.id \
+    GROUP BY customers.region";
+
+/// Portable reference for [`UNMATCHED_DERIVED_SHOP`] (DuckDB / engine seed).
+pub const UNMATCHED_DERIVED_SHOP_REF: &str =
+    "WITH keep AS (SELECT product_id AS id FROM products WHERE stock > 0 GROUP BY product_id),
+    matched AS (
+       SELECT DISTINCT c.region, p.product_id, p.stock
+       FROM orders o
+       LEFT JOIN raw_customers c ON o.customer_id = c.customer_id AND NOT c.deleted
+       LEFT JOIN products p ON o.product_id = p.product_id
+       JOIN keep t ON p.product_id = t.id
+       WHERE p.product_id IS NOT NULL
+    ), unmatched AS (
+       SELECT CAST(NULL AS VARCHAR) AS region, p.product_id, p.stock
+       FROM products p
+       JOIN keep t ON p.product_id = t.id
+       WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.product_id = p.product_id)
+    ), r AS (
+       SELECT * FROM matched UNION ALL SELECT * FROM unmatched
+    ), g AS (
+       SELECT DISTINCT region FROM (
+         SELECT c.region AS region
+         FROM orders o
+         LEFT JOIN raw_customers c ON o.customer_id = c.customer_id AND NOT c.deleted
+         LEFT JOIN products p ON o.product_id = p.product_id
+         JOIN keep t ON p.product_id = t.id
+         UNION ALL SELECT region FROM unmatched
+       ) u
+    )
+    SELECT g.region, s.stock
+    FROM g
+    LEFT JOIN (SELECT region, SUM(stock) AS stock FROM r GROUP BY region) s
+      ON g.region IS NOT DISTINCT FROM s.region";
+
+/// A.7 session view with a base `TO MEASURE`, then an outer `AGG`.
+pub const A7_BASE_TO_MEASURE_SCRIPT: &str = "CREATE VIEW completed_counts AS \
+    SELECT status, COUNT(*) TO MEASURE AS n FROM orders \
+    WHERE customer_id IS NOT NULL GROUP BY status; \
+    SELECT status, AGG(n) AS n FROM completed_counts \
+    WHERE status = 'completed' GROUP BY status";
+
+pub const A7_BASE_TO_MEASURE_SCRIPT_REF: &str = BASE_TO_MEASURE_SHOP_REF;
+
+/// One shop Layer 2 nested case for the DuckDB parity check and the engine tier.
+#[derive(Clone, Copy)]
+pub struct Layer2NestedCase {
+    pub name: &'static str,
+    pub sql: &'static str,
+    pub reference: &'static str,
+    /// `CREATE VIEW …; SELECT …` via [`ossiec::compile_sql_script`].
+    pub script: bool,
+}
+
+pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
+    Layer2NestedCase {
+        name: "a2_top_two_customers",
+        sql: A2_SHOP,
+        reference: A2_SHOP_REF,
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "a3_avg_orders_per_customer",
+        sql: A3_SHOP,
+        reference: A3_SHOP_REF,
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "s77_fold_filter_and_projection",
+        sql: S77_FOLD_SHOP,
+        reference: S77_FOLD_SHOP_REF,
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "s77_fold_with_outer_where",
+        sql: S77_FOLD_WHERE_SHOP,
+        reference: S77_FOLD_WHERE_SHOP_REF,
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "a2_unevaluated_measure_pass_through",
+        sql: A2_UNEVALUATED_SHOP,
+        reference: A2_UNEVALUATED_SHOP_REF,
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "base_to_measure_count_star",
+        sql: BASE_TO_MEASURE_SHOP,
+        reference: BASE_TO_MEASURE_SHOP_REF,
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "include_unmatched_with_derived_join",
+        sql: UNMATCHED_DERIVED_SHOP,
+        reference: UNMATCHED_DERIVED_SHOP_REF,
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "a7_create_view_base_to_measure",
+        sql: A7_BASE_TO_MEASURE_SCRIPT,
+        reference: A7_BASE_TO_MEASURE_SCRIPT_REF,
+        script: true,
+    },
 ];
 
 // ---------------------------------------------------------------- engines
