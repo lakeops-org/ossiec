@@ -26,7 +26,8 @@ OPTIONS:
                        A script may define CREATE VIEW measure relations (A.7) and end with the
                        SELECT to compile. Views are session state until persist-view.
     persist-view       Write a CREATE VIEW's TO MEASURE items into the model as permanent
-                       metrics; print the updated YAML (or --out <file>).
+                       metrics; print the updated YAML (or --out <file>). Refuses a view
+                       with WHERE, LIMIT/OFFSET or a join other than LEFT JOIN.
 ";
 
 fn main() -> ExitCode {

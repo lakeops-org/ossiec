@@ -12,15 +12,20 @@
 //! Pass-through columns (bare measures already in the model) and evaluated
 //! scalars are skipped. The session view is unchanged; callers that want YAML
 //! use [`crate::to_yaml`].
+//!
+//! A metric carries only the aggregate, not the view's `FROM` or `WHERE`. A view
+//! whose body narrows its rows is refused rather than persisted with different
+//! answers (see [`refuse_narrowed_rows`]).
 
 use polyglot_sql::expressions::{Identifier, Select};
 use polyglot_sql::{generate, parse_one, transform_all, DialectType, Expression};
 
 use super::catalog::Layer2Catalog;
 use super::nested::{self, OutCol};
-use super::{parse_stage_from, parse_stage_prep, L2Formula, StageCfg};
+use super::{consumer_join_kind, parse_stage_from, parse_stage_prep, L2Formula, StageCfg};
 use crate::graph::{bind, SemanticGraph};
 use crate::model::{Expression as ModelExpr, Metric, Model};
+use crate::plan::JoinKind;
 use crate::{sql, Error, Options, Result};
 
 /// One measure taken from a view that can become a model metric.
@@ -67,6 +72,7 @@ pub fn persist_layer2_view(
             "Layer 2 view `{view_name}` has no TO MEASURE items to persist (pass-through measures are already in the model)"
         )));
     }
+    refuse_narrowed_rows(&view_name, &select)?;
 
     let mut model = graph.model().clone();
     let mut added = Vec::new();
@@ -101,6 +107,32 @@ pub fn persist_layer2_view(
     }
     let g = bind(model)?;
     Ok((g, added))
+}
+
+/// Refuse a view whose rows a persisted metric could not reproduce. The metric
+/// keeps only the aggregate and is later queried over the model's own `LEFT`
+/// joins, so a `WHERE`, `LIMIT`/`OFFSET` or any other join kind in the view would
+/// be dropped silently and change the answer.
+fn refuse_narrowed_rows(view: &str, sel: &Select) -> Result<()> {
+    let non_left_join = sel
+        .joins
+        .iter()
+        .map(consumer_join_kind)
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|k| *k != JoinKind::Left);
+    let clause = if sel.where_clause.is_some() {
+        "a WHERE filter"
+    } else if sel.limit.is_some() || sel.offset.is_some() {
+        "LIMIT / OFFSET"
+    } else if non_left_join {
+        "a join other than LEFT JOIN"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Unsupported(format!(
+        "Layer 2 view `{view}` has {clause}, which a persisted metric would not carry: it would answer differently from the view"
+    )))
 }
 
 fn ensure_absent(model: &Model, full: &str, kind: &Kind) -> Result<()> {
@@ -228,44 +260,43 @@ fn formula_to_metric_sql(graph: &SemanticGraph, f: &L2Formula) -> Result<String>
 fn leaf_metric_sql(graph: &SemanticGraph, name: &str) -> Result<String> {
     let i = graph.metric_by_name(name)?;
     let m = &graph.metrics[i];
-    let (sql, owner) = match m.owner {
+    let portable_sql = |found: Option<&Metric>| -> Result<String> {
+        let metric = found
+            .ok_or_else(|| Error::Internal(format!("metric `{name}` missing from bound model")))?;
+        metric.expression.sql.clone().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "Layer 2 persist: leaf metric `{name}` has no portable `sql` expression"
+            ))
+        })
+    };
+    match m.owner {
         Some(ds) => {
             let bare = name
                 .rsplit_once('.')
                 .map(|(_, b)| b)
                 .ok_or_else(|| Error::Internal(format!("dataset metric `{name}` has no `.`")))?;
-            let expr = graph.model.datasets[ds]
-                .metrics
-                .iter()
-                .find(|x| x.name.eq_ignore_ascii_case(bare))
-                .and_then(|x| x.expression.sql.as_ref())
-                .ok_or_else(|| {
-                    Error::Internal(format!("metric `{name}` missing from bound model"))
-                })?;
-            (expr.clone(), Some(ds))
+            let sql = portable_sql(
+                graph.model.datasets[ds]
+                    .metrics
+                    .iter()
+                    .find(|x| x.name.eq_ignore_ascii_case(bare)),
+            )?;
+            qualify_dataset_sql(graph, ds, &sql)
         }
-        None => {
-            let expr = graph
+        None => portable_sql(
+            graph
                 .model
                 .metrics
                 .iter()
-                .find(|x| x.name.eq_ignore_ascii_case(name))
-                .and_then(|x| x.expression.sql.as_ref())
-                .ok_or_else(|| {
-                    Error::Internal(format!("metric `{name}` missing from bound model"))
-                })?;
-            (expr.clone(), None)
-        }
-    };
-    match owner {
-        Some(ds) => qualify_dataset_sql(graph, ds, &sql),
-        None => Ok(sql),
+                .find(|x| x.name.eq_ignore_ascii_case(name)),
+        ),
     }
 }
 
 /// Turn a dataset-scoped metric body into model-scoped SQL: qualify columns and
 /// rewrite `COUNT(*)` to `COUNT(dataset.key)` so the expression is valid at
-/// model scope.
+/// model scope. The key must be a primary-key column: any other column could
+/// hold NULLs, which `COUNT` would skip.
 fn qualify_dataset_sql(graph: &SemanticGraph, ds: usize, sql: &str) -> Result<String> {
     let ast = parse_one(sql, DialectType::Generic)
         .map_err(|e| Error::Internal(format!("persist: cannot parse metric SQL `{sql}`: {e}")))?;
@@ -273,21 +304,13 @@ fn qualify_dataset_sql(graph: &SemanticGraph, ds: usize, sql: &str) -> Result<St
     let key = graph.datasets[ds]
         .primary_key
         .first()
-        .copied()
-        .or_else(|| {
-            graph.datasets[ds]
-                .fields
-                .iter()
-                .position(|f| f.name.eq_ignore_ascii_case("id"))
-        })
-        .or_else(|| (0..graph.datasets[ds].fields.len()).next())
-        .map(|i| graph.datasets[ds].fields[i].name.clone());
+        .map(|&i| graph.datasets[ds].fields[i].name.clone());
     let ast = transform_all(ast, &|node| {
         Ok(match node {
             Expression::Count(mut c) if c.star || c.this.is_none() => {
                 let col = key.as_ref().ok_or_else(|| {
                     polyglot_sql::Error::InvalidInput(format!(
-                        "dataset `{ds_name}` has no field to rewrite COUNT(*) for model-scoped persist"
+                        "dataset `{ds_name}` has no primary key, so COUNT(*) cannot become a model-scoped metric without risking an undercount; persist it at dataset scope with `COUNT(*) TO MEASURE`"
                     ))
                 })?;
                 let mut counted = sql::col(col);
@@ -305,7 +328,10 @@ fn qualify_dataset_sql(graph: &SemanticGraph, ds: usize, sql: &str) -> Result<St
             other => other,
         })
     })
-    .map_err(|e| Error::Internal(format!("persist: qualify `{sql}`: {e}")))?;
+    .map_err(|e| match e {
+        polyglot_sql::Error::InvalidInput(m) => Error::Unsupported(m),
+        e => Error::Internal(format!("persist: qualify `{sql}`: {e}")),
+    })?;
     expr_sql(&ast)
 }
 
