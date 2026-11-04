@@ -217,7 +217,8 @@ JOIN (SELECT c.region, SUM(o.amount) TO MEASURE AS total_revenue
       GROUP BY c.region) m ON r.region = m.region
 GROUP BY r.region;
 
--- A.7: the same relation, named. The view is session state, not a model change.
+-- A.7: the same relation, named (session catalog). Persist into the model with
+-- `persist_layer2_view` / `ossiec persist-view`.
 CREATE VIEW region_metrics AS
 SELECT c.region,
        (AGG(o.order_amt) / AGG(t.ticket_count)) TO MEASURE AS sales_per_ticket
@@ -252,6 +253,9 @@ let mut views = ossiec::Layer2Catalog::new();
 ossiec::define_layer2_view(&graph, &mut views, "CREATE VIEW region_metrics AS SELECT ...", &opts)?;
 let out = ossiec::compile_sql_with(&graph, &views, "SELECT region, AGG(sales_per_ticket) FROM region_metrics GROUP BY region", &opts)?;
 // compile-l2 accepts the same script: CREATE VIEW ...; SELECT ...
+// Promote TO MEASURE items into the model (and optionally write YAML):
+let (graph, added) = ossiec::persist_layer2_view(&graph, &views, "region_metrics", &opts)?;
+let yaml = ossiec::to_yaml(graph.model())?;
 ```
 
 Model-scoped metrics are not measures (§10.3). `AGG(expr)` inside `AGG()` is refused; use `AGG(a) + AGG(b)`. Other join forms (`ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) are not implemented yet. `CROSS JOIN` takes no `ON`.
@@ -359,7 +363,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including a ratio with a partial-fact derived join), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`). Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
+| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including a ratio with a partial-fact derived join), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
 
 ## Known issues
 
@@ -413,7 +417,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Role-playing dimensions (`relationship.field`, shortest path by default)
 - [x] Unmatched one-side rows (`includeUnmatched`)
 - [x] NULL placement in `orderBy`
-- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog, not written into the model)
+- [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
 - [ ] Publish to crates.io
 
 ## Contributing

@@ -2613,3 +2613,104 @@ fn a7_appendix_conformed_dimension_bridge() {
     let c = ossiec::compile_layer2_with(&g, &catalog, via, &two_facts_opts()).unwrap();
     assert_region_ratio(&c.sql);
 }
+
+// -------------------------------------------------------- A.7 persist into model
+
+#[test]
+fn persist_view_ratio_becomes_model_metric() {
+    let (g, catalog) = define_region_metrics();
+    let (g2, added) =
+        ossiec::persist_layer2_view(&g, &catalog, "region_metrics", &two_facts_opts()).unwrap();
+    assert_eq!(added, vec!["sales_per_ticket"]);
+    assert!(g2
+        .model()
+        .metrics
+        .iter()
+        .any(|m| m.name == "sales_per_ticket"));
+    // Layer 3 request uses the new metric; answers match the Layer 2 view path.
+    let l3 = ossiec::compile(
+        &g2,
+        &serde_json::from_str(
+            r#"{"metrics":["sales_per_ticket"],"dimensions":["customers.region"]}"#,
+        )
+        .unwrap(),
+        &two_facts_opts(),
+    )
+    .unwrap();
+    assert_region_ratio(&l3.sql);
+    // Round-trip YAML still binds.
+    let yaml = ossiec::to_yaml(g2.model()).unwrap();
+    let g3 = ossiec::from_yaml(&yaml).unwrap();
+    assert!(g3
+        .describe()
+        .metrics
+        .iter()
+        .any(|m| m.name == "sales_per_ticket" && m.queryable));
+}
+
+#[test]
+fn persist_view_base_to_measure_becomes_dataset_metric() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW completed_counts AS \
+         SELECT o.status, COUNT(*) TO MEASURE AS completed_n \
+         FROM orders o WHERE o.status = 'completed' GROUP BY o.status",
+        &opts,
+    )
+    .unwrap();
+    let (g2, added) = ossiec::persist_layer2_view(&g, &catalog, "completed_counts", &opts).unwrap();
+    assert_eq!(added, vec!["orders.completed_n"]);
+    assert!(g2.model().datasets.iter().any(|d| {
+        d.name == "orders" && d.metrics.iter().any(|m| m.name == "completed_n")
+    }));
+    let l3 = ossiec::compile(
+        &g2,
+        &serde_json::from_str(r#"{"metrics":["orders.completed_n"]}"#).unwrap(),
+        &opts,
+    )
+    .unwrap();
+    assert!(l3.sql.to_uppercase().contains("COUNT"), "{}", l3.sql);
+}
+
+#[test]
+fn persist_view_refusals() {
+    let (g, catalog) = define_region_metrics();
+    let opts = two_facts_opts();
+    let e = ossiec::persist_layer2_view(&g, &catalog, "missing", &opts)
+        .err()
+        .expect("missing view");
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("not defined")),
+        "{e}"
+    );
+    let (g2, _) = ossiec::persist_layer2_view(&g, &catalog, "region_metrics", &opts).unwrap();
+    let e = ossiec::persist_layer2_view(&g2, &catalog, "region_metrics", &opts)
+        .err()
+        .expect("duplicate metric");
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("already exists")),
+        "{e}"
+    );
+    let mut cat = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut cat,
+        "CREATE VIEW eu_ids AS SELECT c.region FROM customers c WHERE c.region = 'EU'",
+        &opts,
+    )
+    .unwrap();
+    let e = ossiec::persist_layer2_view(&g, &cat, "eu_ids", &opts)
+        .err()
+        .expect("no TO MEASURE");
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("no TO MEASURE")),
+        "{e}"
+    );
+}

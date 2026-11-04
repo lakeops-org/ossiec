@@ -45,7 +45,7 @@ pub(super) const MAX_DERIVED: usize = 8;
 
 /// What a column of a stage's result is.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum OutKind {
+pub(crate) enum OutKind {
     /// A dimension / grouping column: a value of a field.
     Field,
     /// An `AGG(measure)` or SQL aggregate, already evaluated to a scalar.
@@ -64,7 +64,7 @@ pub(super) enum OutKind {
 
 /// One consumer-visible output column of a [`Node`].
 #[derive(Debug, Clone)]
-pub(super) struct OutCol {
+pub(crate) struct OutCol {
     pub name: String,
     pub kind: OutKind,
 }

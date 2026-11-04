@@ -55,7 +55,9 @@ pub use front::compile_with as compile_sql_with;
 /// `CREATE VIEW` + `SELECT` script for the SQL frontend.
 pub use front::compile_script as compile_sql_script;
 
-pub use front::{define_layer2_view, Layer2Catalog, Layer2Column, Layer2ColumnKind};
+pub use front::{
+    define_layer2_view, persist_layer2_view, Layer2Catalog, Layer2Column, Layer2ColumnKind,
+};
 
 /// Older name for [`compile_sql`].
 pub use front::compile as compile_layer2;
@@ -118,6 +120,11 @@ pub fn load(yaml: &str) -> Result<Model> {
 /// [`load`] then [`bind`].
 pub fn from_yaml(yaml: &str) -> Result<SemanticGraph> {
     bind(load(yaml)?)
+}
+
+/// Serialize a model to Ossie YAML (for writing measures persisted from Layer 2).
+pub fn to_yaml(model: &Model) -> Result<String> {
+    serde_yaml::to_string(model).map_err(|e| Error::Internal(format!("cannot write YAML: {e}")))
 }
 
 /// How to render the compiled SQL.
