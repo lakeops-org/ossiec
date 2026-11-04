@@ -1224,7 +1224,7 @@ fn each_stage_is_adapted_with_its_own_plan() {
         },
     )
     .unwrap();
-    assert!(my.sql.contains("utf8mb4_bin"), "{}", my.sql);
+    assert!(my.sql.contains("COLLATE utf8mb4_bin"), "{}", my.sql);
     assert!(
         my.sql.to_uppercase().contains("CAST("),
         "outer AVG: {}",

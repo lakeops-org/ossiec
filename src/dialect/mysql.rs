@@ -1,11 +1,11 @@
 //! MySQL rules.
 
 use polyglot_sql::builder::{cast, Expr};
-use polyglot_sql::{transform, DialectType, Expression};
+use polyglot_sql::expressions::CollationExpr;
+use polyglot_sql::{transform, Expression};
 
 use super::{internal, literal_backslashes_in_like};
 use crate::plan::LogicalPlan;
-use crate::sql;
 use crate::Result;
 
 /// - **Byte-exact strings.** MySQL's default collation (`utf8mb4_0900_ai_ci`)
@@ -37,15 +37,14 @@ pub(super) fn adapt_avg(ast: Expression) -> Result<Expression> {
 
 pub(super) fn adapt(ast: Expression, plan: &LogicalPlan) -> Result<Expression> {
     let ast = literal_backslashes_in_like(ast)?;
-    let binary = match sql::parse("x COLLATE utf8mb4_bin", DialectType::Generic) {
-        Ok(Expression::Collation(c)) => c,
-        _ => return Err(crate::Error::Internal("collation template".into())),
-    };
     transform(ast, &|e| {
         if plan.string_exprs.contains(&e) {
-            let mut c = binary.clone();
-            c.this = e;
-            return Ok(Some(Expression::Collation(c)));
+            return Ok(Some(Expression::Collation(Box::new(CollationExpr {
+                this: e,
+                collation: "utf8mb4_bin".into(),
+                quoted: false,
+                double_quoted: false,
+            }))));
         }
         Ok(Some(match e {
             Expression::Avg(mut f) => {
