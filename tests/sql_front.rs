@@ -2667,9 +2667,11 @@ fn persist_view_base_to_measure_becomes_dataset_metric() {
     .unwrap();
     let (g2, added) = ossiec::persist_layer2_view(&g, &catalog, "completed_counts", &opts).unwrap();
     assert_eq!(added, vec!["orders.completed_n"]);
-    assert!(g2.model().datasets.iter().any(|d| {
-        d.name == "orders" && d.metrics.iter().any(|m| m.name == "completed_n")
-    }));
+    assert!(g2
+        .model()
+        .datasets
+        .iter()
+        .any(|d| { d.name == "orders" && d.metrics.iter().any(|m| m.name == "completed_n") }));
     let l3 = ossiec::compile(
         &g2,
         &serde_json::from_str(r#"{"metrics":["orders.completed_n"]}"#).unwrap(),
