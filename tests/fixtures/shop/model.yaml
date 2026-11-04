@@ -49,6 +49,8 @@ datasets:
       - { name: id, expression: { sql: product_id }, datatype: Integer }
       - { name: category, expression: { sql: category }, datatype: String, dimension: {} }
       - { name: stock, expression: { sql: stock }, datatype: Integer }
+    metrics:
+      - { name: stock_units, expression: { sql: SUM(stock) } }
 
 relationships:
   - { name: orders_to_customers, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
@@ -79,6 +81,9 @@ metrics:
   - name: revenue_change
     expression: { sql: "SUM(orders.revenue) - LAG(SUM(orders.revenue), 1) OVER (ORDER BY orders.order_date)" }
     description: Revenue change from the previous period
+  - name: revenue_change_to_next
+    expression: { sql: "LEAD(SUM(orders.revenue), 1) OVER (ORDER BY orders.order_date) - SUM(orders.revenue)" }
+    description: Revenue change to the next period
   - name: revenue_rank_in_region
     expression: { sql: "RANK() OVER (PARTITION BY customers.region ORDER BY SUM(orders.revenue) DESC)" }
   - name: stock_share

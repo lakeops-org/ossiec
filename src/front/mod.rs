@@ -26,8 +26,9 @@
 //! composed measure the same way. `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS m`
 //! (§5.1) defers a base measure: an ephemeral dataset-scoped metric on a clone of
 //! the graph, passed through for the outer `AGG`. [`define_layer2_view`] keeps a
-//! named measure relation in a session [`Layer2Catalog`] (`CREATE VIEW`); it is
-//! not written into the model. Other join forms (`ASOF`, `SEMI`/`ANTI`,
+//! named measure relation in a session [`Layer2Catalog`] (`CREATE VIEW`).
+//! [`persist_layer2_view`] writes that view's `TO MEASURE` items into the model
+//! as permanent metrics (and re-binds). Other join forms (`ASOF`, `SEMI`/`ANTI`,
 //! `NATURAL`, `LATERAL`, …) stay [`Error::Unsupported`].
 //!
 //! **Roles.** A column qualified by a relationship name (`departs_from.city`) is a
@@ -64,12 +65,14 @@ use crate::{Compiled, Error, Options, Result};
 mod catalog;
 mod fold;
 mod nested;
+mod persist;
 mod shell;
 mod to_measure;
 
 pub use catalog::{
     compile_script, define_layer2_view, Layer2Catalog, Layer2Column, Layer2ColumnKind,
 };
+pub use persist::persist_layer2_view;
 
 use nested::{OutCol, OutKind};
 
@@ -160,6 +163,7 @@ pub(super) struct Layer2Parsed {
 }
 
 /// A query-local base measure: one SQL aggregate, owned by a single dataset.
+#[derive(Debug, Clone)]
 pub(super) struct EphemeralMetric {
     /// Canonical `dataset.metric` name.
     pub name: String,
@@ -308,7 +312,11 @@ pub(super) fn pragma_include_unmatched(sql: &str) -> bool {
 }
 
 /// Clause checks and the `FROM` / `JOIN` list of one `AGG` stage.
-fn parse_stage_prep(graph: &SemanticGraph, sel: &Select, cfg: &StageCfg<'_>) -> Result<ParsedFrom> {
+pub(super) fn parse_stage_prep(
+    graph: &SemanticGraph,
+    sel: &Select,
+    cfg: &StageCfg<'_>,
+) -> Result<ParsedFrom> {
     if sel.with.is_some() || sel.distinct || sel.having.is_some() || sel.qualify.is_some() {
         return Err(unsupported(
             "Layer 2 WITH / DISTINCT / HAVING / QUALIFY are not implemented yet",
@@ -330,7 +338,7 @@ fn stage_aliases(graph: &SemanticGraph, from: &ParsedFrom) -> Vec<String> {
 
 /// One `AGG` stage: select list, `FROM`/`JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`.
 /// `derived_outs` are the compiled columns of the derived tables in `FROM`.
-fn parse_stage_from(
+pub(super) fn parse_stage_from(
     graph: &SemanticGraph,
     sel: &Select,
     cfg: &StageCfg<'_>,

@@ -600,14 +600,21 @@ fn a2_unevaluated_measure_passes_through_inner_select() {
 
 #[test]
 fn layer2_nested_cases_match_their_references_on_duckdb() {
-    // The engine tier's shop cases (A.2, A.3, §7.7), checked here without Docker.
+    // The engine tier's shop cases, checked here without Docker.
     let db = duckdb();
-    for (name, layer2, reference) in LAYER2_NESTED_CASES {
-        let c = ossiec::compile_layer2(&graph(), layer2, &duck()).unwrap();
+    let g = graph();
+    for case in LAYER2_NESTED_CASES {
+        let c = if case.script {
+            ossiec::compile_layer2_script(&g, case.sql, &duck())
+        } else {
+            ossiec::compile_layer2(&g, case.sql, &duck())
+        }
+        .unwrap_or_else(|e| panic!("{}: {e}", case.name));
         assert_eq!(
             sorted(duckdb_rows(&db, &c.sql)),
-            sorted(duckdb_rows(&db, reference)),
-            "{name}: {}",
+            sorted(duckdb_rows(&db, case.reference)),
+            "{}: {}",
+            case.name,
             c.sql
         );
     }
@@ -790,23 +797,27 @@ fn nested_db() -> duckdb::Connection {
     c
 }
 
-const A2_OSSIE: &str = "SELECT s.category, AGG(s.total_revenue) AS revenue \
+/// Appendix A.2 (`relational_semantics.md`): top-N self-join. Spec names the fact
+/// `orders` and ranks on `total_revenue` while measuring `total_quantity`; this
+/// fixture uses `sales` for the same shape.
+const A2_APPENDIX: &str = "SELECT s.category, AGG(s.total_quantity) \
     FROM sales s \
-    JOIN (SELECT state_id, AGG(total_revenue) AS state_revenue \
+    JOIN (SELECT state_id, AGG(total_revenue) AS r \
           FROM sales GROUP BY state_id \
-          ORDER BY state_revenue DESC, state_id LIMIT 2) t \
+          ORDER BY r DESC, state_id LIMIT 2) t \
       ON s.state_id = t.state_id \
     GROUP BY s.category";
 
 #[test]
-fn a2_ossie_names_execute() {
+fn a2_appendix_top_n_self_join() {
     let g = nested_graph();
-    let c = ossiec::compile_layer2(&g, A2_OSSIE, &duck()).unwrap();
+    let c = ossiec::compile_layer2(&g, A2_APPENDIX, &duck()).unwrap();
     let db = nested_db();
     let got = sorted(duckdb_rows(&db, &c.sql));
+    // Top two states by revenue: 3 (101) then 2 (35).
     let want = sorted(duckdb_rows(
         &db,
-        "SELECT category, SUM(amount) FROM sales WHERE state_id IN (3, 2) GROUP BY category",
+        "SELECT category, SUM(qty) FROM sales WHERE state_id IN (3, 2) GROUP BY category",
     ));
     assert_eq!(got, want);
     assert_eq!(got.len(), 2);
@@ -869,16 +880,17 @@ fn a2_null_safe_derived_key_keeps_null_group() {
     );
 }
 
-const A3_OSSIE: &str = "SELECT d.category, AVG(m.state_revenue) \
+/// Appendix A.3: average-of-averages over states (`sales` stands in for `orders`).
+const A3_APPENDIX: &str = "SELECT d.category, AVG(m.state_revenue) \
     FROM (SELECT category, state_id FROM sales GROUP BY category, state_id) d \
     JOIN (SELECT state_id, AGG(total_revenue) AS state_revenue FROM sales GROUP BY state_id) m \
       ON d.state_id IS NOT DISTINCT FROM m.state_id \
     GROUP BY d.category";
 
 #[test]
-fn a3_ossie_names_execute_with_null_safe_keys() {
+fn a3_appendix_two_stage_aggregation() {
     let g = nested_graph();
-    let c = ossiec::compile_layer2(&g, A3_OSSIE, &duck()).unwrap();
+    let c = ossiec::compile_layer2(&g, A3_APPENDIX, &duck()).unwrap();
     let db = nested_db();
     let got = sorted(duckdb_rows(&db, &c.sql));
     // A: states 1, 2, 3 and NULL → (30 + 35 + 101 + 7) / 4; B: 1, 3, 4 → (30 + 101 + 2) / 3.
@@ -897,8 +909,12 @@ fn a3_ossie_names_execute_with_null_safe_keys() {
 #[test]
 fn a3_plain_equality_drops_null_keys() {
     let g = nested_graph();
-    let c = ossiec::compile_layer2(&g, &A3_OSSIE.replace("IS NOT DISTINCT FROM", "="), &duck())
-        .unwrap();
+    let c = ossiec::compile_layer2(
+        &g,
+        &A3_APPENDIX.replace("IS NOT DISTINCT FROM", "="),
+        &duck(),
+    )
+    .unwrap();
     let db = nested_db();
     let got = sorted(duckdb_rows(&db, &c.sql));
     let a = got.iter().find(|r| r[0] == "A").unwrap();
@@ -1208,7 +1224,7 @@ fn each_stage_is_adapted_with_its_own_plan() {
         },
     )
     .unwrap();
-    assert!(my.sql.contains("utf8mb4_bin"), "{}", my.sql);
+    assert!(my.sql.contains("COLLATE utf8mb4_bin"), "{}", my.sql);
     assert!(
         my.sql.to_uppercase().contains("CAST("),
         "outer AVG: {}",
@@ -1854,6 +1870,9 @@ datasets:
     fields:
       - { name: code, expression: { sql: code }, datatype: String }
       - { name: city, expression: { sql: city }, datatype: String }
+      - { name: gates, expression: { sql: gates }, datatype: Integer }
+    metrics:
+      - { name: gate_count, expression: { sql: SUM(gates) } }
 relationships:
   - { name: departs_from, from: flights, to: airports, from_columns: [origin], to_columns: [code] }
   - { name: arrives_at, from: flights, to: airports, from_columns: [dest], to_columns: [code] }
@@ -1866,8 +1885,10 @@ fn flights_graph() -> ossiec::SemanticGraph {
 fn flights_db() -> duckdb::Connection {
     let c = duckdb::Connection::open_in_memory().unwrap();
     c.execute_batch(
-        "CREATE TABLE airports (code VARCHAR, city VARCHAR);
-         INSERT INTO airports VALUES ('JFK', 'New York'), ('LHR', 'London'), ('CDG', 'Paris');
+        "CREATE TABLE airports (code VARCHAR, city VARCHAR, gates INTEGER);
+         INSERT INTO airports VALUES
+           ('JFK', 'New York', 4), ('LHR', 'London', 3), ('CDG', 'Paris', 2),
+           ('FRA', 'Frankfurt', 5); -- never a departure or arrival
          CREATE TABLE flights (id INTEGER, origin VARCHAR, dest VARCHAR, delay INTEGER);
          INSERT INTO flights VALUES
            (1, 'JFK', 'LHR', 10),
@@ -2425,4 +2446,545 @@ fn create_view_compiles_on_every_engine() {
         polyglot_sql::parse_one(&c.sql, target)
             .unwrap_or_else(|e| panic!("{target:?} does not parse: {e}\n{}", c.sql));
     }
+}
+
+// ---------------------------------------------------------------- combinations (recent merges)
+
+#[test]
+fn create_view_with_base_sum_to_measure() {
+    // A.7 body with a base §5.1 measure, not only an AGG composition.
+    let g = two_facts_graph();
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW region_revenue AS \
+         SELECT c.region, SUM(o.amount) TO MEASURE AS total_revenue \
+         FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
+         GROUP BY c.region",
+        &two_facts_opts(),
+    )
+    .unwrap();
+    let via = "SELECT region, AGG(total_revenue) AS total_revenue \
+        FROM region_revenue GROUP BY region";
+    let fold = "SELECT region, AGG(total_revenue) AS total_revenue FROM ( \
+         SELECT c.region, SUM(o.amount) TO MEASURE AS total_revenue \
+         FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
+         GROUP BY c.region) m GROUP BY region";
+    let c = ossiec::compile_layer2_with(&g, &catalog, via, &two_facts_opts()).unwrap();
+    let direct = ossiec::compile_layer2(&g, fold, &two_facts_opts()).unwrap();
+    assert_eq!(
+        c.sql, direct.sql,
+        "view expands to the same fold as an inline derived FROM"
+    );
+    let got = rows_f64(duckdb_rows(&two_facts_db(), &c.sql));
+    let want = rows_f64(duckdb_rows(
+        &two_facts_db(),
+        "SELECT c.region, SUM(o.amount) \
+         FROM orders o JOIN customers c ON o.customer_id = c.id \
+         GROUP BY c.region",
+    ));
+    assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+    for (a, b) in got.iter().zip(&want) {
+        assert_eq!(a.0, b.0);
+        assert!((a.1 - b.1).abs() < 1e-9, "{got:?} vs {want:?}");
+    }
+}
+
+#[test]
+fn include_unmatched_with_role_played_derived_attach() {
+    // One relationship so `airports.gate_count` is unambiguous, but the dimension
+    // still uses the role form (`departs_from.city`) and the derived ON attaches
+    // through that role alias. FRA never hosts a departure; the derived join keeps
+    // FRA/JFK/LHR (drops CDG). With includeUnmatched, Frankfurt's gates appear
+    // under a NULL city group and the derived attach rides `…__unmatched`.
+    let model = FLIGHTS.replace(
+        "  - { name: arrives_at, from: flights, to: airports, from_columns: [dest], to_columns: [code] }\n",
+        "",
+    );
+    let g = ossiec::from_yaml(&model).unwrap();
+    let sql = "-- ossiec: includeUnmatched\n\
+         SELECT departs_from.city, AGG(airports.gate_count) \
+         FROM flights f \
+         LEFT JOIN airports dep ON f.origin = dep.code \
+         JOIN (SELECT code FROM airports WHERE code <> 'CDG' GROUP BY code) t \
+           ON departs_from.code = t.code \
+         GROUP BY departs_from.city";
+    let c = ossiec::compile_layer2(&g, sql, &duck()).unwrap();
+    assert!(
+        c.sql.contains("airports__departs_from") && c.sql.contains("__unmatched"),
+        "{}",
+        c.sql
+    );
+    let db = flights_db();
+    let got = sorted(duckdb_rows(&db, &c.sql));
+    let want = sorted(duckdb_rows(
+        &db,
+        "WITH keep AS (SELECT code FROM airports WHERE code <> 'CDG' GROUP BY code),
+         matched AS (
+            SELECT DISTINCT a.city, a.code, a.gates
+            FROM flights f
+            LEFT JOIN airports a ON f.origin = a.code
+            JOIN keep t ON a.code = t.code
+            WHERE a.code IS NOT NULL
+         ), unmatched AS (
+            SELECT CAST(NULL AS VARCHAR) AS city, a.code, a.gates
+            FROM airports a
+            JOIN keep t ON a.code = t.code
+            WHERE NOT EXISTS (SELECT 1 FROM flights f WHERE f.origin = a.code)
+         ), r AS (
+            SELECT * FROM matched UNION ALL SELECT * FROM unmatched
+         ), g AS (
+            SELECT DISTINCT city FROM (
+              SELECT a.city FROM flights f
+              LEFT JOIN airports a ON f.origin = a.code
+              JOIN keep t ON a.code = t.code
+              UNION ALL SELECT city FROM unmatched
+            ) u
+         )
+         SELECT g.city, s.gates
+         FROM g
+         LEFT JOIN (SELECT city, SUM(gates) AS gates FROM r GROUP BY city) s
+           ON g.city IS NOT DISTINCT FROM s.city",
+    ));
+    assert_eq!(got, want, "sql:\n{}", c.sql);
+    assert!(
+        got.iter().any(|r| r[0] == "NULL" && r[1].starts_with('5')),
+        "unused FRA (5 gates) should appear unmatched: {got:?}\n{}",
+        c.sql
+    );
+    assert!(got.iter().all(|r| r[0] != "Paris"), "{got:?}");
+}
+
+#[test]
+fn a4_ratio_with_partial_fact_derived_join() {
+    // Derived join hosts orders only: ticket counts stay complete across every
+    // region, and the ratio does not fan either fact through the other.
+    let g = two_facts_graph();
+    let sql = "SELECT c.region, \
+                      AGG(o.order_amt) / AGG(t.ticket_count) AS sales_per_ticket \
+               FROM customers c \
+               LEFT JOIN orders o ON o.customer_id = c.id \
+               LEFT JOIN tickets t ON t.customer_id = c.id \
+               JOIN (SELECT customer_id, AGG(order_amt) AS n FROM orders \
+                     GROUP BY customer_id ORDER BY n DESC, customer_id LIMIT 2) d \
+                 ON o.customer_id = d.customer_id \
+               GROUP BY c.region";
+    let c = ossiec::compile_layer2(&g, sql, &two_facts_opts()).unwrap();
+    assert!(c.sql.contains("UNION ALL"), "{}", c.sql);
+    let db = two_facts_db();
+    let got = rows_f64(duckdb_rows(&db, &c.sql));
+    let want = rows_f64(duckdb_rows(
+        &db,
+        "SELECT region, \
+                CASE WHEN order_amt IS NULL THEN NULL \
+                     ELSE order_amt * 1.0 / ticket_count END \
+         FROM (
+            SELECT region, MAX(order_amt) AS order_amt, COALESCE(MAX(ticket_count), 0) AS ticket_count FROM (
+                SELECT c.region AS region, SUM(o.amount) AS order_amt, NULL::BIGINT AS ticket_count
+                FROM orders o
+                LEFT JOIN customers c ON o.customer_id = c.id
+                JOIN (SELECT customer_id FROM orders GROUP BY customer_id
+                      ORDER BY SUM(amount) DESC, customer_id LIMIT 2) d
+                  ON o.customer_id = d.customer_id
+                GROUP BY c.region
+                UNION ALL
+                SELECT c.region, NULL, COUNT(*)
+                FROM tickets t
+                LEFT JOIN customers c ON t.customer_id = c.id
+                GROUP BY c.region
+             ) GROUP BY region
+         )",
+    ));
+    assert_eq!(got, want, "{}", c.sql);
+    let eu = got.iter().find(|r| r.0 == "EU").unwrap();
+    assert!((eu.1 - 20.0).abs() < 1e-9, "60/3 = 20: {got:?}");
+    // US / APAC keep unrestricted tickets and a NULL numerator → NULL ratio.
+    assert!(got.iter().any(|r| r.0 == "US" && r.1 < 0.0), "{got:?}");
+    assert!(got.iter().any(|r| r.0 == "APAC" && r.1 < 0.0), "{got:?}");
+}
+
+/// Appendix A.7: conformed-dimension bridge as a session `CREATE VIEW`.
+#[test]
+fn a7_appendix_conformed_dimension_bridge() {
+    let (g, catalog) = define_region_metrics();
+    let via = "SELECT region, AGG(sales_per_ticket) AS sales_per_ticket \
+        FROM region_metrics GROUP BY region";
+    let c = ossiec::compile_layer2_with(&g, &catalog, via, &two_facts_opts()).unwrap();
+    assert_region_ratio(&c.sql);
+}
+
+// -------------------------------------------------------- A.7 persist into model
+
+#[test]
+fn persist_view_ratio_becomes_model_metric() {
+    let (g, catalog) = define_region_metrics();
+    let (g2, added) =
+        ossiec::persist_layer2_view(&g, &catalog, "region_metrics", &two_facts_opts()).unwrap();
+    assert_eq!(added, vec!["sales_per_ticket"]);
+    assert!(g2
+        .model()
+        .metrics
+        .iter()
+        .any(|m| m.name == "sales_per_ticket"));
+    // Layer 3 request uses the new metric; answers match the Layer 2 view path.
+    let l3 = ossiec::compile(
+        &g2,
+        &serde_json::from_str(
+            r#"{"metrics":["sales_per_ticket"],"dimensions":["customers.region"]}"#,
+        )
+        .unwrap(),
+        &two_facts_opts(),
+    )
+    .unwrap();
+    assert_region_ratio(&l3.sql);
+    // Round-trip YAML still binds.
+    let yaml = ossiec::to_yaml(g2.model()).unwrap();
+    let g3 = ossiec::from_yaml(&yaml).unwrap();
+    assert!(g3
+        .describe()
+        .metrics
+        .iter()
+        .any(|m| m.name == "sales_per_ticket" && m.queryable));
+}
+
+#[test]
+fn persist_view_base_to_measure_becomes_dataset_metric() {
+    let g = graph();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    };
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW status_counts AS \
+         SELECT o.status, COUNT(*) TO MEASURE AS status_n \
+         FROM orders o GROUP BY o.status",
+        &opts,
+    )
+    .unwrap();
+    let (g2, added) = ossiec::persist_layer2_view(&g, &catalog, "status_counts", &opts).unwrap();
+    assert_eq!(added, vec!["orders.status_n"]);
+    assert!(g2
+        .model()
+        .datasets
+        .iter()
+        .any(|d| { d.name == "orders" && d.metrics.iter().any(|m| m.name == "status_n") }));
+    assert_eq!(
+        persisted_rows(
+            &g2,
+            r#"{"metrics":["orders.status_n"],"dimensions":["orders.status"]}"#
+        ),
+        view_rows(
+            &g,
+            &catalog,
+            "SELECT status, AGG(status_n) FROM status_counts GROUP BY status"
+        ),
+    );
+}
+
+fn persist_opts() -> Options {
+    Options {
+        target: Some(DialectType::DuckDB),
+        ..Default::default()
+    }
+}
+
+fn sorted_rows(sql: &str) -> Vec<Vec<String>> {
+    let mut rows = duckdb_rows(&duckdb(), sql);
+    rows.sort();
+    rows
+}
+
+fn view_rows(g: &ossiec::SemanticGraph, catalog: &Layer2Catalog, sql: &str) -> Vec<Vec<String>> {
+    sorted_rows(
+        &ossiec::compile_layer2_with(g, catalog, sql, &persist_opts())
+            .unwrap()
+            .sql,
+    )
+}
+
+fn persisted_rows(g: &ossiec::SemanticGraph, request: &str) -> Vec<Vec<String>> {
+    let request = serde_json::from_str(request).unwrap();
+    sorted_rows(&ossiec::compile(g, &request, &persist_opts()).unwrap().sql)
+}
+
+fn persist_error(model: &str, view: &str) -> Error {
+    let g = ossiec::from_yaml(model).unwrap();
+    let mut catalog = Layer2Catalog::new();
+    let opts = persist_opts();
+    let name = ossiec::define_layer2_view(&g, &mut catalog, view, &opts).unwrap();
+    ossiec::persist_layer2_view(&g, &catalog, &name, &opts)
+        .err()
+        .unwrap_or_else(|| panic!("persisted: {view}"))
+}
+
+/// The model's own path from a fact to a dimension is a LEFT join, so this view
+/// is the one join shape that keeps its answers once persisted.
+#[test]
+fn persist_view_left_join_matches_the_view() {
+    let g = graph();
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW v AS SELECT c.region, (AGG(o.order_count) * 2) TO MEASURE AS doubled \
+         FROM orders o LEFT JOIN customers c ON o.customer_id = c.id GROUP BY c.region",
+        &persist_opts(),
+    )
+    .unwrap();
+    let (g2, _) = ossiec::persist_layer2_view(&g, &catalog, "v", &persist_opts()).unwrap();
+    assert_eq!(
+        persisted_rows(
+            &g2,
+            r#"{"metrics":["doubled"],"dimensions":["customers.region"]}"#
+        ),
+        view_rows(
+            &g,
+            &catalog,
+            "SELECT region, AGG(doubled) FROM v GROUP BY region"
+        ),
+    );
+}
+
+/// Each view narrows or reshapes its rows in a way a metric cannot carry.
+/// Persisting would silently change its answers, so it must be refused.
+#[test]
+fn persist_view_refuses_what_a_metric_cannot_carry() {
+    let ratio = "(AGG(o.order_count) * 1) TO MEASURE AS r";
+    for (clause, view) in [
+        (
+            "WHERE",
+            "CREATE VIEW v AS SELECT o.status, COUNT(*) TO MEASURE AS n \
+             FROM orders o WHERE o.status = 'completed' GROUP BY o.status"
+                .to_string(),
+        ),
+        (
+            "WHERE",
+            format!(
+                "CREATE VIEW v AS SELECT o.status, {ratio} \
+                 FROM orders o WHERE o.status = 'completed' GROUP BY o.status"
+            ),
+        ),
+        (
+            "LIMIT",
+            "CREATE VIEW v AS SELECT o.status, COUNT(*) TO MEASURE AS n \
+             FROM orders o GROUP BY o.status ORDER BY o.status LIMIT 1"
+                .to_string(),
+        ),
+        (
+            "other than LEFT",
+            format!(
+                "CREATE VIEW v AS SELECT c.region, {ratio} \
+                 FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region"
+            ),
+        ),
+        (
+            "other than LEFT",
+            format!(
+                "CREATE VIEW v AS SELECT c.region, {ratio} \
+                 FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id GROUP BY c.region"
+            ),
+        ),
+        (
+            "other than LEFT",
+            format!(
+                "CREATE VIEW v AS SELECT c.region, {ratio} \
+                 FROM orders o FULL JOIN customers c ON o.customer_id = c.id GROUP BY c.region"
+            ),
+        ),
+    ] {
+        let e = persist_error(SHOP, &view);
+        assert!(
+            matches!(e, Error::Unsupported(ref m) if m.contains(clause) && m.contains("would not carry")),
+            "{view}: {e}"
+        );
+    }
+}
+
+/// A filter inside a nested relation must not slip past the check on the outer
+/// `SELECT`, whether it comes from a referenced view or an inline derived table.
+#[test]
+fn persist_view_refuses_a_filter_in_a_nested_relation() {
+    let g = graph();
+    let opts = persist_opts();
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW a AS SELECT status, order_count FROM orders \
+         WHERE status = 'completed' GROUP BY status",
+        &opts,
+    )
+    .unwrap();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW over_view AS SELECT o.status, (AGG(a.order_count) * 2) TO MEASURE AS d \
+         FROM orders o LEFT JOIN a ON o.status = a.status GROUP BY o.status",
+        &opts,
+    )
+    .unwrap();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW over_derived AS SELECT o.status, (AGG(t.order_count) * 2) TO MEASURE AS d \
+         FROM orders o LEFT JOIN (SELECT status, order_count FROM orders \
+         WHERE status = 'completed' GROUP BY status) t ON o.status = t.status GROUP BY o.status",
+        &opts,
+    )
+    .unwrap();
+    for view in ["over_view", "over_derived"] {
+        let e = ossiec::persist_layer2_view(&g, &catalog, view, &opts)
+            .err()
+            .unwrap_or_else(|| panic!("persisted {view}"));
+        assert!(
+            matches!(e, Error::Unsupported(ref m) if m.contains("a WHERE filter")),
+            "{view}: {e}"
+        );
+    }
+}
+
+/// `COUNT(*)` on the nullable side of a LEFT JOIN becomes `COUNT(dataset.key)`.
+/// A NULL-extended row (product 13 never sold) must not make that differ from
+/// the view.
+#[test]
+fn persist_view_count_star_on_the_nullable_side_matches_the_view() {
+    let g = graph();
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW v AS SELECT p.id, (AGG(o.order_count) * 1) TO MEASURE AS d \
+         FROM products p LEFT JOIN orders o ON o.product_id = p.id GROUP BY p.id",
+        &persist_opts(),
+    )
+    .unwrap();
+    let (g2, _) = ossiec::persist_layer2_view(&g, &catalog, "v", &persist_opts()).unwrap();
+    let persisted = persisted_rows(&g2, r#"{"metrics":["d"],"dimensions":["products.id"]}"#);
+    assert!(!persisted.is_empty());
+    assert_eq!(
+        persisted,
+        view_rows(&g, &catalog, "SELECT id, AGG(d) FROM v GROUP BY id"),
+    );
+}
+
+/// `orders` without a primary key whose first field, `customer_id`, holds NULLs
+/// (guest checkouts): `COUNT(customer_id)` would undercount `COUNT(*)`.
+const ORDERS_WITHOUT_PRIMARY_KEY: &str = r#"
+version: "0.2.0.dev0"
+name: no_primary_key
+datasets:
+  - name: orders
+    source: orders
+    fields:
+      - { name: customer_id, expression: { sql: customer_id }, datatype: Integer }
+      - { name: status, expression: { sql: status }, datatype: String, dimension: {} }
+    metrics:
+      - name: order_count
+        expression: { sql: COUNT(*) }
+"#;
+
+#[test]
+fn persist_view_composing_count_star_needs_a_primary_key() {
+    let e = persist_error(
+        ORDERS_WITHOUT_PRIMARY_KEY,
+        "CREATE VIEW v AS SELECT status, (AGG(order_count) * 1) TO MEASURE AS c \
+         FROM orders GROUP BY status",
+    );
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("no primary key")),
+        "{e}"
+    );
+    // A field that happens to be called `id` is not a primary key either.
+    let e = persist_error(
+        &SHOP.replacen("    primary_key: [id]\n", "", 1),
+        "CREATE VIEW v AS SELECT status, (AGG(order_count) * 1) TO MEASURE AS c \
+         FROM orders GROUP BY status",
+    );
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("no primary key")),
+        "{e}"
+    );
+}
+
+/// The refusal above tells the user to persist at dataset scope: that must work
+/// and must keep the rows with a NULL first field.
+#[test]
+fn persist_view_count_star_without_a_primary_key_works_at_dataset_scope() {
+    let g = ossiec::from_yaml(ORDERS_WITHOUT_PRIMARY_KEY).unwrap();
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW v AS SELECT status, COUNT(*) TO MEASURE AS n FROM orders GROUP BY status",
+        &persist_opts(),
+    )
+    .unwrap();
+    let (g2, added) = ossiec::persist_layer2_view(&g, &catalog, "v", &persist_opts()).unwrap();
+    assert_eq!(added, vec!["orders.n"]);
+    assert_eq!(
+        persisted_rows(
+            &g2,
+            r#"{"metrics":["orders.n"],"dimensions":["orders.status"]}"#
+        ),
+        view_rows(&g, &catalog, "SELECT status, AGG(n) FROM v GROUP BY status"),
+    );
+}
+
+#[test]
+fn persist_view_refuses_a_leaf_without_portable_sql() {
+    let dialect_only = SHOP.replacen(
+        "expression: { sql: COUNT(*) }\n        description: Number of orders",
+        "expression:\n          dialects:\n            - { dialect: DUCKDB, expression: \"COUNT(*)\" }",
+        1,
+    );
+    assert_ne!(dialect_only, SHOP, "fixture no longer has this metric");
+    let e = persist_error(
+        &dialect_only,
+        "CREATE VIEW v AS SELECT status, (AGG(order_count) * 1) TO MEASURE AS c \
+         FROM orders GROUP BY status",
+    );
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("no portable `sql` expression")),
+        "{e}"
+    );
+}
+
+#[test]
+fn persist_view_refusals() {
+    let (g, catalog) = define_region_metrics();
+    let opts = two_facts_opts();
+    let e = ossiec::persist_layer2_view(&g, &catalog, "missing", &opts)
+        .err()
+        .expect("missing view");
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("not defined")),
+        "{e}"
+    );
+    let (g2, _) = ossiec::persist_layer2_view(&g, &catalog, "region_metrics", &opts).unwrap();
+    let e = ossiec::persist_layer2_view(&g2, &catalog, "region_metrics", &opts)
+        .err()
+        .expect("duplicate metric");
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("already exists")),
+        "{e}"
+    );
+    let mut cat = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut cat,
+        "CREATE VIEW eu_ids AS SELECT c.region FROM customers c WHERE c.region = 'EU'",
+        &opts,
+    )
+    .unwrap();
+    let e = ossiec::persist_layer2_view(&g, &cat, "eu_ids", &opts)
+        .err()
+        .expect("no TO MEASURE");
+    assert!(
+        matches!(e, Error::Request(ref m) if m.contains("no TO MEASURE")),
+        "{e}"
+    );
 }

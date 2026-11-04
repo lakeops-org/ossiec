@@ -2,7 +2,8 @@
 //!
 //! A view is a named derived table: its select list's fields, passed-through
 //! measures and `(...) TO MEASURE` items. [`define_layer2_view`] checks the body
-//! and stores it on a [`Layer2Catalog`]. Nothing is written to the model.
+//! and stores it on a [`Layer2Catalog`]. [`super::persist_layer2_view`] can later
+//! write the view's `TO MEASURE` items into the model as permanent metrics.
 //! [`super::compile_with`] then rewrites `FROM` / `JOIN` of that name into
 //! the defining `SELECT`, so `AGG(view.measure)` is the same §7.7 path as a
 //! derived table (sole `FROM` folds; a join attaches the view like Appendix A.2).
@@ -44,11 +45,11 @@ pub struct Layer2Catalog {
 /// One view: the defining `SELECT` (with `TO MEASURE` markers), the expressions
 /// those markers stand for, and the columns a consumer sees.
 #[derive(Debug, Clone)]
-struct View {
-    name: String,
-    select: Select,
-    to_measures: Vec<Expression>,
-    outputs: Vec<OutCol>,
+pub(super) struct View {
+    pub(super) name: String,
+    pub(super) select: Select,
+    pub(super) to_measures: Vec<Expression>,
+    pub(super) outputs: Vec<OutCol>,
 }
 
 impl Layer2Catalog {
@@ -73,7 +74,7 @@ impl Layer2Catalog {
         })
     }
 
-    fn lookup(&self, name: &str) -> Option<&View> {
+    pub(super) fn lookup(&self, name: &str) -> Option<&View> {
         self.views
             .iter()
             .find(|v| v.name.eq_ignore_ascii_case(name))
