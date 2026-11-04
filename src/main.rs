@@ -17,7 +17,8 @@ OPTIONS:
     --include-unmatched
                        Layer 2: also return one-side rows no fact reaches (same as a
                        request's includeUnmatched, or `-- ossiec: includeUnmatched` in the SQL)
-    --out <path>       persist-view: write the updated model YAML to this file (default: stdout)
+    --out <path>       persist-view: write the updated model YAML to this file (default: stdout).
+                       The model is re-serialized: unknown keys and comments are not preserved
     --compact          One-line SQL
     --json             Print the full compile result (SQL, dialect, warnings, hash) as JSON
 

@@ -258,7 +258,9 @@ let (graph, added) = ossiec::persist_layer2_view(&graph, &views, "region_metrics
 let yaml = ossiec::to_yaml(graph.model())?;
 ```
 
-Persisting refuses a view with `WHERE`, `LIMIT`/`OFFSET` or a join other than `LEFT JOIN`, because a metric would not carry them and would answer differently from the view. Composing a dataset's `COUNT(*)` into a model-scoped metric also needs that dataset to declare a primary key.
+Persisting refuses a view with `WHERE`, `LIMIT`/`OFFSET` or a join other than `LEFT JOIN`, including inside a referenced view or derived table, because a metric would not carry them and could answer differently from the view. Composing a dataset's `COUNT(*)` into a model-scoped metric also needs that dataset to declare a primary key.
+
+`to_yaml` and `persist-view` write a re-serialized model, so unknown keys and comments in the source file are not preserved. Write to a new file and review the diff before replacing the original.
 
 Model-scoped metrics are not measures (§10.3). `AGG(expr)` inside `AGG()` is refused; use `AGG(a) + AGG(b)`. Other join forms (`ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) are not implemented yet. `CROSS JOIN` takes no `ON`.
 

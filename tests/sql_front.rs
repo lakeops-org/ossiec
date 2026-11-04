@@ -2804,6 +2804,73 @@ fn persist_view_refuses_what_a_metric_cannot_carry() {
     }
 }
 
+/// A filter inside a nested relation must not slip past the check on the outer
+/// `SELECT`, whether it comes from a referenced view or an inline derived table.
+#[test]
+fn persist_view_refuses_a_filter_in_a_nested_relation() {
+    let g = graph();
+    let opts = persist_opts();
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW a AS SELECT status, order_count FROM orders \
+         WHERE status = 'completed' GROUP BY status",
+        &opts,
+    )
+    .unwrap();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW over_view AS SELECT o.status, (AGG(a.order_count) * 2) TO MEASURE AS d \
+         FROM orders o LEFT JOIN a ON o.status = a.status GROUP BY o.status",
+        &opts,
+    )
+    .unwrap();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW over_derived AS SELECT o.status, (AGG(t.order_count) * 2) TO MEASURE AS d \
+         FROM orders o LEFT JOIN (SELECT status, order_count FROM orders \
+         WHERE status = 'completed' GROUP BY status) t ON o.status = t.status GROUP BY o.status",
+        &opts,
+    )
+    .unwrap();
+    for view in ["over_view", "over_derived"] {
+        let e = ossiec::persist_layer2_view(&g, &catalog, view, &opts)
+            .err()
+            .unwrap_or_else(|| panic!("persisted {view}"));
+        assert!(
+            matches!(e, Error::Unsupported(ref m) if m.contains("a WHERE filter")),
+            "{view}: {e}"
+        );
+    }
+}
+
+/// `COUNT(*)` on the nullable side of a LEFT JOIN becomes `COUNT(dataset.key)`.
+/// A NULL-extended row (product 13 never sold) must not make that differ from
+/// the view.
+#[test]
+fn persist_view_count_star_on_the_nullable_side_matches_the_view() {
+    let g = graph();
+    let mut catalog = Layer2Catalog::new();
+    ossiec::define_layer2_view(
+        &g,
+        &mut catalog,
+        "CREATE VIEW v AS SELECT p.id, (AGG(o.order_count) * 1) TO MEASURE AS d \
+         FROM products p LEFT JOIN orders o ON o.product_id = p.id GROUP BY p.id",
+        &persist_opts(),
+    )
+    .unwrap();
+    let (g2, _) = ossiec::persist_layer2_view(&g, &catalog, "v", &persist_opts()).unwrap();
+    let persisted = persisted_rows(&g2, r#"{"metrics":["d"],"dimensions":["products.id"]}"#);
+    assert!(!persisted.is_empty());
+    assert_eq!(
+        persisted,
+        view_rows(&g, &catalog, "SELECT id, AGG(d) FROM v GROUP BY id"),
+    );
+}
+
 /// `orders` without a primary key whose first field, `customer_id`, holds NULLs
 /// (guest checkouts): `COUNT(customer_id)` would undercount `COUNT(*)`.
 const ORDERS_WITHOUT_PRIMARY_KEY: &str = r#"

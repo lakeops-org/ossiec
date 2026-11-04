@@ -112,8 +112,17 @@ pub fn persist_layer2_view(
 /// Refuse a view whose rows a persisted metric could not reproduce. The metric
 /// keeps only the aggregate and is later queried over the model's own `LEFT`
 /// joins, so a `WHERE`, `LIMIT`/`OFFSET` or any other join kind in the view would
-/// be dropped silently and change the answer.
+/// be dropped silently and change the answer. Derived tables are checked too,
+/// which is where the body of a referenced view ends up after expansion.
 fn refuse_narrowed_rows(view: &str, sel: &Select) -> Result<()> {
+    let relations = sel
+        .from
+        .iter()
+        .flat_map(|f| f.expressions.iter())
+        .chain(sel.joins.iter().map(|j| &j.this));
+    for derived in relations.filter_map(derived_select) {
+        refuse_narrowed_rows(view, derived)?;
+    }
     let non_left_join = sel
         .joins
         .iter()
@@ -131,8 +140,19 @@ fn refuse_narrowed_rows(view: &str, sel: &Select) -> Result<()> {
         return Ok(());
     };
     Err(Error::Unsupported(format!(
-        "Layer 2 view `{view}` has {clause}, which a persisted metric would not carry: it would answer differently from the view"
+        "Layer 2 view `{view}` has {clause}, which a persisted metric would not carry: it could answer differently from the view"
     )))
+}
+
+fn derived_select(relation: &Expression) -> Option<&Select> {
+    match relation {
+        Expression::Alias(a) => derived_select(&a.this),
+        Expression::Subquery(s) => match &s.this {
+            Expression::Select(sel) => Some(sel),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn ensure_absent(model: &Model, full: &str, kind: &Kind) -> Result<()> {
