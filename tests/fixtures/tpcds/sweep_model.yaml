@@ -7,7 +7,7 @@
 # same `tpcds.public.` prefix as the example; tests rewrite it per engine.
 version: "0.2.0.dev0"
 name: tpcds_sweep
-description: Store sales with the item and date attributes used by TPC-DS q3, q42, q52, q55 and q98.
+description: Store / catalog / web sales with attributes for TPC-DS q3, q7, q12, q26, q42, q43, q48, q52, q55, q96 and q98.
 datasets:
   - name: store_sales
     source: tpcds.public.store_sales
@@ -20,10 +20,31 @@ datasets:
       - { name: ss_store_sk, expression: { sql: ss_store_sk }, datatype: Integer }
       - { name: ss_sold_time_sk, expression: { sql: ss_sold_time_sk }, datatype: Integer }
       - { name: ss_hdemo_sk, expression: { sql: ss_hdemo_sk }, datatype: Integer }
+      - { name: ss_cdemo_sk, expression: { sql: ss_cdemo_sk }, datatype: Integer }
+      - { name: ss_promo_sk, expression: { sql: ss_promo_sk }, datatype: Integer }
+      - { name: ss_quantity, expression: { sql: ss_quantity }, datatype: Integer }
+      - { name: ss_list_price, expression: { sql: ss_list_price }, datatype: Decimal }
+      - { name: ss_coupon_amt, expression: { sql: ss_coupon_amt }, datatype: Decimal }
       - { name: ss_sales_price, expression: { sql: ss_sales_price }, datatype: Decimal }
       - { name: ss_ext_sales_price, expression: { sql: ss_ext_sales_price }, datatype: Decimal }
+      - { name: ss_net_profit, expression: { sql: ss_net_profit }, datatype: Decimal }
+      - { name: ss_addr_sk, expression: { sql: ss_addr_sk }, datatype: Integer }
     metrics:
       - { name: sales_count, expression: { sql: "COUNT(*)" } }
+
+  - name: catalog_sales
+    source: tpcds.public.catalog_sales
+    primary_key: [cs_item_sk, cs_order_number]
+    fields:
+      - { name: cs_sold_date_sk, expression: { sql: cs_sold_date_sk }, datatype: Integer }
+      - { name: cs_item_sk, expression: { sql: cs_item_sk }, datatype: Integer }
+      - { name: cs_order_number, expression: { sql: cs_order_number }, datatype: Integer }
+      - { name: cs_bill_cdemo_sk, expression: { sql: cs_bill_cdemo_sk }, datatype: Integer }
+      - { name: cs_promo_sk, expression: { sql: cs_promo_sk }, datatype: Integer }
+      - { name: cs_quantity, expression: { sql: cs_quantity }, datatype: Integer }
+      - { name: cs_list_price, expression: { sql: cs_list_price }, datatype: Decimal }
+      - { name: cs_coupon_amt, expression: { sql: cs_coupon_amt }, datatype: Decimal }
+      - { name: cs_sales_price, expression: { sql: cs_sales_price }, datatype: Decimal }
 
   - name: web_sales
     source: tpcds.public.web_sales
@@ -58,6 +79,27 @@ datasets:
       - { name: hd_demo_sk, expression: { sql: hd_demo_sk }, datatype: Integer }
       - { name: hd_dep_count, expression: { sql: hd_dep_count }, datatype: Integer }
 
+  - name: customer_demographics
+    source: tpcds.public.customer_demographics
+    primary_key: [cd_demo_sk]
+    fields:
+      - { name: cd_demo_sk, expression: { sql: cd_demo_sk }, datatype: Integer }
+      - { name: cd_gender, expression: { sql: cd_gender }, datatype: String }
+      - { name: cd_marital_status, expression: { sql: cd_marital_status }, datatype: String }
+      - { name: cd_education_status, expression: { sql: cd_education_status }, datatype: String }
+
+  - name: promotion
+    source: tpcds.public.promotion
+    primary_key: [p_promo_sk]
+    fields:
+      - { name: p_promo_sk, expression: { sql: p_promo_sk }, datatype: Integer }
+      - { name: p_channel_email, expression: { sql: p_channel_email }, datatype: String }
+      - { name: p_channel_event, expression: { sql: p_channel_event }, datatype: String }
+      # Request filters are AND-only; q7's `(email = N OR event = N)` is this flag.
+      - name: channel_email_or_event_n
+        expression: { sql: "CASE WHEN p_channel_email = 'N' OR p_channel_event = 'N' THEN 1 ELSE 0 END" }
+        datatype: Integer
+
   - name: store_returns
     source: tpcds.public.store_returns
     primary_key: [sr_item_sk, sr_ticket_number]
@@ -81,8 +123,19 @@ datasets:
     primary_key: [ca_address_sk]
     fields:
       - { name: ca_address_sk, expression: { sql: ca_address_sk }, datatype: Integer }
+      - { name: ca_country, expression: { sql: ca_country }, datatype: String }
       - { name: ca_state, expression: { sql: ca_state }, datatype: String }
       - { name: ca_gmt_offset, expression: { sql: ca_gmt_offset }, datatype: Decimal }
+
+  # Sale-line billing address (q48). Same physical table as customer_address;
+  # a separate dataset keeps the path from store_sales unambiguous.
+  - name: bill_address
+    source: tpcds.public.customer_address
+    primary_key: [ca_address_sk]
+    fields:
+      - { name: ca_address_sk, expression: { sql: ca_address_sk }, datatype: Integer }
+      - { name: ca_country, expression: { sql: ca_country }, datatype: String }
+      - { name: ca_state, expression: { sql: ca_state }, datatype: String }
 
   - name: date_dim
     source: tpcds.public.date_dim
@@ -118,10 +171,18 @@ relationships:
   - { name: sales_to_store, from: store_sales, to: store, from_columns: [ss_store_sk], to_columns: [s_store_sk] }
   - { name: sales_to_time, from: store_sales, to: time_dim, from_columns: [ss_sold_time_sk], to_columns: [t_time_sk] }
   - { name: sales_to_hdemo, from: store_sales, to: household_demographics, from_columns: [ss_hdemo_sk], to_columns: [hd_demo_sk] }
+  - { name: sales_to_cdemo, from: store_sales, to: customer_demographics, from_columns: [ss_cdemo_sk], to_columns: [cd_demo_sk] }
+  - { name: sales_to_promo, from: store_sales, to: promotion, from_columns: [ss_promo_sk], to_columns: [p_promo_sk] }
+  - { name: sales_to_bill_addr, from: store_sales, to: bill_address, from_columns: [ss_addr_sk], to_columns: [ca_address_sk] }
   # Role-playing: date_dim is also the customer's first-sale and first-ship-to date.
   # From store_sales, a plain `date_dim.x` is the one-hop sale date (shortest path).
   - { name: customer_first_sales, from: customer, to: date_dim, from_columns: [c_first_sales_date_sk], to_columns: [d_date_sk] }
   - { name: customer_first_shipto, from: customer, to: date_dim, from_columns: [c_first_shipto_date_sk], to_columns: [d_date_sk] }
+  # Catalog sales (q26): same dimensions as store, independent fact.
+  - { name: catalog_to_date, from: catalog_sales, to: date_dim, from_columns: [cs_sold_date_sk], to_columns: [d_date_sk] }
+  - { name: catalog_to_item, from: catalog_sales, to: item, from_columns: [cs_item_sk], to_columns: [i_item_sk] }
+  - { name: catalog_to_cdemo, from: catalog_sales, to: customer_demographics, from_columns: [cs_bill_cdemo_sk], to_columns: [cd_demo_sk] }
+  - { name: catalog_to_promo, from: catalog_sales, to: promotion, from_columns: [cs_promo_sk], to_columns: [p_promo_sk] }
   # A second, independent fact sharing item and date_dim.
   - { name: web_to_date, from: web_sales, to: date_dim, from_columns: [ws_sold_date_sk], to_columns: [d_date_sk] }
   - { name: web_to_item, from: web_sales, to: item, from_columns: [ws_item_sk], to_columns: [i_item_sk] }
@@ -135,6 +196,43 @@ relationships:
 metrics:
   - name: total_sales
     expression: { sql: SUM(store_sales.ss_ext_sales_price) }
+  # TPC-DS q7: averages over store_sales lines (filters live on the request).
+  - name: avg_quantity
+    expression: { sql: AVG(store_sales.ss_quantity) }
+  - name: avg_list_price
+    expression: { sql: AVG(store_sales.ss_list_price) }
+  - name: avg_coupon_amt
+    expression: { sql: AVG(store_sales.ss_coupon_amt) }
+  - name: avg_sales_price
+    expression: { sql: AVG(store_sales.ss_sales_price) }
+  # TPC-DS q26: same shape as q7 over catalog_sales.
+  - name: catalog_avg_quantity
+    expression: { sql: AVG(catalog_sales.cs_quantity) }
+  - name: catalog_avg_list_price
+    expression: { sql: AVG(catalog_sales.cs_list_price) }
+  - name: catalog_avg_coupon_amt
+    expression: { sql: AVG(catalog_sales.cs_coupon_amt) }
+  - name: catalog_avg_sales_price
+    expression: { sql: AVG(catalog_sales.cs_sales_price) }
+  # TPC-DS q48: OR-of-AND filter groups become one CASE (request filters are AND-only).
+  - name: q48_quantity
+    expression:
+      sql: >-
+        SUM(CASE WHEN
+          ((customer_demographics.cd_marital_status = 'M' AND customer_demographics.cd_education_status = '4 yr Degree'
+            AND store_sales.ss_sales_price BETWEEN 100.00 AND 150.00)
+           OR (customer_demographics.cd_marital_status = 'D' AND customer_demographics.cd_education_status = '2 yr Degree'
+            AND store_sales.ss_sales_price BETWEEN 50.00 AND 100.00)
+           OR (customer_demographics.cd_marital_status = 'S' AND customer_demographics.cd_education_status = 'College'
+            AND store_sales.ss_sales_price BETWEEN 150.00 AND 200.00))
+          AND
+          ((bill_address.ca_country = 'United States' AND bill_address.ca_state IN ('CO', 'OH', 'TX')
+            AND store_sales.ss_net_profit BETWEEN 0 AND 2000)
+           OR (bill_address.ca_country = 'United States' AND bill_address.ca_state IN ('OR', 'MN', 'KY')
+            AND store_sales.ss_net_profit BETWEEN 150 AND 3000)
+           OR (bill_address.ca_country = 'United States' AND bill_address.ca_state IN ('VA', 'CA', 'MS')
+            AND store_sales.ss_net_profit BETWEEN 50 AND 25000))
+          THEN store_sales.ss_quantity ELSE NULL END)
   # TPC-DS q98's revenueratio: an item's share of its class's revenue.
   - name: revenue_ratio
     expression:

@@ -9,6 +9,7 @@
 # Containers are named ossiec-*; nothing else on the machine is touched.
 set -euo pipefail
 
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:484}"
 STARROCKS_IMAGE="${STARROCKS_IMAGE:-starrocks/allin1-ubuntu:4.1.6}"
 CLICKHOUSE_IMAGE="${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8}"
@@ -57,7 +58,9 @@ case "${1:-}" in
     start ossiec-starrocks "$STARROCKS_IMAGE"
     start ossiec-postgres "$POSTGRES_IMAGE" -e POSTGRES_PASSWORD=ossiec
     start ossiec-clickhouse "$CLICKHOUSE_IMAGE"
-    start ossiec-trino "$TRINO_IMAGE"
+    # The TPC-DS tier copies tables into the memory catalog (default limit 128 MB).
+    start ossiec-trino "$TRINO_IMAGE" \
+      -v "$SCRIPTS_DIR/trino-memory.properties:/etc/trino/catalog/memory.properties:ro"
     # local-infile: the TPC-DS tier bulk-loads CSV.
     start ossiec-mysql "$MYSQL_IMAGE" -e MYSQL_ROOT_PASSWORD=ossiec -e MYSQL_DATABASE=ossiec
     wait_for ossiec-postgres 60 psql -U postgres -c 'SELECT 1'

@@ -4,8 +4,8 @@
 //!   metrics (including the de-duplicated and window ones) against hand-written
 //!   reference SQL.
 //! - **Official TPC-DS queries** (`fixtures/tpcds/sweep_model.yaml`): requests that
-//!   express q3, q42, q52, q55 and q98, compared with the benchmark's own SQL from
-//!   DuckDB's `tpcds_queries()`.
+//!   express q3, q7, q12, q26, q42, q43, q48, q52, q55, q96 and q98, compared
+//!   with the benchmark's own SQL from DuckDB's `tpcds_queries()`.
 //!
 //! Ground truth always runs on the *same* engine as ossiec's query (reference SQL
 //! is written for DuckDB and transpiled), so differences between engines' data
@@ -365,6 +365,47 @@ const CASES: &[Case] = &[
         reference: Reference::Official(3),
     },
     Case {
+        name: "q7",
+        model: SWEEP,
+        request: r#"{"metrics": ["avg_quantity", "avg_list_price", "avg_coupon_amt", "avg_sales_price"],
+            "dimensions": ["item.i_item_id"],
+            "filters": [
+                {"field": "customer_demographics.cd_gender", "op": "=", "value": "M"},
+                {"field": "customer_demographics.cd_marital_status", "op": "=", "value": "S"},
+                {"field": "customer_demographics.cd_education_status", "op": "=", "value": "College"},
+                {"field": "promotion.channel_email_or_event_n", "op": "=", "value": 1},
+                {"field": "date_dim.d_year", "op": "=", "value": 2000}
+            ],
+            "orderBy": [{"field": "item.i_item_id"}],
+            "limit": 100}"#,
+        reference: Reference::Official(7),
+    },
+    Case {
+        // Catalog twin of q7.
+        name: "q26",
+        model: SWEEP,
+        request: r#"{"metrics": ["catalog_avg_quantity", "catalog_avg_list_price", "catalog_avg_coupon_amt", "catalog_avg_sales_price"],
+            "dimensions": ["item.i_item_id"],
+            "filters": [
+                {"field": "customer_demographics.cd_gender", "op": "=", "value": "M"},
+                {"field": "customer_demographics.cd_marital_status", "op": "=", "value": "S"},
+                {"field": "customer_demographics.cd_education_status", "op": "=", "value": "College"},
+                {"field": "promotion.channel_email_or_event_n", "op": "=", "value": 1},
+                {"field": "date_dim.d_year", "op": "=", "value": 2000}
+            ],
+            "orderBy": [{"field": "item.i_item_id"}],
+            "limit": 100}"#,
+        reference: Reference::Official(26),
+    },
+    Case {
+        // OR-of-AND filter groups live in the metric CASE; year is a request filter.
+        name: "q48",
+        model: SWEEP,
+        request: r#"{"metrics": ["q48_quantity"],
+            "filters": [{"field": "date_dim.d_year", "op": "=", "value": 2000}]}"#,
+        reference: Reference::Official(48),
+    },
+    Case {
         name: "q42",
         model: SWEEP,
         request: r#"{"metrics": ["total_sales"], "dimensions": ["date_dim.d_year", "item.i_category_id", "item.i_category"],
@@ -472,10 +513,13 @@ fn graph_for(model: &str, engine: Engine) -> ossiec::SemanticGraph {
     ossiec::from_yaml(&model.replace("tpcds.public.", prefix)).unwrap()
 }
 
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 13] = [
     "web_sales",
+    "catalog_sales",
     "time_dim",
     "household_demographics",
+    "customer_demographics",
+    "promotion",
     "store_sales",
     "date_dim",
     "item",
@@ -597,6 +641,24 @@ fn load(engine: Engine, duck: &Connection) {
         args.extend(load);
         sh(&args.iter().map(String::as_str).collect::<Vec<_>>());
     }
+    if engine == Engine::MySql {
+        // Without keys MySQL plans the benchmark's comma joins as cross joins over
+        // customer_demographics: q7's reference took 16 minutes, not under a second.
+        let keys: String = [
+            ("customer", "c_customer_sk"),
+            ("customer_address", "ca_address_sk"),
+            ("customer_demographics", "cd_demo_sk"),
+            ("date_dim", "d_date_sk"),
+            ("household_demographics", "hd_demo_sk"),
+            ("item", "i_item_sk"),
+            ("promotion", "p_promo_sk"),
+            ("store", "s_store_sk"),
+            ("time_dim", "t_time_sk"),
+        ]
+        .map(|(t, k)| format!("ALTER TABLE {t} ADD PRIMARY KEY ({k});\n"))
+        .concat();
+        common::run(engine, &keys).unwrap_or_else(|e| panic!("adding keys on MySQL: {e}"));
+    }
 }
 
 /// DuckDB sorts NULLs last; StarRocks and MySQL sort them first on ASC. Spell
@@ -672,6 +734,11 @@ fn sweep(engine: Engine) {
                 if engine == Engine::ClickHouse {
                     // References use LEFT JOINs too; give them standard NULL semantics.
                     reference = format!("SET join_use_nulls = 1;\n{reference}");
+                }
+                if engine == Engine::MySql {
+                    // The official SQL's AVG of integers would round to 4 decimals
+                    // (q26: 20.6667, not 20.666667). ossiec's own SQL casts to DOUBLE.
+                    reference = format!("SET div_precision_increment = 30;\n{reference}");
                 }
                 match (
                     run_in(engine, &compiled.sql, ("memory", "tpcds")),
