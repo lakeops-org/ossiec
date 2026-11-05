@@ -1,6 +1,6 @@
 //! Request validation, unsupported shapes, dialect coverage and determinism.
 
-use ossiec::{DialectType, Error, Options, Request};
+use ossiec::{DialectType, Error, ErrorCode, Options, Request};
 
 const SHOP: &str = include_str!("fixtures/shop/model.yaml");
 
@@ -16,10 +16,10 @@ fn compile_err(model: &str, json: &str) -> Error {
 #[test]
 fn errors_name_the_problem_and_the_choices() {
     let cases = [
-        (r#"{"metrics": []}"#, "at least one metric or dimension"),
+        (r#"{"metrics": []}"#, "at least one dimension or metric"),
         (
             r#"{"metrics": ["revenue"]}"#,
-            "unknown metric `revenue`; available: orders.order_count, products.stock_units, total_revenue",
+            "unknown metric `revenue`; available: orders.order_count, orders.gross_revenue, customers.known_customers",
         ),
         (
             r#"{"metrics": ["total_revenue"], "dimensions": ["orders.nope"]}"#,
@@ -97,12 +97,12 @@ fn independent_facts_are_stacked_not_joined() {
 }
 
 #[test]
-fn dimension_only_request_across_facts_is_ambiguous() {
+fn dimension_only_filter_must_be_reachable_from_the_anchor() {
     let e = compile_err(
         TWO_FACTS,
         r#"{"dimensions": ["customers.region"], "filters": [{"field": "orders.amount", "op": ">", "value": 0}, {"field": "tickets.id", "op": ">", "value": 0}]}"#,
     );
-    assert!(matches!(e, Error::Unsupported(_)), "{e}");
+    assert_eq!(e.code(), Some(ErrorCode::UnsupportedFilterPath), "{e}");
 }
 
 #[test]
@@ -122,8 +122,9 @@ metrics:
     let e = compile_err(
         model,
         r#"{"metrics": ["total_delay"], "dimensions": ["airports.city"]}"#,
-    )
-    .to_string();
+    );
+    assert_eq!(e.code(), Some(ErrorCode::AmbiguousPath), "{e}");
+    let e = e.to_string();
     assert!(
         e.contains("departs_from") && e.contains("arrives_at"),
         "{e}"
@@ -136,10 +137,16 @@ fn one_side_measure_without_primary_key_is_refused() {
         "    source: products\n    primary_key: [id]\n",
         "    source: products\n",
     );
-    let e = compile_err(
-        &model,
-        r#"{"metrics": ["total_stock"], "dimensions": ["customers.region"]}"#,
-    );
+    // Only Layer 2 de-duplicates: Layer 3 reads products' own rows.
+    let g = ossiec::from_yaml(&model).unwrap();
+    let e = ossiec::compile_sql(
+        &g,
+        "SELECT c.region, AGG(p.stock_units) FROM orders o \
+         LEFT JOIN customers c ON o.customer_id = c.id \
+         LEFT JOIN products p ON o.product_id = p.id GROUP BY c.region",
+        &Options::default(),
+    )
+    .expect_err("expected an error");
     assert!(
         matches!(e, Error::Unsupported(ref m) if m.contains("declare a primary_key on `products`")),
         "{e}"
@@ -151,10 +158,11 @@ fn compiles_for_every_engine_with_portable_constructs_only() {
     let g = ossiec::from_yaml(SHOP).unwrap();
     let requests = [
         r#"{"metrics": ["completed_revenue", "orders.order_count"], "dimensions": ["products.category"]}"#,
-        r#"{"metrics": ["total_stock", "total_revenue"], "dimensions": ["customers.region"]}"#,
+        r#"{"metrics": ["total_stock", "total_revenue"], "dimensions": ["products.category"]}"#,
         r#"{"metrics": ["total_revenue"], "dimensions": ["orders.order_date"], "timeGrain": "quarter", "orderBy": [{"field": "orders.order_date"}], "limit": 10}"#,
-        r#"{"metrics": ["cumulative_revenue", "revenue_change"], "dimensions": ["orders.order_date"], "timeGrain": "month"}"#,
-        r#"{"metrics": ["revenue_rank_in_region", "stock_share"], "dimensions": ["customers.region", "products.category"], "metricFilters": [{"metric": "revenue_rank_in_region", "op": "<=", "value": 2}]}"#,
+        r#"{"metrics": ["cumulative_revenue", "revenue_change"], "dimensions": ["orders.order_date"], "timeGrain": "month", "deferredMetrics": true}"#,
+        r#"{"metrics": ["stock_share", "total_revenue"], "dimensions": ["products.category"], "deferredMetrics": true}"#,
+        r#"{"metrics": ["revenue_rank_in_region"], "dimensions": ["customers.region", "products.category"], "deferredMetrics": true, "metricFilters": [{"metric": "revenue_rank_in_region", "op": "<=", "value": 2}]}"#,
     ];
     for target in [
         DialectType::Trino,
@@ -217,8 +225,9 @@ fn compiles_for_every_engine_with_portable_constructs_only() {
 #[test]
 fn same_input_same_sql_and_hash() {
     let g = ossiec::from_yaml(SHOP).unwrap();
-    let r =
-        req(r#"{"metrics": ["total_stock", "total_revenue"], "dimensions": ["customers.region"]}"#);
+    let r = req(
+        r#"{"metrics": ["total_stock", "total_revenue"], "dimensions": ["products.category"]}"#,
+    );
     let a = ossiec::compile(&g, &r, &Options::default()).unwrap();
     let b = ossiec::compile(&ossiec::from_yaml(SHOP).unwrap(), &r, &Options::default()).unwrap();
     assert_eq!((a.sql, a.request_hash), (b.sql, b.request_hash));
@@ -246,4 +255,6 @@ fn describe_lists_metrics_dimensions_and_context() {
         .find(|m| m.name == "revenue_rank_in_region")
         .unwrap();
     assert_eq!(rank.requires_dimensions, ["customers.region"]);
+    assert!(rank.requires_deferred_metrics);
+    assert!(!rev.requires_deferred_metrics);
 }

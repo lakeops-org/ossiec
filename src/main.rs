@@ -112,8 +112,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         ["compile", model, request] => {
             let g = graph(model)?;
-            let req: ossiec::Request =
-                serde_json::from_str(&read(request)?).map_err(|e| format!("request: {e}"))?;
+            let req = ossiec::Request::from_json(&read(request)?).map_err(|e| e.to_string())?;
             print_compiled(
                 ossiec::compile(&g, &req, &opts).map_err(|e| e.to_string())?,
                 json,

@@ -18,7 +18,7 @@ Define a metric once. Get correct SQL for any engine.
 **ossiec does that part.** Give it an Ossie model and a request ("`total_revenue` by `customers.region`, last quarter") and it returns one SQL statement, in the dialect you need, that can't double-count.
 
 ```console
-$ echo '{"metrics": ["total_stock"], "dimensions": ["customers.region"]}' \
+$ echo '{"metrics": ["total_revenue", "total_stock"], "dimensions": ["products.category"]}' \
     | ossiec compile shop.yaml - --dialect snowflake
 ```
 
@@ -41,14 +41,18 @@ It runs, it looks right, and it's wrong. Stock lives on `products`, but the join
 | EU | **250** | **150** | EU bought products 10 and 11: 100 + 50 units |
 | US | **60** | **30** | US bought product 12, twice: 30 units |
 
-ossiec sees that `SUM(products.stock)` reads only the "one" side of a many-to-one join, so it evaluates the sum over rows de-duplicated on `products`' primary key. The test suite runs both queries on DuckDB and checks that the naive one really is wrong, so the test can't pass for the wrong reason.
+ossiec gets there two ways, both from the Ossie spec:
+
+- **Ask with metrics and dimensions (Layer 3)** and ossiec chooses the joins. Stock by customer region has no safe answer there, since `products` can't reach `customers` along many-to-one relationships, so it refuses with `E_NO_PATH` rather than guess.
+- **Write the joins yourself with `AGG(products.stock_units)` (Layer 2)** and the sum runs over rows de-duplicated on `products`' primary key, which gives the column above. The test suite runs both queries on DuckDB and checks that the naive one really is wrong, so the test can't pass for the wrong reason.
 
 ## Features
 
 - **Reads the current Ossie spec** (`0.2.0.dev0`, model at the document root): datasets with table or query sources, fields, primary keys, relationships, dataset- and model-scoped metrics, `ai_context`, `custom_extensions`. Every [Ossie example and compliance fixture](tests/fixtures/ossie) binds.
 - **No fan traps or chasm traps by construction.** Joins only go many→one from a single root. Measures from different grains are computed separately and stacked with `UNION ALL`, never joined to each other ([how](#how-it-works)).
 - **Engine-native output, checked on real engines.** One AST, rendered by [polyglot-sql](https://crates.io/crates/polyglot-sql) for Trino, Athena, StarRocks, ClickHouse, DuckDB, MySQL, Postgres, Snowflake, BigQuery, Databricks, Redshift and 20+ more. Every correctness case runs on **DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL** and must return the same rows. Where an engine answers differently, a small [dialect rule](src/dialect/) fixes it (for example, ClickHouse's `lag` returns `0` instead of NULL for the first row).
-- **Window metrics:** running totals, rankings and period-over-period (`SUM(SUM(x)) OVER (…)`, `RANK() OVER (…)`, `LAG`), computed over the grouped result. `describe` tells callers which dimensions each one needs.
+- **Window metrics:** running totals, rankings and period-over-period (`SUM(SUM(x)) OVER (…)`, `RANK() OVER (…)`, `LAG`), computed over the grouped result. The spec defers them for model-scoped metrics, so a request asks with `"deferredMetrics": true`. `describe` tells callers which metrics need that, and which dimensions each one needs.
+- **Refuses with the spec's error codes.** A Layer 3 request the spec rejects raises its `E_…` code, first matching row first, instead of an answer that might be wrong ([list](#what-gets-refused)).
 - **Uses vendor expressions when you want them.** A field can carry a portable expression plus `SNOWFLAKE`, `TRINO`, … variants; `--prefer SNOWFLAKE` uses the native one.
 - **Answers in the model's language.** Errors name the problem and the valid choices (`unknown metric 'revenue'; available: total_revenue, …`), so an agent can correct itself. `describe` returns metrics, dimensions and `ai_context` as JSON.
 - **Safe SQL construction.** Model and request content become AST nodes, never SQL text.
@@ -114,44 +118,34 @@ Check it, then see what it offers:
 
 ```console
 $ ossiec validate shop.yaml
-ok: `shop` — 3 datasets, 2 relationships, 13 metrics (0 not queryable yet)
+ok: `shop` — 3 datasets, 2 relationships, 24 metrics (0 not queryable yet)
 
 $ ossiec describe shop.yaml      # metrics, dimensions, ai_context as JSON
 ```
 
-Compile a request. This one mixes a fact measure with a one-side measure:
+Compile a request. Each metric reads its own home dataset in its own branch, so `total_stock` counts every product, sold or not:
 
 ```console
-$ echo '{"metrics": ["total_revenue", "total_stock"], "dimensions": ["customers.region"]}' \
+$ echo '{"metrics": ["total_revenue", "total_stock"], "dimensions": ["products.category"]}' \
     | ossiec compile shop.yaml - --dialect duckdb
-warning: FAN_TRAP_RISK: `SUM("products".stock)` is computed over `products` rows de-duplicated by primary key; ...
 ```
 
 ```sql
 SELECT
-  stacked.d0 AS "customers.region",
+  stacked.d0 AS "category",
   MAX(stacked.t0) AS "total_revenue",
   MAX(stacked.t1) AS "total_stock"
 FROM (
-  -- revenue at the order grain
-  SELECT "customers".region AS d0, SUM("orders".amount_cents / 100.0) AS t0, NULL AS t1
+  -- revenue from the orders' rows
+  SELECT "products".category AS d0, SUM("orders".amount_cents / 100.0) AS t0, NULL AS t1
   FROM orders AS "orders"
-  LEFT JOIN (SELECT * FROM raw_customers WHERE NOT deleted) AS "customers"
-    ON "orders".customer_id = "customers".customer_id
   LEFT JOIN products AS "products" ON "orders".product_id = "products".product_id
-  GROUP BY "customers".region
+  GROUP BY "products".category
   UNION ALL
-  -- stock over distinct (region, product) rows
-  SELECT dedup.d0 AS d0, NULL AS t0, SUM(dedup.c0) AS t1
-  FROM (
-    SELECT DISTINCT "customers".region AS d0, "products".product_id AS k0, "products".stock AS c0
-    FROM orders AS "orders"
-    LEFT JOIN (SELECT * FROM raw_customers WHERE NOT deleted) AS "customers"
-      ON "orders".customer_id = "customers".customer_id
-    LEFT JOIN products AS "products" ON "orders".product_id = "products".product_id
-    WHERE NOT "products".product_id IS NULL
-  ) AS dedup
-  GROUP BY dedup.d0
+  -- stock from the products' rows
+  SELECT "products".category AS d0, NULL AS t0, SUM("products".stock) AS t1
+  FROM products AS "products"
+  GROUP BY "products".category
 ) AS stacked
 GROUP BY stacked.d0
 ```
@@ -164,7 +158,7 @@ The same request with `--dialect bigquery`, `clickhouse` or `starrocks` renders 
 
 ```rust
 let graph = ossiec::from_yaml(&std::fs::read_to_string("shop.yaml")?)?; // load + validate once
-let request: ossiec::Request = serde_json::from_str(r#"{
+let request = ossiec::Request::from_json(r#"{
     "metrics": ["completed_revenue"],
     "dimensions": ["orders.order_date"],
     "timeGrain": "month",
@@ -175,16 +169,20 @@ let out = ossiec::compile(&graph, &request, &ossiec::Options {
     ..Default::default()
 })?;
 println!("{}", out.sql);       // the statement
-println!("{:?}", out.warnings); // e.g. FAN_TRAP_RISK
+println!("{:?}", out.warnings);
 ```
+
+A rejected request is `Error::Query { code, message }`, and `error.code()` gives the [`ErrorCode`](src/wide_table.rs).
 
 ### Layer 2 (`AGG(measure)`)
 
 Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic on `AGG(...)` in the select list (ratios); independent facts that share dimensions; consumer joins along model relationships, including unused many→one joins and reverse fan-out (G2 via primary-key de-duplication); `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS` join kinds (§7.6: null-extended and Cartesian rows do not inflate `AGG`); **A.2** derived tables joined into an `AGG` stage; **A.3** `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables (with `IS NOT DISTINCT FROM` join keys). Consumer aliases (`AS n`) name the output columns. `layer2_to_request` returns leaf measures of flat queries only; nested SQL is `compile_sql` / `compile-sql` (aliases: `compile_layer2` / `compile-l2`) only. **§7.7** unevaluated measures: a derived table may pass a dataset-scoped measure through its select list and an outer `AGG(t.m)` evaluates it (join form, or a sole derived `FROM`, which is folded into the outer stage). **Query-local `TO MEASURE`** in a derived table's select list, consumed by an outer `AGG(t.m)`, is implemented for both `(AGG(a) / AGG(b)) TO MEASURE AS m` and a base `SUM|COUNT|AVG|MIN|MAX(...) TO MEASURE AS m` (unevaluated until that outer `AGG`). **`CREATE VIEW` (Appendix A.7)** stores that relation in a session [`Layer2Catalog`](src/front/catalog.rs) (`define_layer2_view` / `compile_sql_with`, or a `compile-sql` script). The session catalog leaves the model YAML unchanged until `persist_layer2_view` / `persist-view` runs.
 
-**Roles.** Qualify a column with the relationship name, the same form as a Layer 3 dimension: `departs_from.city`. That name may also be the JOIN alias (`JOIN airports AS departs_from`). A plain `airports.city` still takes the unique shortest path and is refused when departure and arrival both tie.
+**Roles.** Qualify a column with the relationship name, the same form as a Layer 3 dimension: `departs_from.city`. That name may also be the JOIN alias (`JOIN airports AS departs_from`). In Layer 2 a plain `airports.city` takes the unique shortest path and is refused when departure and arrival both tie.
 
-**`includeUnmatched`.** One-side rows no fact reaches are off unless `Options { include_unmatched: true, .. }` or a comment `-- ossiec: includeUnmatched` (or `compile-l2 --include-unmatched`). It applies to the outermost `AGG` stage, including one that joins a derived table onto the unmatched grain. Layer 3 still uses the request field; `Options.include_unmatched` does not change it.
+**`WHERE`** is any row predicate over the query's columns (§7.3): comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT` and expressions, across datasets. Aggregates and windows are refused, and subqueries aren't supported yet.
+
+**`includeUnmatched`.** One-side rows no fact reaches are off unless `Options { include_unmatched: true, .. }` or a comment `-- ossiec: includeUnmatched` (or `compile-l2 --include-unmatched`). It applies to the outermost `AGG` stage, including one that joins a derived table onto the unmatched grain. Layer 3 has no such rows to add, since each metric reads all of its home dataset, so it raises `E_INVALID_QUERY` for the request field and ignores the option.
 
 ```sql
 -- A.2: restrict an AGG stage to the top two customers
@@ -268,10 +266,10 @@ Model-scoped metrics are not measures (§10.3). `AGG(expr)` inside `AGG()` is re
 
 ```jsonc
 {
-  "metrics": ["total_revenue", "orders.order_count"], // model metrics by name, dataset metrics as dataset.metric
-  "dimensions": ["customers.region", "orders.order_date"],
-  "filters": [
-    {"field": "orders.status", "op": "IN", "values": ["completed", "shipped"]},
+  "metrics": ["total_revenue", {"metric": "orders.order_count", "alias": "orders"}], // model metrics by name, dataset metrics as dataset.metric
+  "dimensions": ["customers.region", {"field": "orders.order_date", "alias": "day"}],
+  "filter": "orders.status IN ('completed', 'shipped')", // one expression over one dataset
+  "filters": [                             // structured, and may read several datasets
     {"field": "orders.order_date", "op": "BETWEEN", "values": ["2026-01-01", "2026-03-31"]}
   ],
   "metricFilters": [{"metric": "total_revenue", "op": ">", "value": 1000}], // HAVING
@@ -279,17 +277,21 @@ Model-scoped metrics are not measures (§10.3). `AGG(expr)` inside `AGG()` is re
   "timeDimension": "orders.order_date",    // only needed when several time dimensions are requested
   "orderBy": [{"field": "total_revenue", "direction": "desc", "nulls": "last"}], // nulls: first | last (optional)
   "limit": 100,
-  "includeUnmatched": false                // see below
+  "deferredMetrics": false                 // see below
 }
 ```
 
-**Roles.** When a dataset is reachable more than one way (a customer's first-sale date and the sale's own date both lead to `date_dim`), a plain `date_dim.d_year` takes the **shortest** path. To use another, name the relationship: `customer_first_sales.d_year`. A request can use several roles at once, each joined under its own alias. If two paths tie, the request is refused with the relationship names to choose from.
+**Output columns** are named by the alias if given, or the final part of the reference: `customers.region` comes back as `region`. Two entries with the same name raise `E_NAME_COLLISION`, so `orders.id` and `customers.id` need an alias on at least one. `orderBy` takes an output name or a reference.
 
-**Independent facts.** Measures from facts that don't join each other (store sales and web sales by item category) are computed in one join tree per fact and stacked, so groups are the union across facts: a category sold only online still appears. Every requested dimension and filter must be reachable from each fact.
+The spec's query is `metrics`, `dimensions` and `filter`. The others are ossiec's own properties, which the spec allows when a query asks for them explicitly (§9).
 
-**`includeUnmatched`.** By default a one-side measure only sees rows a fact reaches: stock of products that sold. With `"includeUnmatched": true`, rows no fact reaches (products never sold, customers who never ordered) are added as a group of their own, where the fact's dimensions are NULL. Filters on the fact side exclude them, as SQL NULL semantics say.
+**Roles.** When a dataset is reachable more than one way (a sale's own date, and its store's opening date), a plain `dates.year` raises `E_AMBIGUOUS_PATH`, even if one path is shorter. Name the relationship to choose: `sale_date.year`. A request can use several roles at once, each joined under its own alias.
 
-Leave out `metrics` to list **dimension values** instead: `{"dimensions": ["customers.region"]}` returns every region in `customers`. Dimensions from several datasets return only the combinations that occur, joined through the fact that links them. Agents use this to filter with real values.
+**Home datasets.** Metrics from datasets that don't join each other (store sales and web sales by item category) are computed in one branch per home dataset and stacked, so groups are the union across them: a category sold only online still appears. Every requested dimension and filter must be reachable from every metric's home datasets.
+
+**`deferredMetrics`.** The spec defers two kinds of model-scoped metric: window functions, and aggregates reading several datasets (`SUM(sales.price * dates.year)`). With `"deferredMetrics": true` they're answered, the second from the dataset that reaches the others. Without it they raise `E_DEFERRED_WINDOWED_METRIC` and `E_AMBIGUOUS_MEASURE_GRAIN`.
+
+Leave out `metrics` to list **dimension values** instead: `{"dimensions": ["customers.region"]}` returns every region in `customers`. Dimensions from several datasets need one of those datasets to reach the others, and return the combinations it links. Agents use this to filter with real values.
 
 | Filter `op` | Value |
 |---|---|
@@ -307,22 +309,39 @@ YAML ─load─► Model ─bind─► SemanticGraph ─plan─► LogicalPlan �
 ```
 
 1. **Bind** (once per model). Parse every expression and resolve every name with ANSI identifier rules. Split each metric into aggregate *terms* and an outer formula: `SUM(a.x) / NULLIF(SUM(b.y), 0)` becomes two terms and `t0 / NULLIF(t1, 0)`. All problems are reported together.
-2. **Pick the join roots.** Each aggregate reads its home dataset (`SUM(orders.x) / COUNT(DISTINCT customers.id)` counts customers with no orders too), and gets a branch that `LEFT JOIN`s from there to every dimension and filter. Many→one joins never multiply home rows, and `LEFT` keeps orphan rows in the NULL group instead of dropping them. A request where a home can't reach a dimension or filter uses one tree, from the dataset that reaches everything.
+2. **Pick the join roots.** Each aggregate reads its home dataset (`SUM(orders.x) / COUNT(DISTINCT customers.id)` counts customers with no orders too), and gets a branch that `LEFT JOIN`s from there to every dimension and filter. Many→one joins never multiply home rows, and `LEFT` keeps orphan rows in the NULL group instead of dropping them. A request where a home can't reach a dimension or filter is refused.
 3. **Classify each term.**
-   - A term that reads the root, or that duplicates can't change (`MIN`, `MAX`, `COUNT(DISTINCT …)`), is computed **inline** over the joined rows.
-   - In that one tree, a term that reads only one-side data (`SUM(products.stock)` over an `orders` root) is computed over rows **de-duplicated on that dataset's primary key**, which is the reference strategy in Ossie's relational spec (§9).
+   - A term that reads the root, or that duplicates can't change (`MIN`, `MAX`, `COUNT(DISTINCT …)`), is computed **inline** over the joined rows. In Layer 3 every term reads its root.
+   - In a Layer 2 query, whose joins decide the rows, a term that reads only one-side data (`SUM(products.stock)` over an `orders` root) is computed over rows **de-duplicated on that dataset's primary key**, which is the reference strategy in Ossie's relational spec (§9).
 4. **Stack, don't join.** Each branch and strategy becomes a part grouped by the same dimensions. Parts are combined with `UNION ALL` and `MAX` per term, so there's no join predicate between parts to get wrong. The groups are every part's groups, so asking for a metric can add groups (wide table §6.1).
 5. **Windows last.** Window functions in a metric run in the final `SELECT`, over one row per group: `SUM(SUM(x)) OVER (ORDER BY d)` becomes `SUM(base.t0) OVER (ORDER BY base.d0)`. Fields a window partitions or orders by must be requested dimensions. When windows are present, `metricFilters` apply to the finished rows, so "rank ≤ 3" means the top three by the full ranking.
 6. **Render.** Build one polyglot AST and apply the target's [dialect rules](src/dialect/) (only where a real-engine test showed polyglot's rendering answers differently). Generate it in the source dialect, then transpile to the target.
 
-If ossiec can't make a request correct, it refuses it rather than guessing:
+### What gets refused
 
-| Situation | Response |
+A Layer 3 request the spec rejects raises one of `wide_table_semantics.md` §8's codes. When several apply, the first in this order wins:
+
+| Code | Condition |
 |---|---|
-| Dimensions or filters several facts could link, with no measure saying which (item prices by year, when store and web sales both have items and dates) | `… joined by several facts (…); … independent facts need a measure from each` |
-| A dataset reachable two ways of equal length (departure *and* arrival airport) | `… in more than one way (departs_from \| arrives_at); name the one you mean as <relationship>.<field>` |
-| A one-side measure on a dataset with no `primary_key` | `… declare a primary_key on 'products'` |
-| A window metric without the dimension it orders by | `metric 'cumulative_revenue' is a window over 'orders.order_date'; add it to 'dimensions'` |
+| `E_INVALID_QUERY` | Malformed, or a property Layer 3 doesn't support (`includeUnmatched`) |
+| `E_EMPTY_AGGREGATION_QUERY` | No dimensions or metrics |
+| `E_NAME_NOT_FOUND` | A reference doesn't resolve |
+| `E_METRIC_IN_DIMENSIONS`, `E_FIELD_IN_METRICS` | An entry names the wrong kind of thing |
+| `E_AGGREGATE_IN_WHERE`, `E_WINDOW_IN_WHERE` | A filter reads an aggregate, a metric or a window |
+| `E_CROSS_DATASET_FILTER` | `filter` reads more than one dataset |
+| `E_NAME_COLLISION` | Two entries have the same output name, like `orders.id` and `customers.id` without an alias |
+| `E_UNAGGREGATED_FINER_GRAIN_REFERENCE` | A model-scoped metric reads a field outside every aggregate |
+| `E_DEFERRED_WINDOWED_METRIC` | A model-scoped metric has a window, without `deferredMetrics` |
+| `E_AMBIGUOUS_MEASURE_GRAIN` | An aggregate reads several datasets (without `deferredMetrics`), has a `FILTER` on another dataset, or reads none (`COUNT(*)` at model scope) |
+| `E_NO_PATH` | No metric reaches a dimension's dataset |
+| `E_PARTIAL_DIMENSION_REACHABILITY` | Some metrics reach a dimension's dataset, others don't |
+| `E_NO_ANCHOR` | No metrics, and no dimension's dataset reaches the others |
+| `E_UNSUPPORTED_FILTER_PATH` | A metric or the anchor can't reach a filter's dataset |
+| `E_AMBIGUOUS_PATH` | Two paths lead to a dataset the query needs, or two datasets qualify as the anchor |
+
+Metrics the spec rejects don't stop a model loading: only a query that names one is refused, and `describe` marks it.
+
+Two refusals are ossiec's own: a window metric without the dimension it orders by (`metric 'cumulative_revenue' is a window over 'orders.order_date'; add it to 'dimensions'`, as `E_INVALID_QUERY`), and, in Layer 2, a one-side measure on a dataset with no `primary_key`.
 
 The full rationale is in **[docs/DESIGN.md](docs/DESIGN.md)**.
 
@@ -340,7 +359,7 @@ The full rationale is in **[docs/DESIGN.md](docs/DESIGN.md)**.
 | Non-SQL dialects (`DAX`, `MDX`, `TABLEAU`, …) | Ignored (a field needs at least one SQL form) |
 | `FILTER (WHERE …)`, `COUNT(DISTINCT …)`, ratios, `CASE`, scalar functions | ✅ |
 | ANSI identifier rules (bare names case-insensitive, quoted exact) | ✅ |
-| Window functions in metrics (`OVER`, `RANK`, `LAG`, running totals) | ✅ |
+| Window functions in metrics (`OVER`, `RANK`, `LAG`, running totals) | ✅ Dataset-scoped directly, model-scoped with `deferredMetrics` |
 | Ossie ontology documents (Layer 4) | Rejected with a clear error |
 | Pre-0.2 `semantic_model:` documents | Rejected with a clear error |
 
@@ -359,14 +378,14 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 | Suite | What it proves |
 |---|---|
-| [`correctness`](tests/correctness.rs) | **The numbers are right.** 31 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
-| [`engines`](tests/engines.rs) | **Every engine agrees.** The same 31 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1, ClickHouse 26.8 and MySQL 8.4 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
-| [`tpcds`](tests/tpcds.rs) | **Real data, and the benchmark's own SQL.**<br>• **Apache Ossie's TPC-DS example model, unchanged,** on generated TPC-DS data: all its metric kinds, including the de-duplicated `store_productivity` and the window metrics.<br>• **Official TPC-DS queries q3, q7, q12, q26, q42, q43, q48, q52, q55, q96 and q98**, expressed as ossiec requests and compared row by row with TPC-DS's own query text.<br>26 cases, including multi-hop joins, composite keys, date roles, store-and-web independent facts and unmatched items, on DuckDB (sf=0.1, 288k `store_sales` rows), Trino (`tpcds.tiny`), Postgres, StarRocks and ClickHouse. Each reference runs on the same engine, so data-generator differences cancel out. |
-| [`fuzz`](tests/fuzz.rs) | **Cases nobody wrote.** Random requests compared with an independent reference generated from the spec's own evaluation strategy, on all six engines. |
+| [`correctness`](tests/correctness.rs) | **The numbers are right.** 30 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
+| [`engines`](tests/engines.rs) | **Every engine agrees.** The same 30 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1, ClickHouse 26.8 and MySQL 8.4 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
+| [`tpcds`](tests/tpcds.rs) | **Real data, and the benchmark's own SQL.**<br>• **Apache Ossie's TPC-DS example model, unchanged,** on generated TPC-DS data: all its metric kinds, including the two-branch `store_productivity` and the window metrics.<br>• **Official TPC-DS queries q3, q7, q12, q26, q42, q43, q48, q52, q55, q96 and q98**, expressed as ossiec requests and compared row by row with TPC-DS's own query text.<br>26 cases, including multi-hop joins, composite keys, date roles, store-and-web independent facts and unmatched items, on DuckDB (sf=0.1, 288k `store_sales` rows), Trino (`tpcds.tiny`), Postgres, StarRocks and ClickHouse. Each reference runs on the same engine, so data-generator differences cancel out. |
+| [`fuzz`](tests/fuzz.rs) | **Cases nobody wrote.** Random requests, each decided independently from the model's relationships: refused ones must raise the right code, and answered ones must match a reference generated from the spec's own evaluation strategy, on all six engines. |
 | [`scale`](tests/scale.rs) | **No blow-ups.** A 121-table model binds in about 0.1 s and compiles in about 10 ms per request (unoptimized build). On Trino sf=1, each TPC-DS case must run within 3× its reference. |
 | [`golden`](tests/golden.rs) | **The SQL didn't drift.** Exact output for TPC-DS and shop requests across generic, BigQuery, Trino, StarRocks, ClickHouse and Snowflake, in [`tests/golden/`](tests/golden). |
 | [`model`](tests/model.rs) | **Spec conformance.** Every Ossie example binds, every compliance metric (M0–M3) returns its expected answer on DuckDB, and there's one test per validation rule. |
-| [`wide_table`](tests/wide_table.rs) | **Layer 3's own examples.** The data and results from `wide_table_semantics.md` (§1.3, §5.2, §6.1, Appendix B). |
+| [`wide_table`](tests/wide_table.rs) | **Layer 3's own examples and rejections.** The data and results from `wide_table_semantics.md` (§1.3, §3.4, §5.2, §6.1, Appendix B), every row of §8 and the order between them. |
 | [`query_compliance`](tests/query_compliance.rs) | **Ossie's own query suite.** Every vendored `compliance/query` case returns its expected result on DuckDB, compared by the suite's rules. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
 | [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including a ratio with a partial-fact derived join), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
@@ -374,16 +393,17 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 ## Known issues
 
 **Semantics to know**
-- **De-duplicated groups overlap.** A product sold in two regions counts in both, so per-group values don't sum to a grand total. ossiec warns (`FAN_TRAP_RISK`). Products that never sold aren't in any group unless the request sets `includeUnmatched`; or query the measure without dimensions for the catalogue total.
+- **De-duplicated groups overlap (Layer 2).** A product sold in two regions counts in both, so per-group values don't sum to a grand total. ossiec warns (`FAN_TRAP_RISK`). Products that never sold aren't in any group unless the query sets `includeUnmatched`.
 - **Window metrics see only the rows in the result.** A running total over a filtered date range starts at the range's first row, and `stock_share` is a share of the groups returned. With windows present, metric filters apply after the window.
 - **Division is always true division.** `/` in portable expressions casts the numerator to `DOUBLE` unless one side is a fractional literal, so `COUNT(a) / COUNT(b)` isn't truncated on Postgres and Trino. Ratios therefore come back as floating point. `amount_cents / 100.0` stays exact.
 - **NULL ordering** follows generic SQL on every engine: NULLs sort first in ascending order (`NULLS FIRST` is emitted where needed).
 - **Strings compare and sort by byte on every engine**, so `'Bob'` comes before `'ada'` and `'ada'` never equals `'Ada'`. Postgres string dimensions carry `COLLATE "C"`, and MySQL string dimensions and filters `COLLATE utf8mb4_bin`, to match.
 - **A backslash in a `LIKE` pattern is an ordinary character**, as in SQL without `ESCAPE`. On engines that escape with it by default (Postgres, ClickHouse, StarRocks, MySQL), ossiec doubles it.
-- **Groups don't depend on the measures you ask for.** A group appears whenever some joined row has it, and a measure with no rows there reads NULL (`COUNT` reads 0).
+- **In Layer 3, groups depend on the metrics you ask for** (spec §6.1). Each metric brings its home dataset's groups, and a metric with no rows in a group takes its empty-input value: NULL, or 0 for `COUNT`. In Layer 2 the query's joins decide the groups.
+- **Layer 2 columns keep the full reference** (`customers.region`) unless the query aliases them with `AS`. Layer 3 columns use the final part.
 - **Time grains ignore time zones.** Truncating a `DateTimeTz` uses the engine's session time zone.
 
-**Refused for now:** nested windows; a dataset reached two ways of equal length unless the role is named.
+**Refused for now:** nested windows.
 
 **Spec leniency:** bare names in model-scoped metrics are accepted with a warning.
 
@@ -420,8 +440,11 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [ ] More official TPC-DS queries (many of the 99 need constructs no semantic request expresses: correlated subqueries, cross-channel set operations, ROLLUP)
 - [x] Window metrics (cumulative, rank, period-over-period)
 - [x] Independent facts across shared dimensions
-- [x] Role-playing dimensions (`relationship.field`, shortest path by default)
-- [x] Unmatched one-side rows (`includeUnmatched`)
+- [x] Role-playing dimensions (`relationship.field`)
+- [x] Unmatched one-side rows in Layer 2 (`includeUnmatched`)
+- [x] Layer 3 rejections with the spec's error codes (`wide_table_semantics.md` §8), and the `filter` expression
+- [x] Layer 3 aliases and short output names
+- [x] Layer 2 `WHERE` as any row predicate (`IN`, `OR`, `LIKE`, `BETWEEN`, `NOT`, expressions)
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
 - [ ] Publish to crates.io

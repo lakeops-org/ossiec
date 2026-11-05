@@ -34,10 +34,13 @@ mod lower;
 pub mod model;
 mod plan;
 mod sql;
+mod wide_table;
+
+pub use wide_table::ErrorCode;
 
 pub use graph::{bind, Catalog, DimensionDoc, MetricDoc, SemanticGraph};
 pub use model::Model;
-pub use plan::{Direction, Filter, MetricFilter, Nulls, Op, OrderBy, Request, TimeGrain};
+pub use plan::{Direction, Filter, MetricFilter, Nulls, Op, OrderBy, Request, Selected, TimeGrain};
 pub use polyglot_sql::DialectType;
 
 /// Compile consumer SQL with `AGG(measure)` (Ossie Layer 2 surface).
@@ -87,8 +90,21 @@ pub enum Error {
     /// Valid Ossie that this version can't compile yet.
     #[error("not supported yet: {0}")]
     Unsupported(String),
+    /// A Layer 3 request the spec rejects, with its code (wide table §8).
+    #[error("{code}: {message}")]
+    Query { code: ErrorCode, message: String },
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl Error {
+    /// The spec's code, for a rejected Layer 3 request.
+    pub fn code(&self) -> Option<ErrorCode> {
+        match self {
+            Error::Query { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -138,9 +154,8 @@ pub struct Options {
     pub prefer_dialect: Option<String>,
     pub pretty: bool,
     /// Layer 2 only: also return one-side rows no fact row reaches (products never
-    /// sold, customers who never ordered). Same switch as a Layer 3 request's
-    /// `includeUnmatched`. A comment `-- ossiec: includeUnmatched` in the SQL sets
-    /// it too. [`compile`] ignores this field; Layer 3 reads [`Request::include_unmatched`].
+    /// sold, customers who never ordered). A comment `-- ossiec: includeUnmatched` in the SQL sets
+    /// it too. [`compile`] ignores this field: Layer 3 has no such rows to add.
     pub include_unmatched: bool,
 }
 
@@ -178,7 +193,15 @@ pub fn compile(graph: &SemanticGraph, request: &Request, opts: &Options) -> Resu
         prefer: opts.prefer_dialect.clone(),
         ..Default::default()
     };
-    let plan = plan::plan(graph, request, plan::Interface::WideTable, &mut ctx)?;
+    // Past the §8 checks, a request error is about a property of the request.
+    let plan =
+        plan::plan(graph, request, plan::Interface::WideTable, &mut ctx).map_err(|e| match e {
+            Error::Request(message) => Error::Query {
+                code: ErrorCode::InvalidQuery,
+                message,
+            },
+            other => other,
+        })?;
     finish_compile(graph, request, plan, ctx, opts)
 }
 

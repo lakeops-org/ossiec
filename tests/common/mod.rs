@@ -214,70 +214,6 @@ pub struct Case {
 
 pub const CASES: &[Case] = &[
     Case {
-        // includeUnmatched: product 13 never sold, so no order reaches it. It
-        // joins the NULL-region group (its region is NULL), with its stock.
-        name: "unmatched_products_included",
-        request: r#"{"metrics": ["total_stock", "products_sold"], "dimensions": ["customers.region"], "includeUnmatched": true}"#,
-        reference: "WITH matched AS (
-              SELECT DISTINCT c.region, p.product_id, p.stock
-              FROM orders o
-              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-              LEFT JOIN products p ON o.product_id = p.product_id
-              WHERE p.product_id IS NOT NULL
-            ), unmatched AS (
-              SELECT DISTINCT CAST(NULL AS VARCHAR) AS region, p.product_id, p.stock
-              FROM products p WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.product_id = p.product_id)
-            ), r AS (SELECT * FROM matched UNION ALL SELECT * FROM unmatched),
-            g AS (
-              SELECT DISTINCT c.region FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-              UNION SELECT region FROM unmatched
-            )
-            SELECT g.region, s.stock, COALESCE(s.n, 0)
-            FROM g LEFT JOIN (SELECT region, SUM(stock) AS stock, COUNT(*) AS n FROM r GROUP BY region) s
-              ON g.region IS NOT DISTINCT FROM s.region",
-        prefer: false,
-    },
-    Case {
-        // A filter on the fact side can't pass for unmatched rows (their region
-        // is NULL), so they add nothing.
-        name: "unmatched_rows_fail_fact_side_filters",
-        request: r#"{"metrics": ["total_stock"], "dimensions": ["customers.region"], "includeUnmatched": true,
-            "filters": [{"field": "customers.region", "op": "IN", "values": ["EU", "US"]}]}"#,
-        reference: "SELECT region, SUM(stock) FROM (
-              SELECT DISTINCT c.region, p.product_id, p.stock
-              FROM orders o
-              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-              LEFT JOIN products p ON o.product_id = p.product_id
-              WHERE c.region IN ('EU', 'US') AND p.product_id IS NOT NULL
-            ) GROUP BY region",
-        prefer: false,
-    },
-    Case {
-        // COUNT(DISTINCT) of a one-side key is normally inline; with
-        // includeUnmatched it is de-duplicated so customers who never ordered
-        // (Eve, ada, C:\temp) are counted, in the NULL-category group.
-        name: "unmatched_customers_counted",
-        request: r#"{"metrics": ["buying_customers"], "dimensions": ["products.category"], "includeUnmatched": true}"#,
-        reference: "WITH matched AS (
-              SELECT DISTINCT p.category, c.customer_id
-              FROM orders o
-              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-              LEFT JOIN products p ON o.product_id = p.product_id
-              WHERE c.customer_id IS NOT NULL
-            ), unmatched AS (
-              SELECT DISTINCT CAST(NULL AS VARCHAR) AS category, c.customer_id
-              FROM {customers} c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)
-            ), r AS (SELECT * FROM matched UNION ALL SELECT * FROM unmatched),
-            g AS (
-              SELECT DISTINCT p.category FROM orders o LEFT JOIN products p ON o.product_id = p.product_id
-              UNION SELECT category FROM unmatched
-            )
-            SELECT g.category, COALESCE(s.n, 0)
-            FROM g LEFT JOIN (SELECT category, COUNT(*) AS n FROM r GROUP BY category) s
-              ON g.category IS NOT DISTINCT FROM s.category",
-        prefer: false,
-    },
-    Case {
         // String comparison is case-sensitive everywhere but MySQL's default
         // collation: 'ada' must not also match 'Ada'.
         name: "case_sensitive_filter",
@@ -295,24 +231,56 @@ pub const CASES: &[Case] = &[
         prefer: false,
     },
     Case {
-        // COUNT over no rows is 0, not NULL (spec: empty-input value). APAC has
-        // orders but no product rows.
+        // COUNT over no rows is 0, not NULL (wide table 5.5). The order with no
+        // product is a NULL group from its own branch, which `products` has no row for.
         name: "count_is_zero_for_a_group_without_rows",
-        request: r#"{"metrics": ["total_revenue", "products_sold"], "dimensions": ["customers.region"]}"#,
+        request: r#"{"metrics": ["total_revenue", "products_sold"], "dimensions": ["products.category"]}"#,
         reference: "WITH rev AS (
-              SELECT c.region, SUM(o.amount_cents / 100.0) AS r
-              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region
-            ), sold AS (
-              SELECT region, COUNT(*) AS n FROM (
-                SELECT DISTINCT c.region, p.product_id
-                FROM orders o
-                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-                LEFT JOIN products p ON o.product_id = p.product_id
-                WHERE p.product_id IS NOT NULL
-              ) GROUP BY region
+              SELECT p.category, SUM(o.amount_cents / 100.0) AS r
+              FROM orders o LEFT JOIN products p ON o.product_id = p.product_id GROUP BY p.category
+            ), sold AS (SELECT category, COUNT(*) AS n FROM products GROUP BY category)
+            SELECT COALESCE(rev.category, sold.category), rev.r, COALESCE(sold.n, 0)
+            FROM rev FULL JOIN sold ON rev.category IS NOT DISTINCT FROM sold.category",
+        prefer: false,
+    },
+    Case {
+        // The spec's `filter`: one expression over one dataset, in every branch.
+        // `<>` removes an order with no customer, whose region is NULL (wide table 3.4).
+        name: "filter_expression",
+        request: r#"{"metrics": ["total_revenue", "customers.known_customers"], "dimensions": ["customers.segment"],
+            "filter": "customers.region <> 'US' AND customers.segment LIKE '%m%'"}"#,
+        reference: "WITH rev AS (
+              SELECT c.segment, SUM(o.amount_cents / 100.0) AS r
+              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              WHERE c.region <> 'US' AND c.segment LIKE '%m%' GROUP BY c.segment
+            ), n AS (
+              SELECT segment, COUNT(*) AS n FROM {customers}
+              WHERE region <> 'US' AND segment LIKE '%m%' GROUP BY segment
             )
-            SELECT rev.region, rev.r, COALESCE(sold.n, 0)
-            FROM rev LEFT JOIN sold ON rev.region IS NOT DISTINCT FROM sold.region",
+            SELECT COALESCE(rev.segment, n.segment), rev.r, COALESCE(n.n, 0)
+            FROM rev FULL JOIN n ON rev.segment IS NOT DISTINCT FROM n.segment",
+        prefer: false,
+    },
+    Case {
+        // Aliases name the columns, with a field selected twice and a role-free
+        // sort by an alias. Output names that equal a source column must not capture
+        // the field's own column in any clause (`amount_cents`, `status`).
+        name: "aliases_and_output_names",
+        request: r#"{"dimensions": ["orders.status", {"field": "orders.status", "alias": "state"}],
+            "metrics": [{"metric": "total_revenue", "alias": "amount_cents"}, "orders.order_count"],
+            "filter": "orders.amount_cents > 100",
+            "metricFilters": [{"metric": "total_revenue", "op": ">", "value": 1}],
+            "orderBy": [{"field": "amount_cents", "direction": "desc"}]}"#,
+        reference: "SELECT status, status, SUM(amount_cents / 100.0) AS r, COUNT(*)
+            FROM orders WHERE amount_cents > 100
+            GROUP BY status HAVING SUM(amount_cents / 100.0) > 1 ORDER BY r DESC",
+        prefer: false,
+    },
+    Case {
+        // A filter with no dataset still gives one row, of empty-input values.
+        name: "filter_without_a_dataset",
+        request: r#"{"metrics": ["total_revenue", "orders.order_count", "total_stock"], "filter": "1 = 0"}"#,
+        reference: "SELECT CAST(NULL AS DOUBLE), 0, CAST(NULL AS INTEGER)",
         prefer: false,
     },
     Case {
@@ -353,41 +321,15 @@ pub const CASES: &[Case] = &[
     },
     Case {
         name: "averages_of_integers_and_one_side_values",
-        request: r#"{"metrics": ["avg_stock", "avg_amount_cents"], "dimensions": ["customers.region"]}"#,
-        reference: "WITH g AS (
-              SELECT c.region, AVG(o.amount_cents) AS a
-              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region
-            ), st AS (
-              SELECT region, AVG(stock) AS s FROM (
-                SELECT DISTINCT c.region, p.product_id, p.stock
-                FROM orders o
-                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-                LEFT JOIN products p ON o.product_id = p.product_id
-                WHERE p.product_id IS NOT NULL
-              ) GROUP BY region
+        request: r#"{"metrics": ["avg_stock", "avg_amount_cents"], "dimensions": ["products.category"]}"#,
+        reference: "WITH st AS (
+              SELECT category, AVG(stock) AS s FROM products GROUP BY category
+            ), g AS (
+              SELECT p.category, AVG(o.amount_cents) AS a
+              FROM orders o LEFT JOIN products p ON o.product_id = p.product_id GROUP BY p.category
             )
-            SELECT g.region, st.s, g.a FROM g LEFT JOIN st ON g.region IS NOT DISTINCT FROM st.region",
-        prefer: false,
-    },
-    Case {
-        // Three parts (orders inline, products and customers de-duplicated) and a
-        // filter on a one-side dataset, which every part must apply.
-        name: "three_parts_with_a_one_side_filter",
-        request: r#"{"metrics": ["total_revenue", "total_stock", "customer_count"], "dimensions": ["products.category"],
-            "filters": [{"field": "customers.segment", "op": "=", "value": "smb"}]}"#,
-        reference: "WITH j AS (
-              SELECT p.category, p.product_id, p.stock, c.customer_id AS cid, o.amount_cents
-              FROM orders o
-              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-              LEFT JOIN products p ON o.product_id = p.product_id
-              WHERE c.segment = 'smb'
-            ), g AS (SELECT category, SUM(amount_cents / 100.0) AS r FROM j GROUP BY category),
-            st AS (SELECT category, SUM(stock) AS s FROM (SELECT DISTINCT category, product_id, stock FROM j WHERE product_id IS NOT NULL) GROUP BY category),
-            cc AS (SELECT category, COUNT(*) AS n FROM (SELECT DISTINCT category, cid FROM j WHERE cid IS NOT NULL) GROUP BY category)
-            SELECT g.category, g.r, st.s, COALESCE(cc.n, 0)
-            FROM g
-            LEFT JOIN st ON g.category IS NOT DISTINCT FROM st.category
-            LEFT JOIN cc ON g.category IS NOT DISTINCT FROM cc.category",
+            SELECT COALESCE(st.category, g.category), st.s, g.a
+            FROM st FULL JOIN g ON st.category IS NOT DISTINCT FROM g.category",
         prefer: false,
     },
     Case {
@@ -406,12 +348,13 @@ pub const CASES: &[Case] = &[
         prefer: false,
     },
     Case {
-        // Dimensions from two datasets: only the combinations some order links.
+        // Dimensions from three datasets: the anchor is orders, the one that reaches
+        // the others, so these are the combinations some order links.
         name: "dimension_combinations",
-        request: r#"{"dimensions": ["customers.segment", "products.category"],
+        request: r#"{"dimensions": ["orders.status", "customers.segment", "products.category"],
             "filters": [{"field": "orders.status", "op": "=", "value": "completed"}],
             "orderBy": [{"field": "customers.segment"}, {"field": "products.category"}]}"#,
-        reference: "SELECT DISTINCT c.segment, p.category
+        reference: "SELECT DISTINCT o.status, c.segment, p.category
             FROM orders o
             LEFT JOIN {customers} c ON o.customer_id = c.customer_id
             LEFT JOIN products p ON o.product_id = p.product_id
@@ -431,12 +374,13 @@ pub const CASES: &[Case] = &[
     },
     Case {
         name: "integer_ratio",
-        request: r#"{"metrics": ["orders_per_customer"], "dimensions": ["products.category"]}"#,
-        reference: "SELECT p.category, COUNT(o.order_id) / NULLIF(COUNT(DISTINCT c.customer_id), 0)
-            FROM orders o
-            LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-            LEFT JOIN products p ON o.product_id = p.product_id
-            GROUP BY p.category",
+        request: r#"{"metrics": ["orders_per_customer"], "dimensions": ["customers.segment"]}"#,
+        reference: "WITH o AS (
+              SELECT c.segment, COUNT(o.order_id) AS n
+              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.segment
+            ), c AS (SELECT segment, COUNT(DISTINCT customer_id) AS n FROM {customers} GROUP BY segment)
+            SELECT COALESCE(o.segment, c.segment), o.n / NULLIF(c.n, 0)
+            FROM o FULL JOIN c ON o.segment IS NOT DISTINCT FROM c.segment",
         prefer: false,
     },
     Case {
@@ -457,34 +401,15 @@ pub const CASES: &[Case] = &[
     },
     Case {
         name: "count_distinct_buyers",
-        request: r#"{"metrics": ["revenue_per_customer", "buying_customers"], "dimensions": ["products.category"],
+        request: r#"{"metrics": ["revenue_per_customer", "buying_customers"], "dimensions": ["customers.region"],
             "filters": [{"field": "customers.segment", "op": "=", "value": "smb"}]}"#,
-        reference: "SELECT p.category,
-                SUM(o.amount_cents / 100.0) / NULLIF(COUNT(DISTINCT c.customer_id), 0),
-                COUNT(DISTINCT c.customer_id)
-            FROM orders o
-            LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-            LEFT JOIN products p ON o.product_id = p.product_id
-            WHERE c.segment = 'smb'
-            GROUP BY p.category",
-        prefer: false,
-    },
-    Case {
-        name: "one_side_measure_dedup",
-        request: r#"{"metrics": ["total_stock"], "dimensions": ["customers.region"]}"#,
-        // Groups come from every joined row (spec: a group with no input rows is kept),
-        // so APAC, whose only order has no product, appears with NULL stock.
-        reference: "SELECT g.region, s.stock
-            FROM (SELECT DISTINCT c.region FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id) g
-            LEFT JOIN (
-              SELECT region, SUM(stock) AS stock FROM (
-                SELECT DISTINCT c.region, p.product_id, p.stock
-                FROM orders o
-                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-                LEFT JOIN products p ON o.product_id = p.product_id
-                WHERE p.product_id IS NOT NULL
-              ) GROUP BY region
-            ) s ON g.region IS NOT DISTINCT FROM s.region",
+        reference: "WITH r AS (
+              SELECT c.region, SUM(o.amount_cents / 100.0) AS v
+              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              WHERE c.segment = 'smb' GROUP BY c.region
+            ), n AS (SELECT region, COUNT(DISTINCT customer_id) AS v FROM {customers} WHERE segment = 'smb' GROUP BY region)
+            SELECT COALESCE(r.region, n.region), r.v / NULLIF(n.v, 0), COALESCE(n.v, 0)
+            FROM r FULL JOIN n ON r.region IS NOT DISTINCT FROM n.region",
         prefer: false,
     },
     Case {
@@ -509,10 +434,10 @@ pub const CASES: &[Case] = &[
         prefer: false,
     },
     Case {
+        // Datasets that only meet through a shared dimension, with no dimension.
         name: "grand_totals_across_grains",
-        request: r#"{"metrics": ["total_revenue", "total_stock"], "filters": [{"field": "orders.status", "op": "IS NOT NULL"}]}"#,
-        reference: "SELECT (SELECT SUM(amount_cents / 100.0) FROM orders),
-                (SELECT SUM(stock) FROM products WHERE product_id IN (SELECT product_id FROM orders))",
+        request: r#"{"metrics": ["total_revenue", "total_stock"]}"#,
+        reference: "SELECT (SELECT SUM(amount_cents / 100.0) FROM orders), (SELECT SUM(stock) FROM products)",
         prefer: false,
     },
     Case {
@@ -548,7 +473,7 @@ pub const CASES: &[Case] = &[
     Case {
         name: "running_total_and_change",
         request: r#"{"metrics": ["total_revenue", "cumulative_revenue", "revenue_change"], "dimensions": ["orders.order_date"],
-            "timeGrain": "month", "orderBy": [{"field": "orders.order_date"}]}"#,
+            "timeGrain": "month", "deferredMetrics": true, "orderBy": [{"field": "orders.order_date"}]}"#,
         reference: "SELECT m, r,
                 SUM(r) OVER (ORDER BY m ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
                 r - LAG(r, 1) OVER (ORDER BY m)
@@ -560,7 +485,7 @@ pub const CASES: &[Case] = &[
         // The last period has no next row: NULL, not the type's default.
         name: "change_to_next_period",
         request: r#"{"metrics": ["total_revenue", "revenue_change_to_next"], "dimensions": ["orders.order_date"],
-            "timeGrain": "month", "orderBy": [{"field": "orders.order_date"}]}"#,
+            "timeGrain": "month", "deferredMetrics": true, "orderBy": [{"field": "orders.order_date"}]}"#,
         reference: "SELECT m, r, LEAD(r, 1) OVER (ORDER BY m) - r
             FROM (SELECT DATE_TRUNC('month', order_date) AS m, SUM(amount_cents / 100.0) AS r FROM orders GROUP BY 1)
             ORDER BY m",
@@ -568,7 +493,7 @@ pub const CASES: &[Case] = &[
     },
     Case {
         name: "rank_filter_after_window",
-        request: r#"{"metrics": ["revenue_rank_in_region", "total_revenue"], "dimensions": ["customers.region", "products.category"],
+        request: r#"{"metrics": ["revenue_rank_in_region", "total_revenue"], "dimensions": ["customers.region", "products.category"], "deferredMetrics": true,
             "metricFilters": [{"metric": "revenue_rank_in_region", "op": "=", "value": 1}]}"#,
         reference: "SELECT * FROM (
               SELECT c.region, p.category,
@@ -582,22 +507,17 @@ pub const CASES: &[Case] = &[
         prefer: false,
     },
     Case {
-        name: "window_over_dedup_measure",
-        request: r#"{"metrics": ["stock_share", "total_revenue"], "dimensions": ["customers.region"]}"#,
-        reference: "WITH stock AS (
-              SELECT region, SUM(stock) AS s FROM (
-                SELECT DISTINCT c.region, p.product_id, p.stock
-                FROM orders o
-                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
-                LEFT JOIN products p ON o.product_id = p.product_id
-                WHERE p.product_id IS NOT NULL
-              ) GROUP BY region
-            ), rev AS (
-              SELECT c.region, SUM(o.amount_cents / 100.0) AS r
-              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region
+        // A window over stacked branches sees every group, here the NULL category
+        // of the order with no product, whose stock is NULL.
+        name: "window_over_two_branches",
+        request: r#"{"metrics": ["stock_share", "total_revenue"], "dimensions": ["products.category"], "deferredMetrics": true}"#,
+        reference: "WITH stock AS (SELECT category, SUM(stock) AS s FROM products GROUP BY category),
+            rev AS (
+              SELECT p.category, SUM(o.amount_cents / 100.0) AS r
+              FROM orders o LEFT JOIN products p ON o.product_id = p.product_id GROUP BY p.category
             )
-            SELECT rev.region, stock.s / SUM(stock.s) OVER (), rev.r
-            FROM rev LEFT JOIN stock ON rev.region IS NOT DISTINCT FROM stock.region",
+            SELECT COALESCE(stock.category, rev.category), stock.s / SUM(stock.s) OVER (), rev.r
+            FROM stock FULL JOIN rev ON stock.category IS NOT DISTINCT FROM rev.category",
         prefer: false,
     },
 ];
@@ -861,7 +781,172 @@ pub struct Layer2NestedCase {
     pub script: bool,
 }
 
+/// Layer 3 reads each metric's home dataset; Layer 2 reads the consumer's joins, so
+/// a measure on the one side needs de-duplicating there. This spells those joins.
+macro_rules! shop_joins {
+    ($select:literal, $rest:literal) => {
+        concat!(
+            $select,
+            "FROM orders o LEFT JOIN customers c ON o.customer_id = c.id ",
+            "LEFT JOIN products p ON o.product_id = p.id",
+            $rest
+        )
+    };
+}
+
 pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
+    Layer2NestedCase {
+        // Groups come from every joined row (a group with no input rows is kept),
+        // so APAC, whose only order has no product, appears with NULL stock.
+        name: "one_side_measure_dedup",
+        sql: shop_joins!("SELECT c.region, AGG(p.stock_units) ", " GROUP BY c.region"),
+        reference: "SELECT g.region, s.stock
+            FROM (SELECT DISTINCT c.region FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id) g
+            LEFT JOIN (
+              SELECT region, SUM(stock) AS stock FROM (
+                SELECT DISTINCT c.region, p.product_id, p.stock
+                FROM orders o
+                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+                LEFT JOIN products p ON o.product_id = p.product_id
+                WHERE p.product_id IS NOT NULL
+              ) GROUP BY region
+            ) s ON g.region IS NOT DISTINCT FROM s.region",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "one_side_average_dedup",
+        sql: shop_joins!("SELECT c.region, AGG(p.average_stock) ", " GROUP BY c.region"),
+        reference: "SELECT g.region, s.a
+            FROM (SELECT DISTINCT c.region FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id) g
+            LEFT JOIN (
+              SELECT region, AVG(stock) AS a FROM (
+                SELECT DISTINCT c.region, p.product_id, p.stock
+                FROM orders o
+                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+                LEFT JOIN products p ON o.product_id = p.product_id
+                WHERE p.product_id IS NOT NULL
+              ) GROUP BY region
+            ) s ON g.region IS NOT DISTINCT FROM s.region",
+        script: false,
+    },
+    Layer2NestedCase {
+        // Three stacked parts (orders inline, products and customers de-duplicated)
+        // and a filter on a one-side dataset, which every part must apply.
+        name: "three_parts_with_a_one_side_filter",
+        sql: shop_joins!(
+            "SELECT p.category, AGG(o.gross_revenue), AGG(p.stock_units), AGG(c.known_customers) ",
+            " WHERE c.segment = 'smb' GROUP BY p.category"
+        ),
+        reference: "WITH j AS (
+              SELECT p.category, p.product_id, p.stock, c.customer_id AS cid, o.amount_cents
+              FROM orders o
+              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              LEFT JOIN products p ON o.product_id = p.product_id
+              WHERE c.segment = 'smb'
+            ), g AS (SELECT category, SUM(amount_cents / 100.0) AS r FROM j GROUP BY category),
+            st AS (SELECT category, SUM(stock) AS s FROM (SELECT DISTINCT category, product_id, stock FROM j WHERE product_id IS NOT NULL) GROUP BY category),
+            cc AS (SELECT category, COUNT(*) AS n FROM (SELECT DISTINCT category, cid FROM j WHERE cid IS NOT NULL) GROUP BY category)
+            SELECT g.category, g.r, st.s, COALESCE(cc.n, 0)
+            FROM g
+            LEFT JOIN st ON g.category IS NOT DISTINCT FROM st.category
+            LEFT JOIN cc ON g.category IS NOT DISTINCT FROM cc.category",
+        script: false,
+    },
+    Layer2NestedCase {
+        // includeUnmatched: product 13 never sold, so no order reaches it. It
+        // joins the NULL-region group (its region is NULL), with its stock.
+        name: "unmatched_products_included",
+        sql: concat!(
+            "-- ossiec: includeUnmatched\n",
+            shop_joins!("SELECT c.region, AGG(p.stock_units), AGG(p.product_count) ", " GROUP BY c.region")
+        ),
+        reference: "WITH matched AS (
+              SELECT DISTINCT c.region, p.product_id, p.stock
+              FROM orders o
+              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              LEFT JOIN products p ON o.product_id = p.product_id
+              WHERE p.product_id IS NOT NULL
+            ), unmatched AS (
+              SELECT DISTINCT CAST(NULL AS VARCHAR) AS region, p.product_id, p.stock
+              FROM products p WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.product_id = p.product_id)
+            ), r AS (SELECT * FROM matched UNION ALL SELECT * FROM unmatched),
+            g AS (
+              SELECT DISTINCT c.region FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              UNION SELECT region FROM unmatched
+            )
+            SELECT g.region, s.stock, COALESCE(s.n, 0)
+            FROM g LEFT JOIN (SELECT region, SUM(stock) AS stock, COUNT(*) AS n FROM r GROUP BY region) s
+              ON g.region IS NOT DISTINCT FROM s.region",
+        script: false,
+    },
+    Layer2NestedCase {
+        // A filter on the fact side can't pass for unmatched rows (their region
+        // is NULL), so they add nothing.
+        name: "unmatched_rows_fail_fact_side_filters",
+        sql: concat!(
+            "-- ossiec: includeUnmatched\n",
+            shop_joins!("SELECT c.region, AGG(p.stock_units) ", " WHERE c.region IN ('EU', 'US') GROUP BY c.region")
+        ),
+        reference: "SELECT region, SUM(stock) FROM (
+              SELECT DISTINCT c.region, p.product_id, p.stock
+              FROM orders o
+              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              LEFT JOIN products p ON o.product_id = p.product_id
+              WHERE c.region IN ('EU', 'US') AND p.product_id IS NOT NULL
+            ) GROUP BY region",
+        script: false,
+    },
+    Layer2NestedCase {
+        // WHERE beyond comparisons (§7.3): OR, LIKE, BETWEEN, NOT and an expression,
+        // across datasets, applied to every stacked part.
+        name: "where_is_any_row_predicate",
+        sql: shop_joins!(
+            "SELECT c.region, AGG(o.gross_revenue), AGG(p.stock_units) ",
+            " WHERE (c.segment = 'smb' OR p.category LIKE 'g%') AND o.amount_cents BETWEEN 500 AND 4000 AND NOT o.status = 'returned' AND LOWER(o.status) = o.status GROUP BY c.region"
+        ),
+        reference: "WITH j AS (
+              SELECT c.region, o.amount_cents, p.product_id, p.stock
+              FROM orders o
+              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              LEFT JOIN products p ON o.product_id = p.product_id
+              WHERE (c.segment = 'smb' OR p.category LIKE 'g%') AND o.amount_cents BETWEEN 500 AND 4000
+                AND NOT o.status = 'returned' AND LOWER(o.status) = o.status
+            ), r AS (SELECT region, SUM(amount_cents / 100.0) AS v FROM j GROUP BY region),
+            st AS (
+              SELECT region, SUM(stock) AS v FROM (SELECT DISTINCT region, product_id, stock FROM j WHERE product_id IS NOT NULL)
+              GROUP BY region
+            )
+            SELECT r.region, r.v, st.v FROM r LEFT JOIN st ON r.region IS NOT DISTINCT FROM st.region",
+        script: false,
+    },
+    Layer2NestedCase {
+        // COUNT(DISTINCT) of a one-side key is normally inline; with
+        // includeUnmatched it is de-duplicated so customers who never ordered
+        // (Eve, ada, C:\temp) are counted, in the NULL-category group.
+        name: "unmatched_customers_counted",
+        sql: concat!(
+            "-- ossiec: includeUnmatched\n",
+            shop_joins!("SELECT p.category, AGG(c.distinct_customers) ", " GROUP BY p.category")
+        ),
+        reference: "WITH matched AS (
+              SELECT DISTINCT p.category, c.customer_id
+              FROM orders o
+              LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+              LEFT JOIN products p ON o.product_id = p.product_id
+              WHERE c.customer_id IS NOT NULL
+            ), unmatched AS (
+              SELECT DISTINCT CAST(NULL AS VARCHAR) AS category, c.customer_id
+              FROM {customers} c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)
+            ), r AS (SELECT * FROM matched UNION ALL SELECT * FROM unmatched),
+            g AS (
+              SELECT DISTINCT p.category FROM orders o LEFT JOIN products p ON o.product_id = p.product_id
+              UNION SELECT category FROM unmatched
+            )
+            SELECT g.category, COALESCE(s.n, 0)
+            FROM g LEFT JOIN (SELECT category, COUNT(*) AS n FROM r GROUP BY category) s
+              ON g.category IS NOT DISTINCT FROM s.category",
+        script: false,
+    },
     Layer2NestedCase {
         name: "a2_top_two_customers",
         sql: A2_SHOP,

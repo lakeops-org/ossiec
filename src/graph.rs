@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::model::{self, Model};
 use crate::sql::{self, Tpl};
+use crate::wide_table::ErrorCode;
 use crate::{Error, Result};
 
 /// Which kind of expression a dialect entry carries.
@@ -95,6 +96,14 @@ pub(crate) struct Term {
     pub null_type: Option<&'static str>,
     /// Generated SQL of `ast`; identical aggregates across metrics share one term.
     pub key: String,
+}
+
+/// One reason wide table §5.2 refuses a query naming a model-scoped metric.
+pub(crate) struct MetricRejection {
+    pub code: ErrorCode,
+    pub message: String,
+    /// The spec defers this case, so `deferredMetrics` can ask for it.
+    pub deferred: bool,
 }
 
 /// A metric split into aggregate terms and an outer expression over them.
@@ -536,8 +545,24 @@ pub fn bind(model: Model) -> Result<SemanticGraph> {
     };
     let mut ctx = Ctx::default();
     for i in 0..g.metrics.len() {
+        // Wide table §5.2: these are for a query that names the metric to refuse,
+        // so they don't stop the rest of the model from loading.
+        let rejections = match g.metric_rejections(i, &mut ctx) {
+            Ok(r) => r,
+            Err(Error::InvalidModel(es)) => {
+                errs.extend(es);
+                continue;
+            }
+            Err(other) => {
+                errs.push(other.to_string());
+                continue;
+            }
+        };
         match g.resolve_metric_unchecked(i, &mut ctx) {
             Ok(_) => {}
+            Err(Error::InvalidModel(es)) if !rejections.is_empty() => {
+                g.metrics[i].unsupported = Some(es.join("; "))
+            }
             Err(Error::Unsupported(why)) => g.metrics[i].unsupported = Some(why),
             Err(Error::InvalidModel(es)) => errs.extend(es),
             Err(other) => errs.push(other.to_string()),
@@ -841,15 +866,22 @@ impl SemanticGraph {
     /// relationship leads to, playing that role (ANSI identifier rules).
     /// Returns (dataset, field, role relationship).
     pub(crate) fn field_by_name(&self, name: &str) -> Result<(usize, usize, Option<usize>)> {
-        let c = match sql::parse(name, DialectType::Generic) {
-            Ok(Expression::Column(c)) if c.table.is_some() => c,
-            _ => {
-                return Err(Error::Request(format!(
-                    "`{name}` is not a field reference; use `dataset.field` or `relationship.field`"
-                )))
-            }
+        match sql::parse(name, DialectType::Generic) {
+            Ok(Expression::Column(c)) if c.table.is_some() => self.field_of_column(&c),
+            _ => Err(Error::Request(format!(
+                "`{name}` is not a field reference; use `dataset.field` or `relationship.field`"
+            ))),
+        }
+    }
+
+    /// [`Self::field_by_name`] for a parsed, qualified column.
+    pub(crate) fn field_of_column(&self, c: &Column) -> Result<(usize, usize, Option<usize>)> {
+        let Some(t) = c.table.as_ref() else {
+            return Err(Error::Request(format!(
+                "`{}` is not a field reference; use `dataset.field` or `relationship.field`",
+                c.name.name
+            )));
         };
-        let t = c.table.as_ref().expect("checked above");
         let is_dataset = lookup(
             self.datasets.iter().map(|d| d.name.as_str()),
             &t.name,
@@ -870,7 +902,7 @@ impl SemanticGraph {
                 c.table = Some(Identifier::quoted(&self.datasets[self.rels[r].to].name));
                 c
             }
-            None => c,
+            None => c.clone(),
         };
         let (ds, f) = self
             .resolve_column(&c, None, &mut Ctx::default())
@@ -1091,6 +1123,89 @@ impl SemanticGraph {
             ))
         })?;
         Ok((ds, f))
+    }
+
+    /// What wide table §5.2 refuses in a model-scoped metric, every case that
+    /// applies. Names that don't resolve are an invalid model, whatever else the
+    /// metric does.
+    pub(crate) fn metric_rejections(
+        &self,
+        m: usize,
+        ctx: &mut Ctx,
+    ) -> Result<Vec<MetricRejection>> {
+        let info = &self.metrics[m];
+        if info.owner.is_some() {
+            return Ok(vec![]);
+        }
+        let name = &info.name;
+        let ast = ctx.pick(&info.variants).ast.clone();
+        self.column_datasets(&ast, None, ctx).map_err(|e| match e {
+            Error::InvalidModel(v) => {
+                Error::InvalidModel(vec![format!("metric `{name}`: {}", v.join("; "))])
+            }
+            other => other,
+        })?;
+        let mut out = vec![];
+        // §5.2 reports a window's own clauses under the window, not as stray fields.
+        let outside = transform(ast.clone(), &|e| {
+            Ok(Some(
+                if is_aggregate(&e) || matches!(e, Expression::WindowFunction(_)) {
+                    Expression::Null(polyglot_sql::expressions::Null)
+                } else {
+                    e
+                },
+            ))
+        })
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        if !get_columns(&outside).is_empty() {
+            out.push(MetricRejection {
+                code: ErrorCode::UnaggregatedFinerGrainReference,
+                message: format!("metric `{name}` reads a field outside every aggregate"),
+                deferred: false,
+            });
+        }
+        if contains_window_function(&ast) {
+            out.push(MetricRejection {
+                code: ErrorCode::DeferredWindowedMetric,
+                message: format!(
+                    "metric `{name}` contains a window function, which the spec defers; set `deferredMetrics` to compute it over the grouped result"
+                ),
+                deferred: true,
+            });
+        }
+        for agg in get_aggregate_functions(&ast) {
+            let reads = self.column_datasets(&clear_aggregate_filter(agg.clone()), None, ctx)?;
+            let filter_reads = match aggregate_filter(agg) {
+                Some(p) => self.column_datasets(p, None, ctx)?,
+                None => BTreeSet::new(),
+            };
+            let found = if reads.is_empty() {
+                Some((
+                    "has an aggregate whose arguments read no dataset; make it a dataset-scoped metric",
+                    false,
+                ))
+            } else if reads.len() > 1 {
+                Some((
+                    "has an aggregate whose arguments read several datasets, which the spec defers; set `deferredMetrics` to compute it from the dataset that reaches the others",
+                    true,
+                ))
+            } else if !filter_reads.is_subset(&reads) {
+                Some((
+                    "has a FILTER that reads a dataset other than the one its aggregate reads",
+                    false,
+                ))
+            } else {
+                None
+            };
+            if let Some((why, deferred)) = found {
+                out.push(MetricRejection {
+                    code: ErrorCode::AmbiguousMeasureGrain,
+                    message: format!("metric `{name}` {why}"),
+                    deferred,
+                });
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn resolve_metric(&self, m: usize, ctx: &mut Ctx) -> Result<ResolvedMetric> {
@@ -1384,7 +1499,8 @@ impl SemanticGraph {
         let metrics = scoped
             .chain(self.model.metrics.iter())
             .zip(&self.metrics)
-            .map(|(m, mi)| MetricDoc {
+            .enumerate()
+            .map(|(i, (m, mi))| MetricDoc {
                 name: mi.name.clone(),
                 description: m.description.clone(),
                 datatype: m.datatype.clone(),
@@ -1392,6 +1508,9 @@ impl SemanticGraph {
                 queryable: mi.unsupported.is_none(),
                 not_queryable_because: mi.unsupported.clone(),
                 requires_dimensions: self.required_dims(&mi.name),
+                requires_deferred_metrics: self
+                    .metric_rejections(i, &mut Ctx::default())
+                    .is_ok_and(|r| r.iter().any(|r| r.deferred)),
                 dialects: dialect_names(&mi.variants),
             })
             .collect();
@@ -1450,6 +1569,9 @@ pub struct MetricDoc {
     /// Dimensions a window metric partitions or orders by; requests must include them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub requires_dimensions: Vec<String>,
+    /// The spec defers this metric: a request must set `deferredMetrics` to get it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub requires_deferred_metrics: bool,
     pub dialects: Vec<String>,
 }
 

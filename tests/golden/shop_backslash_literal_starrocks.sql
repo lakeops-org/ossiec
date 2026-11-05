@@ -1,7 +1,7 @@
 -- request: {"dimensions": ["customers.name"], "filters": [{"field": "customers.name", "op": "IN", "values": ["O'Brien", "C:\\temp"]}]}
 -- dialect: starrocks (source: generic)
 SELECT
-  base.d0 AS `customers.name`
+  base.d0 AS `name`
 FROM (
   SELECT
     `customers`.name AS d0

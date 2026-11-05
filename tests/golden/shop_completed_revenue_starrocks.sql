@@ -1,7 +1,7 @@
 -- request: {"metrics": ["completed_revenue"], "dimensions": ["customers.region"]}
 -- dialect: starrocks (source: generic)
 SELECT
-  base.d0 AS `customers.region`,
+  base.d0 AS `region`,
   base.t0 AS `completed_revenue`
 FROM (
   SELECT

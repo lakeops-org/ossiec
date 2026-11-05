@@ -3,11 +3,12 @@
 //! 1. Resolve every name in the request.
 //! 2. Pick the **join root**: the dataset from which every referenced dataset
 //!    is reachable along many-to-one relationships. Joins only ever go from
-//!    the many side to the one side, so they never multiply root rows.
+//!    the many side to the one side, so they never multiply root rows. Layer 3
+//!    has one root per home dataset, after [`wide_table::check`].
 //! 3. Classify each aggregate term:
 //!    - `Inline`: it reads the root, or it is duplicate-insensitive (`MIN`,
 //!      `MAX`, `COUNT(DISTINCT ...)`). Correct over the joined rows as-is.
-//!    - `PkDedup`: it only reads one-side datasets (`SUM(store.employees)`
+//!    - `PkDedup` (Layer 2): it only reads one-side datasets (`SUM(store.employees)`
 //!      over a `store_sales` root). Joined rows repeat those values, so the
 //!      term is computed over rows de-duplicated on its dataset's primary key.
 
@@ -17,11 +18,12 @@ use polyglot_sql::{transform, Expression};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::graph::{Ctx, SemanticGraph, Term, DIM, TERM};
+use crate::graph::{self, Ctx, SemanticGraph, Term, DIM, TERM};
 
 /// Placeholder for requested dimension `i` inside a metric's outer expression.
 pub(crate) const OUT_DIM: &str = "__ossiec_q";
 use crate::sql::{self, Tpl};
+use crate::wide_table::{self, ErrorCode};
 use crate::{Error, Result};
 
 /// A semantic query: which metrics, sliced by which dimensions.
@@ -31,13 +33,29 @@ pub struct Request {
     /// Ignored by the compiler; lets callers keep the target model in the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// `metric` (model-scoped) or `dataset.metric` (dataset-scoped). Empty to
-    /// list the distinct values of `dimensions` instead.
-    #[serde(default)]
-    pub metrics: Vec<String>,
-    /// `dataset.field`, or `relationship.field` when that dataset plays the role.
-    #[serde(default)]
-    pub dimensions: Vec<String>,
+    /// `metric` (model-scoped) or `dataset.metric` (dataset-scoped), or an object
+    /// `{"metric": ..., "alias": ...}`. Empty to list the distinct values of
+    /// `dimensions` instead.
+    #[serde(
+        default,
+        deserialize_with = "metrics_from_json",
+        serialize_with = "metrics_to_json"
+    )]
+    pub metrics: Vec<Selected>,
+    /// `dataset.field`, or `relationship.field` when that dataset plays the role, or
+    /// an object `{"field": ..., "alias": ...}`.
+    #[serde(
+        default,
+        deserialize_with = "dimensions_from_json",
+        serialize_with = "dimensions_to_json"
+    )]
+    pub dimensions: Vec<Selected>,
+    /// One row predicate over one dataset's fields (wide table §3.4), applied in
+    /// every branch: `customers.region <> 'WEST'`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Structured predicates, all applied in every branch. Unlike `filter` they
+    /// can read several datasets: each must be reachable from every metric.
     #[serde(default)]
     pub filters: Vec<Filter>,
     /// Conditions on requested metrics (SQL `HAVING`).
@@ -52,9 +70,16 @@ pub struct Request {
     pub order_by: Vec<OrderBy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
-    /// Also count one-side rows no fact row reaches (products never sold), as a
-    /// group of their own where the fact's dimensions are NULL. Off by default:
-    /// the request's joins decide its rows (relational semantics §10.2).
+    /// Answer the model-scoped metrics the spec defers (wide table §5.2): windows,
+    /// computed over the grouped result, and aggregates reading several datasets,
+    /// computed from the one that reaches the others. Without this they raise
+    /// `E_DEFERRED_WINDOWED_METRIC` and `E_AMBIGUOUS_MEASURE_GRAIN`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred_metrics: bool,
+    /// Layer 2 only: also count one-side rows no fact row reaches (products never
+    /// sold), as a group of their own where the fact's dimensions are NULL (relational
+    /// semantics §10.2). [`crate::compile`] raises `E_INVALID_QUERY`: in Layer 3 a
+    /// metric already reads all the rows of its home dataset.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_unmatched: bool,
     /// Datasets that must appear in the join tree even when no selected
@@ -64,6 +89,138 @@ pub struct Request {
     #[serde(skip)]
     #[doc(hidden)]
     pub ensure_datasets: Vec<usize>,
+}
+
+/// One entry of `dimensions` or `metrics`. In Layer 3 its output name is the alias
+/// if given, or the final part of the reference (wide table §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selected {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+impl From<&str> for Selected {
+    fn from(name: &str) -> Self {
+        name.to_string().into()
+    }
+}
+
+impl From<String> for Selected {
+    fn from(name: String) -> Self {
+        Selected { name, alias: None }
+    }
+}
+
+impl PartialEq<&str> for Selected {
+    fn eq(&self, other: &&str) -> bool {
+        self.alias.is_none() && self.name == *other
+    }
+}
+
+impl std::ops::Deref for Selected {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.name
+    }
+}
+
+fn selected<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    key: &str,
+) -> std::result::Result<Vec<Selected>, D::Error> {
+    use serde::de::Error as _;
+    let entries = Vec::<Value>::deserialize(d)?;
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            Value::String(name) => Ok(name.into()),
+            Value::Object(o) => {
+                if let Some(k) = o.keys().find(|k| *k != key && *k != "alias") {
+                    return Err(D::Error::custom(format!("unknown property `{k}`")));
+                }
+                let text = |k: &str| match o.get(k) {
+                    None => Ok(None),
+                    Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+                    Some(_) => Err(D::Error::custom(format!(
+                        "`{k}` must be a non-empty string"
+                    ))),
+                };
+                Ok(Selected {
+                    name: text(key)?.ok_or_else(|| D::Error::custom(format!("missing `{key}`")))?,
+                    alias: text("alias")?,
+                })
+            }
+            other => Err(D::Error::custom(format!(
+                "expected a reference or an object with `{key}`, got {other}"
+            ))),
+        })
+        .collect()
+}
+
+fn dimensions_from_json<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<Selected>, D::Error> {
+    selected(d, "field")
+}
+
+fn metrics_from_json<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<Selected>, D::Error> {
+    selected(d, "metric")
+}
+
+/// A plain string without an alias, so a request's JSON and hash don't change.
+fn selected_to_json<S: serde::Serializer>(
+    entries: &[Selected],
+    key: &str,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let json: Vec<Value> = entries
+        .iter()
+        .map(|e| match &e.alias {
+            None => Value::String(e.name.clone()),
+            Some(alias) => serde_json::json!({ key: e.name, "alias": alias }),
+        })
+        .collect();
+    json.serialize(s)
+}
+
+fn dimensions_to_json<S: serde::Serializer>(
+    entries: &[Selected],
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    selected_to_json(entries, "field", s)
+}
+
+fn metrics_to_json<S: serde::Serializer>(
+    entries: &[Selected],
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    selected_to_json(entries, "metric", s)
+}
+
+/// The final part of a reference.
+pub(crate) fn final_part(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+impl Request {
+    /// Read a request from JSON. A malformed one, or one with an unknown or `null`
+    /// property, raises `E_INVALID_QUERY` (wide table §3.7).
+    pub fn from_json(text: &str) -> Result<Request> {
+        let invalid = |message: String| Error::Query {
+            code: ErrorCode::InvalidQuery,
+            message,
+        };
+        let value: Value = serde_json::from_str(text).map_err(|e| invalid(e.to_string()))?;
+        if let Some((key, _)) = value
+            .as_object()
+            .and_then(|o| o.iter().find(|(_, v)| v.is_null()))
+        {
+            return Err(invalid(format!("`{key}` is null")));
+        }
+        serde_json::from_value(value).map_err(|e| invalid(e.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +471,9 @@ pub(crate) fn plan(
     interface: Interface,
     ctx: &mut Ctx,
 ) -> Result<LogicalPlan> {
+    if interface == Interface::WideTable {
+        wide_table::check(g, req, ctx)?;
+    }
     // No metrics: the request lists dimension values (distinct combinations).
     if req.metrics.is_empty() && req.dimensions.is_empty() {
         return Err(req_err("ask for at least one metric or dimension"));
@@ -321,15 +481,25 @@ pub(crate) fn plan(
 
     // Dimensions.
     // (output name, dataset, field, role)
+    let by_output_name = interface == Interface::WideTable;
     let mut dim_refs: Vec<(String, usize, usize, Option<usize>)> = vec![];
+    // Each name `orderBy` can use: (reference, output name).
+    let mut references: Vec<(String, String)> = vec![];
     for d in &req.dimensions {
         let (ds, f, role) = g.field_by_name(d)?;
         let prefix = match role {
             Some(r) => g.rels[r].name.clone(),
             None => g.datasets[ds].name.clone(),
         };
-        let name = format!("{prefix}.{}", g.datasets[ds].fields[f].name);
+        let field = &g.datasets[ds].fields[f].name;
+        let reference = format!("{prefix}.{field}");
+        let name = match &d.alias {
+            Some(alias) if by_output_name => alias.clone(),
+            _ if by_output_name => field.clone(),
+            _ => reference.clone(),
+        };
         if !dim_refs.iter().any(|(n, ..)| *n == name) {
+            references.push((reference, name.clone()));
             dim_refs.push((name, ds, f, role));
         }
     }
@@ -338,6 +508,7 @@ pub(crate) fn plan(
         (None, Some(_)) => return Err(req_err("timeDimension needs a timeGrain")),
         (Some(grain), Some(td)) => {
             let (ds, f, role) = g.field_by_name(td)?;
+            // A field selected under two aliases: the grain applies to the first.
             let i = dim_refs
                 .iter()
                 .position(|(_, d, ff, r)| (*d, *ff, *r) == (ds, f, role))
@@ -387,10 +558,17 @@ pub(crate) fn plan(
     // Metrics: lift aggregate terms, sharing identical ones.
     let mut terms: Vec<Term> = vec![];
     let mut outputs: Vec<(String, Expression)> = vec![];
+    // Which metric each output is.
+    let mut output_metrics: Vec<usize> = vec![];
     let mut windowed = false;
     for m in &req.metrics {
         let mi = g.metric_by_name(m)?;
-        let name = g.metrics[mi].name.clone();
+        let reference = &g.metrics[mi].name;
+        let name = match &m.alias {
+            Some(alias) if by_output_name => alias.clone(),
+            _ if by_output_name => final_part(reference).to_string(),
+            _ => reference.clone(),
+        };
         if outputs.iter().any(|(n, _)| *n == name) {
             continue;
         }
@@ -423,6 +601,8 @@ pub(crate) fn plan(
                 }
             })
             .collect();
+        references.push((g.metrics[mi].name.clone(), name.clone()));
+        output_metrics.push(mi);
         outputs.push((name, renumber(rm.outer, &global, &dim_index)));
     }
 
@@ -457,12 +637,26 @@ pub(crate) fn plan(
         let datatype = g.datasets[ds].fields[fi].datatype.as_deref();
         filters.push(predicate(lhs, f.op, f.value.as_ref(), &f.values, datatype)?);
     }
+    if let Some(text) = &req.filter {
+        let ast = wide_table::parse_filter(text)?;
+        for (ds, f, node) in wide_table::filter_fields(g, &ast) {
+            required.insert(node);
+            if is_string(ds, f) {
+                let e = g.field_sql_as(ds, f, &alias(g, node), ctx);
+                if !string_exprs.contains(&e) {
+                    string_exprs.push(e);
+                }
+            }
+        }
+        filters.push(filter_sql(g, ast, ctx)?);
+    }
     let mut metric_filters = vec![];
     for mf in &req.metric_filters {
         let mi = g.metric_by_name(&mf.metric)?;
-        let (_, outer) = outputs
+        let (output, outer) = output_metrics
             .iter()
-            .find(|(n, _)| *n == g.metrics[mi].name)
+            .position(|&o| o == mi)
+            .map(|i| &outputs[i])
             .ok_or_else(|| {
                 req_err(format!(
                     "metricFilters: `{}` must also be a requested metric",
@@ -477,40 +671,34 @@ pub(crate) fn plan(
         }
         metric_filters.push((
             predicate(outer.clone(), mf.op, Some(&mf.value), &[], None)?,
-            predicate(
-                sql::quoted_col(&g.metrics[mi].name),
-                mf.op,
-                Some(&mf.value),
-                &[],
-                None,
-            )?,
+            predicate(sql::quoted_col(output), mf.op, Some(&mf.value), &[], None)?,
         ));
     }
 
-    // Order and limit refer to output names.
-    let known: Vec<&str> = dims
-        .iter()
-        .map(|(n, _)| n.as_str())
-        .chain(outputs.iter().map(|(n, _)| n.as_str()))
-        .collect();
+    // Order refers to an entry by its output name or its reference.
     let mut order = vec![];
     for o in &req.order_by {
-        let name = match crate::graph::lookup(known.iter().copied(), &o.field, false) {
-            Ok(Some(i)) => known[i].to_string(),
-            _ => {
-                return Err(req_err(format!(
-                    "orderBy `{}` must be a requested dimension or metric ({})",
-                    o.field,
-                    known.join(", ")
-                )))
-            }
+        let find = |names: Vec<&str>| crate::graph::lookup(names, &o.field, false).ok().flatten();
+        let name = find(references.iter().map(|(_, n)| n.as_str()).collect())
+            .or_else(|| find(references.iter().map(|(r, _)| r.as_str()).collect()))
+            .map(|i| references[i].1.clone());
+        let Some(name) = name else {
+            let known: Vec<&str> = references.iter().map(|(r, _)| r.as_str()).collect();
+            return Err(req_err(format!(
+                "orderBy `{}` must be a requested dimension or metric ({})",
+                o.field,
+                known.join(", ")
+            )));
         };
         order.push((name, o.direction, o.nulls));
     }
 
     // Join trees (one per fact) and term strategies.
-    let by_home = interface == Interface::WideTable;
-    let (legs, term_legs) = plan_legs(g, &required, &terms, by_home)?;
+    let (legs, term_legs) = if interface == Interface::WideTable && !terms.is_empty() {
+        branches(g, &required, &terms)?
+    } else {
+        plan_legs(g, &required, &terms)?
+    };
     let mut planned = vec![];
     for (term, leg) in terms.into_iter().zip(term_legs) {
         let root = legs[leg].root;
@@ -604,6 +792,23 @@ fn renumber(e: Expression, global: &[usize], dim_index: &[usize]) -> Expression 
     .expect("renumbering cannot fail")
 }
 
+/// `filter` over the query's aliases, each field in its SQL.
+fn filter_sql(g: &SemanticGraph, ast: Expression, ctx: &mut Ctx) -> Result<Expression> {
+    let ctx = std::cell::RefCell::new(ctx);
+    transform(graph::true_division(ast), &|e| {
+        let Expression::Column(c) = e else {
+            return Ok(Some(e));
+        };
+        Ok(Some(match g.field_of_column(&c) {
+            Ok((ds, f, role)) => {
+                g.field_sql_as(ds, f, &alias(g, (ds, role)), &mut ctx.borrow_mut())
+            }
+            Err(_) => Expression::Column(c),
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))
+}
+
 fn literal(v: &Value, datatype: Option<&str>) -> Result<Expression> {
     use polyglot_sql::builder::{cast, lit};
     let e = match v {
@@ -626,7 +831,7 @@ fn literal(v: &Value, datatype: Option<&str>) -> Result<Expression> {
     Ok(e.into_inner())
 }
 
-fn predicate(
+pub(crate) fn predicate(
     lhs: Expression,
     op: Op,
     value: Option<&Value>,
@@ -681,34 +886,44 @@ fn predicate(
     t.build()
 }
 
-/// Wide table §5.2 and §5.4: every term has one home dataset that reaches every
-/// dimension and filter, so each can be evaluated over its own home rows.
-///
-/// A request where this fails is one §5.3 rejects. Until those rejections land,
-/// it keeps the single join tree.
-fn every_term_has_a_branch(g: &SemanticGraph, required: &BTreeSet<Node>, terms: &[Term]) -> bool {
-    terms.iter().all(|t| {
-        let [home] = t.datasets.iter().copied().collect::<Vec<_>>()[..] else {
-            return false;
-        };
-        let paths = g.paths_from(home);
-        required.iter().all(|&(ds, role)| {
-            let target = role.map_or(ds, |r| g.rels[r].from);
-            target == home || paths.contains_key(&target)
-        })
-    })
+/// Wide table §5.4: one leg per home dataset, joined to every dimension and
+/// filter. [`wide_table::check`] has refused a request where a home has no single
+/// path to something it needs.
+fn branches(
+    g: &SemanticGraph,
+    required: &BTreeSet<Node>,
+    terms: &[Term],
+) -> Result<(Vec<Leg>, Vec<usize>)> {
+    let mut homes: Vec<(usize, BTreeSet<Node>)> = vec![];
+    let mut term_legs = vec![];
+    for t in terms {
+        let home = grain_of(g, &t.datasets)?;
+        let leg = homes
+            .iter()
+            .position(|(h, _)| *h == home)
+            .unwrap_or_else(|| {
+                homes.push((home, required.clone()));
+                homes.len() - 1
+            });
+        // A deferred aggregate also reads the datasets its home joins to.
+        homes[leg].1.extend(t.datasets.iter().map(|&d| (d, None)));
+        term_legs.push(leg);
+    }
+    let legs = homes
+        .iter()
+        .map(|(home, nodes)| tree_from(g, *home, nodes))
+        .collect::<Result<_>>()?;
+    Ok((legs, term_legs))
 }
 
-/// One join tree for everything, or one per root: each term gets the tree for
-/// its own datasets plus every dimension and filter. There are several when no
-/// dataset reaches all of `required` (independent facts sharing dimensions), or
-/// when `by_home` asks for one branch per home dataset. Returns the legs and
-/// each term's leg.
+/// One join tree for everything, or, when no dataset reaches all of `required`
+/// (independent facts sharing dimensions), one per root: each term gets the tree
+/// for its own datasets plus every dimension and filter. Returns the legs and each
+/// term's leg.
 fn plan_legs(
     g: &SemanticGraph,
     required: &BTreeSet<Node>,
     terms: &[Term],
-    by_home: bool,
 ) -> Result<(Vec<Leg>, Vec<usize>)> {
     let mut all = required.clone();
     for t in terms {
@@ -717,8 +932,7 @@ fn plan_legs(
     let single = join_tree(g, &all);
     let independent =
         matches!(&single, Err(Error::Unsupported(m)) if m.contains("independent facts"));
-    let branched = by_home && every_term_has_a_branch(g, required, terms);
-    if !(independent || branched) || terms.is_empty() {
+    if !independent || terms.is_empty() {
         return Ok((vec![single?], vec![0; terms.len()]));
     }
     // One leg per root: terms whose own tree roots at the same fact share it.
@@ -746,11 +960,6 @@ fn plan_legs(
 }
 
 /// The dataset every required node hangs off, and the joins to reach them.
-///
-/// A plain dataset reachable more than one way takes the unique shortest path
-/// (`date_dim` from `store_sales` is the sale date, not the customer's first-sale
-/// date two hops away). A tie is an error that suggests naming the role. A role
-/// node `(dataset, rel)` is reached through `rel`, under its own alias.
 fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
     let plain: BTreeSet<usize> = required
         .iter()
@@ -810,7 +1019,18 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
             )))
         }
     };
+    tree_from(g, root, required)
+}
 
+/// The joins from `root` to every required node.
+///
+/// A plain dataset reachable more than one way takes the unique shortest path
+/// (Layer 2: `date_dim` from `store_sales` is the sale date, not the customer's
+/// first-sale date two hops away). A tie is an error that suggests naming the role.
+/// Layer 3 has already refused both. A role node `(dataset, rel)` is reached through
+/// `rel`, under its own alias.
+fn tree_from(g: &SemanticGraph, root: usize, required: &BTreeSet<Node>) -> Result<Leg> {
+    let root_paths = g.paths_from(root);
     let show = |p: &Vec<usize>| {
         p.iter()
             .map(|&r| g.rels[r].name.as_str())
@@ -819,7 +1039,7 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
     };
     // The default path to `t`: the only one, or the unique shortest.
     let path_to = |t: usize| -> Result<Vec<usize>> {
-        let paths = &all_paths[root][&t];
+        let paths = &root_paths[&t];
         let shortest = paths.iter().map(Vec::len).min().unwrap_or(0);
         let best: Vec<&Vec<usize>> = paths.iter().filter(|p| p.len() == shortest).collect();
         match best.as_slice() {
@@ -902,7 +1122,7 @@ fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
 }
 
 /// The dataset among `datasets` that reaches all the others: the term's row grain.
-fn grain_of(g: &SemanticGraph, datasets: &BTreeSet<usize>) -> Result<usize> {
+pub(crate) fn grain_of(g: &SemanticGraph, datasets: &BTreeSet<usize>) -> Result<usize> {
     datasets
         .iter()
         .copied()

@@ -1,14 +1,13 @@
-//! Differential fuzzing: random valid requests against the shop model, each
-//! compared with an independent reference written straight from the spec's
-//! reference evaluation strategy (relational semantics §9).
+//! Differential fuzzing: random requests against the shop model.
 //!
-//! The reference shares nothing with ossiec's planner: it evaluates every measure
-//! with a correlated subquery over rows de-duplicated to that measure's row
-//! identity. When every metric's home datasets reach every dimension and filter,
-//! each measure reads its home dataset's own rows and the groups are the union of
-//! the branches' (wide table §5.4, §5.5). Otherwise the request is one §5.3 will
-//! reject; until then it is answered over one join tree rooted at `orders`, the
-//! dataset every such request reads (an orders measure or an orders dimension).
+//! Each is either refused or answered, decided here from the shop's relationships
+//! alone, as wide table §5.3 says: a metric reaches a dataset only if every home
+//! dataset does. A refused request must raise that row's code. An answered one is
+//! compared with an independent reference, written straight from the spec's reference
+//! evaluation strategy (relational semantics §9), which shares nothing with ossiec's
+//! planner: it evaluates every measure with a correlated subquery over rows
+//! de-duplicated to that measure's row identity, each reading its home dataset's
+//! own rows, and the groups are the union of the branches' (wide table §5.4, §5.5).
 //!
 //! ```console
 //! cargo test --test fuzz                                  # DuckDB, 100 requests
@@ -155,42 +154,70 @@ const DIMS: &[(&str, &str, bool)] = &[
     ("orders.status", "status", false),
     ("orders.order_date", "order_date", true),
 ];
-/// (request filter JSON, reference predicate)
-const FILTERS: &[(&str, &str)] = &[
+/// (structured filter, the same as a `filter` expression, reference predicate)
+const FILTERS: &[(&str, &str, &str)] = &[
     (
         r#"{"field": "customers.segment", "op": "=", "value": "smb"}"#,
+        "customers.segment = 'smb'",
         "segment = 'smb'",
     ),
     (
         r#"{"field": "products.category", "op": "IN", "values": ["books"]}"#,
+        "products.category IN ('books')",
         "category IN ('books')",
     ),
     (
         r#"{"field": "orders.status", "op": "!=", "value": "returned"}"#,
+        "orders.status <> 'returned'",
         "status <> 'returned'",
     ),
     (
         r#"{"field": "orders.order_date", "op": ">=", "value": "2026-02-01"}"#,
+        "orders.order_date >= DATE '2026-02-01'",
         "order_date >= DATE '2026-02-01'",
     ),
     (
         r#"{"field": "customers.region", "op": "IS NULL"}"#,
+        "customers.region IS NULL",
         "region IS NULL",
     ),
     (
         r#"{"field": "customers.name", "op": "LIKE", "value": "%a%"}"#,
+        "customers.name LIKE '%a%'",
         "name LIKE '%a%'",
     ),
 ];
 
 struct Generated {
     request: String,
-    reference: String,
+    /// The code §8 requires, or the reference for the rows.
+    expected: Result<String, ossiec::ErrorCode>,
+}
+
+/// Orders reach every dataset here; customers and products only themselves.
+fn metric_reaches(metric: &str, dataset: &str) -> bool {
+    homes(metric)
+        .iter()
+        .all(|h| *h == "orders" || *h == dataset)
+}
+
+/// §8 rows 13, 14 and 16, in order.
+fn rejection(metrics: &[&str], dims: &[&str], filter: Option<&str>) -> Option<ossiec::ErrorCode> {
+    let reached = |d: &&str| metrics.iter().filter(|m| metric_reaches(m, d)).count();
+    if dims.iter().any(|d| reached(d) == 0) {
+        Some(ossiec::ErrorCode::NoPath)
+    } else if dims.iter().any(|d| reached(d) < metrics.len()) {
+        Some(ossiec::ErrorCode::PartialDimensionReachability)
+    } else if filter.is_some_and(|f| metrics.iter().any(|m| !metric_reaches(m, f))) {
+        Some(ossiec::ErrorCode::UnsupportedFilterPath)
+    } else {
+        None
+    }
 }
 
 fn generate(rng: &mut Rng) -> Generated {
-    // A third of requests use only one-side measures (every part de-duplicated),
-    // the shape where groups are most at risk of depending on the measures.
+    // A third of requests use only metrics with a home other than orders, the
+    // shape where groups are most at risk of depending on the measures.
     let one_side_only = rng.below(3) == 0;
     let first = if one_side_only {
         rng.pick(OTHER_METRICS)
@@ -215,12 +242,8 @@ fn generate(rng: &mut Rng) -> Generated {
             dims.push(d);
         }
     }
-    // Keep `orders` the join root of the single-tree case: without an orders
-    // measure, group by an orders field.
-    if one_side_only && !dims.iter().any(|d| d.0.starts_with("orders.")) {
-        dims.push(&DIMS[4]); // orders.status
-    }
     let filter = (rng.below(2) == 0).then(|| rng.pick(FILTERS));
+    let as_expression = rng.below(2) == 0;
     let grain = dims.iter().any(|d| d.2) && rng.below(2) == 0;
 
     let quote = |xs: Vec<&str>| {
@@ -234,8 +257,12 @@ fn generate(rng: &mut Rng) -> Generated {
         quote(metrics.clone()),
         quote(dims.iter().map(|d| d.0).collect())
     );
-    if let Some((json, _)) = filter {
-        request.push_str(&format!(r#", "filters": [{json}]"#));
+    if let Some((json, expression, _)) = filter {
+        if as_expression {
+            request.push_str(&format!(r#", "filter": "{expression}""#));
+        } else {
+            request.push_str(&format!(r#", "filters": [{json}]"#));
+        }
     }
     if grain {
         request.push_str(r#", "timeGrain": "month""#);
@@ -255,7 +282,7 @@ fn generate(rng: &mut Rng) -> Generated {
         })
         .collect();
     let where_ = filter
-        .map(|(_, p)| format!(" WHERE {p}"))
+        .map(|(.., p)| format!(" WHERE {p}"))
         .unwrap_or_default();
     let joined = |source: &str| {
         format!(
@@ -266,31 +293,20 @@ fn generate(rng: &mut Rng) -> Generated {
                 .collect::<String>()
         )
     };
-    // `dataset.field` of each dimension and of the filter.
-    let filter_field =
-        filter.map(|(json, _)| json.split("\"field\": \"").nth(1).expect("filter field"));
-    let read: Vec<&str> = dims
-        .iter()
-        .map(|d| d.0)
-        .chain(filter_field)
-        .map(|f| f.split('.').next().expect("dataset"))
-        .collect();
-    // Orders reach every dataset here; customers and products only themselves.
-    let branched = metrics
-        .iter()
-        .flat_map(|m| homes(m))
-        .all(|h| *h == "orders" || read.iter().all(|r| r == h));
-    let mut used: Vec<&str> = if branched {
-        metrics.iter().flat_map(|m| homes(m)).copied().collect()
-    } else {
-        vec!["orders"]
-    };
+    let dataset = |field: &'static str| field.split('.').next().expect("dataset");
+    let filter_dataset =
+        filter.map(|(json, ..)| dataset(json.split("\"field\": \"").nth(1).expect("filter field")));
+    let dim_datasets: Vec<&str> = dims.iter().map(|d| dataset(d.0)).collect();
+    if let Some(code) = rejection(&metrics, &dim_datasets, filter_dataset) {
+        return Generated {
+            request,
+            expected: Err(code),
+        };
+    }
+    let mut used: Vec<&str> = metrics.iter().flat_map(|m| homes(m)).copied().collect();
     used.sort();
     used.dedup();
-    let rel = |home: &str| {
-        let home = if branched { home } else { "orders" };
-        format!("joined_{home}")
-    };
+    let rel = |home: &str| format!("joined_{home}");
     let n = dims.len();
     let groups = if n == 0 {
         "SELECT 1 AS one".to_string()
@@ -311,11 +327,14 @@ fn generate(rng: &mut Rng) -> Generated {
     let reference = format!(
         "WITH joined_orders AS ({}), joined_customers AS ({}), joined_products AS ({}), groups AS ({groups}) SELECT {} FROM groups g",
         joined(JOINED),
-        if branched { joined(JOINED_CUSTOMERS) } else { "SELECT 1".to_string() },
-        if branched { joined(JOINED_PRODUCTS) } else { "SELECT 1".to_string() },
+        joined(JOINED_CUSTOMERS),
+        joined(JOINED_PRODUCTS),
         select.join(", ")
     );
-    Generated { request, reference }
+    Generated {
+        request,
+        expected: Ok(reference),
+    }
 }
 
 fn fuzz(engine: Engine, count: usize) {
@@ -332,6 +351,7 @@ fn fuzz(engine: Engine, count: usize) {
     }
     let mut rng = Rng(0x0551_EC00_F00D_5EED);
     let mut failures = vec![];
+    let mut answered = 0;
     for i in 0..count {
         let g = generate(&mut rng);
         let req: ossiec::Request = serde_json::from_str(&g.request).unwrap();
@@ -339,18 +359,30 @@ fn fuzz(engine: Engine, count: usize) {
             target: Some(engine.dialect()),
             ..Default::default()
         };
-        let compiled = match ossiec::compile(&graph, &req, &opts) {
+        let compiled = ossiec::compile(&graph, &req, &opts);
+        let reference = match g.expected {
+            Err(code) => {
+                let got = compiled.map(|_| ()).map_err(|e| e.code());
+                if got != Err(Some(code)) {
+                    failures.push(format!("#{i} {}: {got:?}, expected {code}", g.request));
+                }
+                continue;
+            }
+            Ok(reference) => reference,
+        };
+        let compiled = match compiled {
             Ok(c) => c,
             Err(e) => {
                 failures.push(format!("#{i} {}: compile: {e}", g.request));
                 continue;
             }
         };
+        answered += 1;
         let got = match engine {
             Engine::DuckDb => Ok(duckdb_rows(&db, &compiled.sql)),
             _ => run(engine, &compiled.sql),
         };
-        let mut want = duckdb_rows(&db, &g.reference);
+        let mut want = duckdb_rows(&db, &reference);
         match got {
             Ok(mut got) => {
                 got.sort();
@@ -365,6 +397,10 @@ fn fuzz(engine: Engine, count: usize) {
             Err(e) => failures.push(format!("#{i} {}: {e}", g.request)),
         }
     }
+    assert!(
+        answered * 3 >= count,
+        "{engine:?}: only {answered} of {count} random requests were answered, too few to prove much"
+    );
     assert!(
         failures.is_empty(),
         "{engine:?}: {} of {count} random requests failed\n\n{}",

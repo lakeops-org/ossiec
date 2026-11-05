@@ -31,6 +31,7 @@ datasets:
       - name: order_count
         expression: { sql: COUNT(*) }
         description: Number of orders
+      - { name: gross_revenue, expression: { sql: SUM(revenue) } }
 
   - name: customers
     # A query source: soft-deleted customers are not customers.
@@ -41,6 +42,9 @@ datasets:
       - { name: name, expression: { sql: name }, datatype: String }
       - { name: region, expression: { sql: region }, datatype: String, dimension: {} }
       - { name: segment, expression: { sql: segment }, datatype: String, dimension: {} }
+    metrics:
+      - { name: known_customers, expression: { sql: COUNT(id) } }
+      - { name: distinct_customers, expression: { sql: COUNT(DISTINCT id) } }
 
   - name: products
     source: products
@@ -51,6 +55,8 @@ datasets:
       - { name: stock, expression: { sql: stock }, datatype: Integer }
     metrics:
       - { name: stock_units, expression: { sql: SUM(stock) } }
+      - { name: product_count, expression: { sql: COUNT(id) } }
+      - { name: average_stock, expression: { sql: AVG(stock) } }
 
 relationships:
   - { name: orders_to_customers, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
@@ -74,7 +80,7 @@ metrics:
     description: Units in stock
   - name: revenue_per_stock_unit
     expression: { sql: "SUM(orders.revenue) / NULLIF(SUM(products.stock), 0)" }
-  # Window metrics: computed over the grouped result.
+  # Window metrics: computed over the grouped result, when a request sets `deferredMetrics`.
   - name: cumulative_revenue
     expression: { sql: "SUM(SUM(orders.revenue)) OVER (ORDER BY orders.order_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)" }
     description: Running total of revenue
@@ -92,8 +98,7 @@ metrics:
   # A ratio of two integer counts: true division on every engine (Postgres and Trino would truncate).
   - name: orders_per_customer
     expression: { sql: "COUNT(orders.id) / NULLIF(COUNT(DISTINCT customers.id), 0)" }
-  # One-side COUNT and AVG: over their home dataset's rows, or primary-key
-  # de-duplicated rows when requested with dimensions that dataset can't reach.
+  # COUNT and AVG on the one side of a relationship, over their home dataset's rows.
   - name: products_sold
     expression: { sql: COUNT(products.id) }
     description: Products in the group

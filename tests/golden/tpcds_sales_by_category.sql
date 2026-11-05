@@ -1,7 +1,7 @@
 -- request: {"metrics": ["total_sales", "total_profit"], "dimensions": ["item.i_category"]}
 -- dialect: generic (source: generic)
 SELECT
-  base.d0 AS "item.i_category",
+  base.d0 AS "i_category",
   base.t0 AS "total_sales",
   base.t1 AS "total_profit"
 FROM (

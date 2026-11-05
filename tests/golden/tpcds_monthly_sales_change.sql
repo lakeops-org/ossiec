@@ -1,8 +1,8 @@
--- request: {"metrics": ["monthly_sales_change"], "dimensions": ["date_dim.d_year", "date_dim.d_moy"]}
+-- request: {"metrics": ["monthly_sales_change"], "dimensions": ["date_dim.d_year", "date_dim.d_moy"], "deferredMetrics": true}
 -- dialect: generic (source: generic)
 SELECT
-  base.d0 AS "date_dim.d_year",
-  base.d1 AS "date_dim.d_moy",
+  base.d0 AS "d_year",
+  base.d1 AS "d_moy",
   base.t0 - LAG(base.t0, 1) OVER (ORDER BY base.d0, base.d1) AS "monthly_sales_change"
 FROM (
   SELECT

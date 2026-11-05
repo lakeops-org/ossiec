@@ -168,7 +168,8 @@ fn a1_status_order_count_matches_layer3() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":["orders.order_count"],"dimensions":["orders.status"]}"#,
+            r#"{"metrics":[{"metric":"orders.order_count","alias":"orders.order_count"}],
+                "dimensions":[{"field":"orders.status","alias":"orders.status"}]}"#,
         )
         .unwrap(),
         &Options {
@@ -245,7 +246,8 @@ fn inner_join_customers_emits_inner_join() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":["orders.order_count"],"dimensions":["customers.region"]}"#,
+            r#"{"metrics":[{"metric":"orders.order_count","alias":"orders.order_count"}],
+                "dimensions":[{"field":"customers.region","alias":"customers.region"}]}"#,
         )
         .unwrap(),
         &opts,
@@ -268,7 +270,8 @@ fn left_join_customers_matches_layer3_agg_shape() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":["orders.order_count"],"dimensions":["customers.region"]}"#,
+            r#"{"metrics":[{"metric":"orders.order_count","alias":"orders.order_count"}],
+                "dimensions":[{"field":"customers.region","alias":"customers.region"}]}"#,
         )
         .unwrap(),
         &opts,
@@ -444,7 +447,9 @@ fn a4_independent_measures_via_joins_match_layer3() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":["orders.order_amt","tickets.ticket_count"],"dimensions":["customers.region"]}"#,
+            r#"{"metrics":[{"metric":"orders.order_amt","alias":"orders.order_amt"},
+                            {"metric":"tickets.ticket_count","alias":"tickets.ticket_count"}],
+                "dimensions":[{"field":"customers.region","alias":"customers.region"}]}"#,
         )
         .unwrap(),
         &opts,
@@ -467,8 +472,14 @@ fn a4_comma_from_lists_independent_facts() {
     );
     assert_eq!(req.dimensions, vec!["customers.region"]);
     let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
+    // Layer 3 names its columns by final part; the plan is the same.
     let l3 = ossiec::compile(&g, &req, &opts).unwrap();
-    assert_eq!(l2.sql, l3.sql);
+    let short = l2
+        .sql
+        .replace("orders.order_amt", "order_amt")
+        .replace("tickets.ticket_count", "ticket_count")
+        .replace("customers.region", "region");
+    assert_eq!(short, l3.sql);
 }
 
 #[test]
@@ -2056,7 +2067,8 @@ fn role_playing_dimension_matches_layer3_and_duckdb() {
     let bare = ossiec::compile_layer2(&g, implicit, &duck()).unwrap();
     let layer3 = l3(
         &g,
-        r#"{"metrics":["flights.total_delay"],"dimensions":["departs_from.city"]}"#,
+        r#"{"metrics":[{"metric":"flights.total_delay","alias":"flights.total_delay"}],
+            "dimensions":[{"field":"departs_from.city","alias":"departs_from.city"}]}"#,
     );
     assert_eq!(joined.sql, layer3.sql);
     assert_eq!(bare.sql, layer3.sql);
@@ -2186,24 +2198,25 @@ fn unmatched_opts() -> Options {
 }
 
 #[test]
-fn include_unmatched_matches_layer3_and_duckdb() {
+fn include_unmatched_is_layer2_only_and_matches_duckdb() {
     let g = stock_graph();
     let l2 = ossiec::compile_layer2(&g, stock_sql(), &unmatched_opts()).unwrap();
-    let layer3 = ossiec::compile(
+    // Layer 3 metrics read their home dataset's rows, so there are none to add.
+    let e = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":["products.stock_units"],"dimensions":["orders.region"],"includeUnmatched":true}"#,
+            r#"{"metrics":["products.stock_units"],"dimensions":["products.category"],"includeUnmatched":true}"#,
         )
         .unwrap(),
         &duck(),
     )
-    .unwrap();
-    assert_eq!(l2.sql, layer3.sql);
+    .expect_err("includeUnmatched is Layer 2's");
+    assert_eq!(e.code(), Some(ossiec::ErrorCode::InvalidQuery), "{e}");
     let req =
         ossiec::layer2_to_request(&g, &format!("-- ossiec: includeUnmatched\n{}", stock_sql()))
             .unwrap();
     assert!(req.include_unmatched);
-    assert_eq!(req.dimensions, vec!["orders.region".to_string()]);
+    assert_eq!(req.dimensions, vec!["orders.region"]);
     let via_pragma = ossiec::compile_layer2(
         &g,
         &format!("-- ossiec: includeUnmatched\n{}", stock_sql()),
@@ -3124,4 +3137,68 @@ fn persist_view_refusals() {
         matches!(e, Error::Request(ref m) if m.contains("no TO MEASURE")),
         "{e}"
     );
+}
+
+/// §7.3: `WHERE` is an ordinary row predicate, on any column the query can read.
+#[test]
+fn where_accepts_any_row_predicate() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let by = |predicate: &str, reference: &str| {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let compiled =
+            ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{predicate}: {e}"));
+        let mut got = duckdb_rows(&db, &compiled.sql);
+        got.sort();
+        let mut want = duckdb_rows(
+            &db,
+            &format!("SELECT status, COUNT(*) FROM orders WHERE {reference} GROUP BY status"),
+        );
+        want.sort();
+        assert_eq!(got, want, "{predicate}\n{}", compiled.sql);
+        assert!(!want.is_empty(), "{predicate}: proves nothing");
+    };
+    for (predicate, reference) in [
+        (
+            "status IN ('completed', 'x')",
+            "status IN ('completed', 'x')",
+        ),
+        ("status NOT IN ('completed')", "status NOT IN ('completed')"),
+        ("status LIKE 'comp%'", "status LIKE 'comp%'"),
+        ("id BETWEEN 100 AND 103", "order_id BETWEEN 100 AND 103"),
+        (
+            "status = 'returned' OR id = 100",
+            "status = 'returned' OR order_id = 100",
+        ),
+        ("NOT status = 'returned'", "NOT status = 'returned'"),
+        ("id + 1 = 101", "order_id + 1 = 101"),
+        (
+            "customer_id = product_id - 9",
+            "customer_id = product_id - 9",
+        ),
+        (
+            "status = 'completed' AND id IN (100, 101)",
+            "status = 'completed' AND order_id IN (100, 101)",
+        ),
+    ] {
+        by(predicate, reference);
+    }
+    // §7.3 rejects these, or they aren't done yet: none is answered wrongly.
+    for (predicate, want) in [
+        ("AGG(order_count) > 1", "aggregate"),
+        ("SUM(id) > 1", "aggregate"),
+        ("id IN (SELECT 1)", "subqueries"),
+        ("nope = 1 OR id = 1", "nope"),
+        ("order_count = 1 OR id = 1", "order_count"),
+    ] {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(predicate)
+            .to_string();
+        assert!(e.contains(want), "{predicate}: {e}");
+    }
 }
