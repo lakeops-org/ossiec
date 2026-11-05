@@ -181,6 +181,10 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **Roles.** Qualify a column with the relationship name, the same form as a Layer 3 dimension: `departs_from.city`. That name may also be the JOIN alias (`JOIN airports AS departs_from`). In Layer 2 a plain `airports.city` takes the unique shortest path and is refused when departure and arrival both tie.
 
+**`HAVING`** (§7.5) takes `AGG()`, expressions over it and selected columns, and the measure needn't be selected. It's computed in its own part like any measure, so a one-side measure is de-duplicated before it's compared. A plain aggregate or a window beside `AGG` is refused.
+
+**`WITH`** (§7.7) is a named derived table, so a measure passes through a CTE as it does through a subquery. `WITH RECURSIVE`, a column list and a set operator in a CTE are refused.
+
 **`WHERE`** is any row predicate over the query's columns (§7.3): comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT` and expressions, across datasets. Aggregates and windows are refused, and subqueries aren't supported yet.
 
 **`includeUnmatched`.** One-side rows no fact reaches are off unless `Options { include_unmatched: true, .. }` or a comment `-- ossiec: includeUnmatched` (or `compile-l2 --include-unmatched`). It applies to the outermost `AGG` stage, including one that joins a derived table onto the unmatched grain. Layer 3 has no such rows to add, since each metric reads all of its home dataset, so it raises `E_INVALID_QUERY` for the request field and ignores the option.
@@ -446,6 +450,9 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 3 rejections with the spec's error codes (`wide_table_semantics.md` §8), and the `filter` expression
 - [x] Layer 3 aliases and short output names
 - [x] Layer 2 `WHERE` as any row predicate (`IN`, `OR`, `LIKE`, `BETWEEN`, `NOT`, expressions)
+- [x] Layer 2 `HAVING` and `WITH`
+- [ ] Layer 2 `ORDER BY` on an unselected `AGG()` or an expression over it (§7.5)
+- [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, `DISTINCT` and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
 - [ ] Publish to crates.io

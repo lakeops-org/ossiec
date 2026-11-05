@@ -188,7 +188,7 @@ Rules apply only when a target is given. Callers that translate downstream set n
 
 | Feature | Shape it will take |
 |---|---|
-| Layer 2 operators (§7) | Refused today: `HAVING`, CTEs, `DISTINCT` and set operators over fields, `ROLLUP`, `GROUP BY ALL`, plain aggregates beside `AGG`, and subqueries in `WHERE`. Other `WHERE` predicates go through `Request.filter`, with each column as its `dataset.field`. |
+| Layer 2 operators (§7) | Refused today: `DISTINCT` and set operators over fields, `ROLLUP`, `GROUP BY ALL`, plain aggregates beside `AGG`, subqueries in `WHERE` and `HAVING`, and `ORDER BY` on an unselected `AGG()` or an expression over it (§7.5). A measure passed through two levels of derived table isn't folded yet, with or without `WITH`. Other `WHERE` predicates go through `Request.filter`, with each column as its `dataset.field`. `HAVING` conjuncts that read only grouping columns go to `WHERE`; the rest become metric filters over placeholders, with the measures they read planned as hidden terms. `WITH` expands to derived tables before anything else reads the query (`front/cte.rs`). |
 | Writing A.7 views into the model | Done: `persist_layer2_view` / `persist-view` / `to_yaml`. |
 | `ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, and the other non-equijoin kinds | Refused. §7.6 covers `INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS` (`CROSS` with `ON` is refused). |
 | Model-side nested aggregates (`AVG(SUM(x))`) | Not Layer 2; see "Why not `ChildAggregate`" under Layer 2 nested queries. |

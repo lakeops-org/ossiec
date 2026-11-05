@@ -262,14 +262,9 @@ impl Compiler<'_> {
         derived_mode: bool,
         outer: &[String],
     ) -> Result<Node> {
-        if sel.with.is_some()
-            || sel.distinct
-            || sel.having.is_some()
-            || sel.qualify.is_some()
-            || sel.offset.is_some()
-        {
+        if sel.distinct || sel.qualify.is_some() || sel.offset.is_some() {
             return Err(unsupported(
-                "Layer 2 WITH / DISTINCT / HAVING / QUALIFY / OFFSET are not implemented yet",
+                "Layer 2 DISTINCT / QUALIFY / OFFSET are not implemented yet",
             ));
         }
         let from = sel.from.as_ref().expect("classified as a fold");
@@ -280,12 +275,8 @@ impl Compiler<'_> {
                 "Layer 2 AGG() over derived table `{alias}` (relational_semantics §7.7) folds a plain filter + projection of model datasets; the derived table has {what}. Join the derived table to a dataset (FROM <dataset> JOIN (...) {alias} ON ...) instead"
             ))
         };
-        if inner.with.is_some()
-            || inner.distinct
-            || inner.having.is_some()
-            || inner.qualify.is_some()
-        {
-            return Err(why("WITH / DISTINCT / HAVING / QUALIFY"));
+        if inner.distinct || inner.having.is_some() || inner.qualify.is_some() {
+            return Err(why("DISTINCT / HAVING / QUALIFY"));
         }
         if inner.order_by.is_some() || inner.limit.is_some() || inner.offset.is_some() {
             return Err(why("ORDER BY / LIMIT / OFFSET"));
@@ -424,6 +415,14 @@ impl Compiler<'_> {
                     .collect::<Result<_>>()?,
                 ..o.clone()
             }),
+        };
+        folded.having = match &sel.having {
+            None => None,
+            Some(h) => {
+                let mut having = h.clone();
+                having.this = map.expr(&h.this, &[])?;
+                Some(having)
+            }
         };
         folded.limit = sel.limit.clone();
         folded.offset = None;

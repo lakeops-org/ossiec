@@ -796,6 +796,65 @@ macro_rules! shop_joins {
 
 pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
     Layer2NestedCase {
+        // §7.5: over the finished groups, on a selected measure.
+        name: "having_on_a_selected_measure",
+        sql: "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status HAVING AGG(order_count) > 1",
+        reference: "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 1",
+        script: false,
+    },
+    Layer2NestedCase {
+        // A measure only HAVING reads, de-duplicated in its own stacked part, and a
+        // ratio and an OR across the group: no fan-out in what it compares.
+        name: "having_on_an_unselected_one_side_measure",
+        sql: shop_joins!(
+            "SELECT c.region, AGG(o.gross_revenue) ",
+            " GROUP BY c.region HAVING AGG(p.stock_units) >= 100 OR AGG(o.gross_revenue) / AGG(o.order_count) > 30"
+        ),
+        reference: "WITH r AS (
+              SELECT c.region, SUM(o.amount_cents / 100.0) AS v, COUNT(*) AS n
+              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region
+            ), st AS (
+              SELECT region, SUM(stock) AS v FROM (
+                SELECT DISTINCT c.region, p.product_id, p.stock
+                FROM orders o
+                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+                LEFT JOIN products p ON o.product_id = p.product_id
+                WHERE p.product_id IS NOT NULL
+              ) GROUP BY region
+            )
+            SELECT r.region, r.v FROM r LEFT JOIN st ON r.region IS NOT DISTINCT FROM st.region
+            WHERE st.v >= 100 OR r.v / r.n > 30",
+        script: false,
+    },
+    Layer2NestedCase {
+        // A grouping column in HAVING compares as WHERE does: bytes, on every engine.
+        name: "having_on_a_grouping_column",
+        sql: "SELECT c.name, AGG(c.known_customers) AS n FROM customers c GROUP BY c.name HAVING c.name = 'ada'",
+        reference: "SELECT name, COUNT(*) FROM {customers} WHERE name = 'ada' GROUP BY name",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.7: a CTE is a derived table, so a measure passes through it unevaluated.
+        name: "cte_passes_a_measure_through",
+        sql: "WITH known AS (SELECT status, order_count FROM orders WHERE customer_id IS NOT NULL) \
+            SELECT status, AGG(order_count) AS n FROM known GROUP BY status",
+        reference: "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status",
+        script: false,
+    },
+    Layer2NestedCase {
+        // One CTE reading another, joined, with HAVING inside it.
+        name: "cte_chain_joined_with_having",
+        sql: "WITH counts AS (SELECT customer_id, AGG(order_count) AS n FROM orders GROUP BY customer_id HAVING AGG(order_count) > 1), \
+                  regulars AS (SELECT customer_id FROM counts GROUP BY customer_id) \
+            SELECT o.status, AGG(o.order_count) AS n FROM orders o \
+            JOIN regulars r ON o.customer_id = r.customer_id GROUP BY o.status",
+        reference: "SELECT o.status, COUNT(*) FROM orders o
+            JOIN (SELECT customer_id FROM orders GROUP BY customer_id HAVING COUNT(*) > 1) r
+              ON o.customer_id = r.customer_id
+            GROUP BY o.status",
+        script: false,
+    },
+    Layer2NestedCase {
         // Groups come from every joined row (a group with no input rows is kept),
         // so APAC, whose only order has no product, appears with NULL stock.
         name: "one_side_measure_dedup",

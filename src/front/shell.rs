@@ -88,9 +88,9 @@ struct Selected {
 impl Compiler<'_> {
     /// An outer query over derived tables only (Appendix A.3).
     pub(super) fn shell(&mut self, sel: &Select, depth: usize, outer: &[String]) -> Result<Node> {
-        if sel.with.is_some() || sel.distinct || sel.qualify.is_some() {
+        if sel.distinct || sel.qualify.is_some() {
             return Err(unsupported(
-                "Layer 2 WITH / DISTINCT / QUALIFY are not implemented yet",
+                "Layer 2 DISTINCT / QUALIFY are not implemented yet",
             ));
         }
         let from = sel.from.as_ref().expect("classified as a shell");

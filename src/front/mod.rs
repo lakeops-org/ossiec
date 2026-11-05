@@ -67,6 +67,7 @@ use crate::sql;
 use crate::{Compiled, Error, Options, Result};
 
 mod catalog;
+mod cte;
 mod fold;
 mod nested;
 mod persist;
@@ -145,7 +146,13 @@ fn rename_consumer_outputs(
 /// Translate Layer 2 SQL into a Layer 3 [`Request`] (join kinds are not
 /// represented). Flat queries only: derived tables (A.2–A.3) are not one request.
 pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
-    Ok(parse_layer2(graph, sql)?.request)
+    let parsed = parse_layer2(graph, sql)?;
+    if parsed.having.is_some() {
+        return Err(unsupported(
+            "a request can't carry this HAVING; compile the SQL with compile_sql",
+        ));
+    }
+    Ok(parsed.request)
 }
 
 pub(super) struct Layer2Parsed {
@@ -156,6 +163,8 @@ pub(super) struct Layer2Parsed {
     pub measure_outputs: Vec<(String, L2Formula)>,
     /// Selected dimension (`dataset.field`) and the label the consumer sees it under.
     pub dim_labels: Vec<(String, String)>,
+    /// `HAVING`, once its `AGG()` leaves and columns are placeholders.
+    pub having: Option<ParsedHaving>,
     /// Derived tables joined to the stage (Appendix A.2).
     pub derived: Vec<DerivedSpec>,
     /// Columns of this stage that are measures awaiting a later `AGG()` (§7.7):
@@ -226,6 +235,15 @@ pub(super) struct ConsumerJoin {
     attach_role: Option<usize>,
 }
 
+/// A `HAVING` predicate over placeholders: `__ossiec_h{i}` for `measures[i]`, and
+/// [`plan::OUT_DIM`]`{i}` for selected dimension `i`.
+pub(super) struct ParsedHaving {
+    pub predicate: Expression,
+    pub measures: Vec<L2Formula>,
+}
+
+const HAVING_MEASURE: &str = "__ossiec_h";
+
 /// Select-list expression whose leaves are bare `AGG(measure)` references.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum L2Formula {
@@ -268,7 +286,10 @@ pub(super) fn parse_top_select(
         .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
     let (ast, to_measures) = strip_model_from_columns(graph, ast, to_measures)?;
     match ast {
-        Expression::Select(sel) => Ok((*sel, to_measures)),
+        Expression::Select(mut sel) => {
+            cte::expand(&mut sel)?;
+            Ok((*sel, to_measures))
+        }
         Expression::CreateView(_) => Err(unsupported(
             "Layer 2 CREATE VIEW is not a query; register it with define_layer2_view (or pass CREATE VIEW statements and a final SELECT to compile_script / compile-l2)",
         )),
@@ -362,9 +383,9 @@ pub(super) fn parse_stage_prep(
     sel: &Select,
     cfg: &StageCfg<'_>,
 ) -> Result<ParsedFrom> {
-    if sel.with.is_some() || sel.distinct || sel.having.is_some() || sel.qualify.is_some() {
+    if sel.distinct || sel.qualify.is_some() {
         return Err(unsupported(
-            "Layer 2 WITH / DISTINCT / HAVING / QUALIFY are not implemented yet",
+            "Layer 2 DISTINCT / QUALIFY are not implemented yet",
         ));
     }
     parse_from_clause(graph, sel.from.as_ref(), &sel.joins, cfg.outer)
@@ -597,6 +618,31 @@ pub(super) fn parse_stage_from(
             }
         }
     }
+    let having = match &sel.having {
+        None => None,
+        Some(h) => {
+            if sel.group_by.is_none() && !dimensions.is_empty() {
+                return Err(Error::Request(
+                    "Layer 2 HAVING makes a query aggregated, so its selected columns need GROUP BY".into(),
+                ));
+            }
+            let (pushed, parsed) = parse_having(graph, scope, &h.this, &dimensions)?;
+            for conjunct in pushed {
+                match conjunct {
+                    Conjunct::Filter(f) => filters.push(f),
+                    Conjunct::Predicate(p) => predicates.push(format!("({p})")),
+                }
+            }
+            if let Some(p) = &parsed {
+                for leaf in p.measures.iter().flat_map(formula_leaves) {
+                    if !metrics.contains(&leaf) {
+                        metrics.push(leaf);
+                    }
+                }
+            }
+            parsed
+        }
+    };
     let filter = (!predicates.is_empty()).then(|| predicates.join(" AND "));
 
     let order_ctx = OrderCtx {
@@ -652,6 +698,7 @@ pub(super) fn parse_stage_from(
         consumer_joins: parsed_from.consumer_joins,
         measure_outputs,
         dim_labels,
+        having,
         derived: parsed_from.derived,
         unevaluated,
         ephemeral,
@@ -1147,8 +1194,13 @@ fn apply_select_formulas(
     _graph: &SemanticGraph,
     logical: &mut LogicalPlan,
     measure_outputs: &[(String, L2Formula)],
+    has_having: bool,
 ) -> Result<()> {
     if measure_outputs.is_empty() {
+        // Measures only `HAVING` reads aren't columns of the result.
+        if has_having {
+            logical.outputs.clear();
+        }
         return Ok(());
     }
     let metric_outers: HashMap<String, Expression> = logical.outputs.iter().cloned().collect();
@@ -2172,6 +2224,167 @@ fn where_to_filters(
         Some(f) => Conjunct::Filter(f),
         None => Conjunct::Predicate(where_predicate(graph, scope, e)?),
     }])
+}
+
+/// §7.5: `HAVING` keeps or drops whole groups. A conjunct that reads only grouping
+/// columns says the same as a `WHERE` on them, so it goes there, where strings
+/// compare by each engine's collation rule and fewer rows are read. The rest runs
+/// over the finished groups.
+fn parse_having(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+    dimensions: &[String],
+) -> Result<(Vec<Conjunct>, Option<ParsedHaving>)> {
+    fn split<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
+        match e {
+            Expression::And(a) => {
+                split(&a.left, out);
+                split(&a.right, out);
+            }
+            Expression::Paren(p) => split(&p.this, out),
+            other => out.push(other),
+        }
+    }
+    let mut conjuncts = vec![];
+    split(e, &mut conjuncts);
+    let mut pushed = vec![];
+    let mut kept: Vec<Expression> = vec![];
+    for c in conjuncts {
+        if contains_aggregate(c) || contains_window_function(c) {
+            return Err(unsupported(
+                "Layer 2 HAVING takes AGG(measure) and selected columns; a plain aggregate or a window beside AGG is not supported",
+            ));
+        }
+        let has_agg = c.contains(is_measure_agg_expr);
+        for column in get_columns(c) {
+            // With an AGG(), its argument is a column too: the second pass below
+            // checks those that aren't one.
+            if !has_agg {
+                if let Expression::Column(col) = column {
+                    selected_dimension(graph, scope, col, dimensions)?;
+                }
+            }
+        }
+        if !has_agg && !get_columns(c).is_empty() {
+            pushed.extend(where_to_filters(graph, scope, c)?);
+        } else {
+            kept.push(c.clone());
+        }
+    }
+    let Some(first) = kept.pop() else {
+        return Ok((pushed, None));
+    };
+    let joined = kept.into_iter().rev().fold(first, |acc, c| {
+        Expression::And(Box::new(BinaryOp::new(c, acc)))
+    });
+    if joined.contains(|x| is_query(x) || is_subquery(x)) {
+        return Err(unsupported(
+            "Layer 2 HAVING does not support subqueries yet",
+        ));
+    }
+    let failure = RefCell::new(None);
+    let measures = RefCell::new(Vec::<L2Formula>::new());
+    // Two passes: an AGG()'s argument is not a column of the group, whichever
+    // order the walk visits a node and its children in.
+    let without_aggs = transform(joined, &|x| {
+        let found = match take_agg(&x) {
+            Ok(Some(arg)) => resolve_agg(graph, scope, arg).map(Some),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
+        };
+        Ok(Some(match found {
+            Ok(Some(formula)) => {
+                let mut m = measures.borrow_mut();
+                m.push(formula);
+                sql::col(&format!("{HAVING_MEASURE}{}", m.len() - 1))
+            }
+            Ok(None) => x,
+            Err(err) => {
+                failure.borrow_mut().get_or_insert(err);
+                x
+            }
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))?;
+    let predicate = transform(without_aggs, &|x| {
+        Ok(Some(match x {
+            Expression::Column(c) if !c.name.name.starts_with(HAVING_MEASURE) => {
+                match selected_dimension(graph, scope, &c, dimensions) {
+                    Ok(i) => sql::col(&format!("{}{i}", plan::OUT_DIM)),
+                    Err(err) => {
+                        failure.borrow_mut().get_or_insert(err);
+                        Expression::Column(c)
+                    }
+                }
+            }
+            other => other,
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))?;
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    Ok((
+        pushed,
+        Some(ParsedHaving {
+            predicate: graph::true_division(predicate),
+            measures: measures.into_inner(),
+        }),
+    ))
+}
+
+/// A `HAVING` column: which selected dimension it is.
+fn selected_dimension(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    col: &Column,
+    dimensions: &[String],
+) -> Result<usize> {
+    let dim = resolve_dim(graph, scope, col)?;
+    dimensions.iter().position(|d| *d == dim).ok_or_else(|| {
+        Error::Request(format!(
+            "Layer 2 HAVING reads `{dim}`, which is not in GROUP BY; put it in WHERE, or group by it"
+        ))
+    })
+}
+
+/// Add a parsed `HAVING` to the plan. Runs before the select list replaces the plan's
+/// outputs, while each measure's expression can still be read from them.
+fn apply_having(logical: &mut LogicalPlan, having: Option<&ParsedHaving>) -> Result<()> {
+    let Some(having) = having else {
+        return Ok(());
+    };
+    if logical.windowed {
+        return Err(unsupported(
+            "Layer 2 HAVING over a window metric is not supported",
+        ));
+    }
+    let metrics: HashMap<String, Expression> = logical.outputs.iter().cloned().collect();
+    let failure = RefCell::new(None);
+    let predicate = transform(having.predicate.clone(), &|x| {
+        Ok(Some(match x {
+            Expression::Column(c) if c.name.name.starts_with(HAVING_MEASURE) => {
+                let i: usize = c.name.name[HAVING_MEASURE.len()..]
+                    .parse()
+                    .expect("HAVING placeholder");
+                match formula_to_expr(&having.measures[i], &metrics) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        failure.borrow_mut().get_or_insert(err);
+                        Expression::Column(c)
+                    }
+                }
+            }
+            other => other,
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))?;
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    logical.metric_filters.push((predicate.clone(), predicate));
+    Ok(())
 }
 
 /// A predicate as `filter` text, each column as its `dataset.field`.

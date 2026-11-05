@@ -3227,3 +3227,253 @@ fn columns_are_named_as_in_standard_sql() {
         ["id", "customer"]
     );
 }
+
+fn answers(sql: &str, reference: &str) {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let c = ossiec::compile_sql(&g, sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let want = sorted(duckdb_rows(&db, reference));
+    assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{sql}\n{}", c.sql);
+    assert!(!want.is_empty(), "{sql}: proves nothing");
+}
+
+fn refuses(sql: &str, want: &str) {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let e = ossiec::compile_sql(&g, sql, &duck())
+        .expect_err(sql)
+        .to_string();
+    assert!(e.contains(want), "want `{want}` for {sql}: {e}");
+}
+
+/// §7.5: `HAVING` may contain `AGG()` and scalar expressions over it.
+#[test]
+fn having_keeps_or_drops_finished_groups() {
+    answers(
+        "SELECT status FROM orders GROUP BY status HAVING AGG(order_count) > 1",
+        "SELECT status FROM orders GROUP BY status HAVING COUNT(*) > 1",
+    );
+    answers(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING COALESCE(AGG(order_count), 0) * 2 >= 4 AND NOT AGG(order_count) = 100",
+        "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) * 2 >= 4",
+    );
+    // A grouping column and a measure in one condition stay over the groups.
+    answers(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING status = 'returned' OR AGG(order_count) > 5",
+        "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING status = 'returned' OR COUNT(*) > 5",
+    );
+    // With no GROUP BY there's one group, kept or dropped.
+    answers(
+        "SELECT AGG(order_count) FROM orders HAVING AGG(order_count) > 1",
+        "SELECT COUNT(*) FROM orders",
+    );
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT AGG(order_count) FROM orders HAVING AGG(order_count) > 1000",
+        &duck(),
+    )
+    .unwrap();
+    assert!(duckdb_rows(&duck_db(), &c.sql).is_empty(), "{}", c.sql);
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT AGG(order_count) FROM orders HAVING 1 = 0",
+        &duck(),
+    )
+    .unwrap();
+    assert!(duckdb_rows(&duck_db(), &c.sql).is_empty(), "{}", c.sql);
+    // Through a sole derived table, and only as a filter on the result's rows.
+    answers(
+        "SELECT status, AGG(n) FROM (SELECT status, order_count AS n FROM orders WHERE customer_id IS NOT NULL) t GROUP BY status HAVING AGG(n) > 1",
+        "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status HAVING COUNT(*) > 1",
+    );
+    refuses(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING customer_id > 1",
+        "not in GROUP BY",
+    );
+    refuses(
+        "SELECT status FROM orders HAVING AGG(order_count) > 1",
+        "need GROUP BY",
+    );
+    refuses(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING order_count > 1",
+        "order_count",
+    );
+    refuses(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING SUM(id) > 1",
+        "plain aggregate",
+    );
+    refuses(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING AGG(order_count) > (SELECT 1)",
+        "subqueries",
+    );
+    refuses(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING AGG(nope) > 1",
+        "nope",
+    );
+    // A request has nowhere to put it.
+    let e = ossiec::sql_to_request(
+        &g,
+        "SELECT status FROM orders GROUP BY status HAVING AGG(order_count) > 1",
+    )
+    .expect_err("no HAVING in a request")
+    .to_string();
+    assert!(e.contains("HAVING"), "{e}");
+    // Two HAVINGs, one hash each.
+    let hash = |h: &str| {
+        let sql = format!("SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING {h}");
+        ossiec::compile_sql(&g, &sql, &duck()).unwrap().request_hash
+    };
+    assert_ne!(hash("AGG(order_count) > 1"), hash("AGG(order_count) > 2"));
+}
+
+fn duck_db() -> duckdb::Connection {
+    duckdb()
+}
+
+/// §7.7: a CTE is a derived table with a name.
+#[test]
+fn with_names_derived_tables() {
+    // The same query, written with and without it.
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let plain = "SELECT status, AGG(order_count) FROM orders GROUP BY status";
+    let with = "WITH o AS (SELECT status, order_count FROM orders) SELECT status, AGG(order_count) FROM o GROUP BY status";
+    assert_eq!(
+        ossiec::compile_sql(&g, plain, &duck()).unwrap().sql,
+        ossiec::compile_sql(&g, with, &duck()).unwrap().sql
+    );
+    // A CTE's body reads the dataset of its own name, and the query reads the CTE.
+    answers(
+        "WITH orders AS (SELECT status, order_count FROM orders WHERE status = 'returned') \
+         SELECT status, AGG(order_count) FROM orders GROUP BY status",
+        "SELECT status, COUNT(*) FROM orders WHERE status = 'returned' GROUP BY status",
+    );
+    // An alias on the reference.
+    answers(
+        "WITH b AS (SELECT status, order_count FROM orders WHERE customer_id IS NOT NULL) \
+         SELECT x.status, AGG(x.order_count) FROM b x GROUP BY x.status",
+        "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status",
+    );
+    // Two levels of pass-through aren't folded yet, with or without WITH.
+    refuses(
+        "WITH a AS (SELECT status, customer_id, order_count FROM orders), \
+              b AS (SELECT status, order_count FROM a WHERE customer_id IS NOT NULL) \
+         SELECT status, AGG(order_count) FROM b GROUP BY status",
+        "a derived table as its FROM",
+    );
+    // Over a plain aggregate outer query (A.3), inside a derived table, used twice.
+    answers(
+        "WITH per AS (SELECT status, AGG(order_count) AS n FROM orders GROUP BY status) \
+         SELECT AVG(n) FROM per",
+        "SELECT AVG(n) FROM (SELECT status, COUNT(*) AS n FROM orders GROUP BY status) t",
+    );
+    answers(
+        "SELECT AVG(n) FROM (WITH per AS (SELECT status, AGG(order_count) AS n FROM orders GROUP BY status) SELECT n FROM per) t",
+        "SELECT AVG(n) FROM (SELECT status, COUNT(*) AS n FROM orders GROUP BY status) t",
+    );
+    answers(
+        "WITH per AS (SELECT customer_id, AGG(order_count) AS n FROM orders GROUP BY customer_id) \
+         SELECT o.status, AGG(o.order_count) FROM orders o \
+         JOIN per a ON o.customer_id = a.customer_id \
+         JOIN per b ON o.customer_id = b.customer_id GROUP BY o.status",
+        "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status",
+    );
+    // A qualified name is the dataset, whatever the CTEs are called.
+    answers(
+        "WITH orders AS (SELECT status, order_count FROM orders WHERE status = 'returned') \
+         SELECT status, AGG(order_count) FROM shop.orders GROUP BY status",
+        "SELECT status, COUNT(*) FROM orders GROUP BY status",
+    );
+    // In a view's body too.
+    let script = "CREATE VIEW v AS WITH k AS (SELECT status, AGG(order_count) AS n FROM orders WHERE customer_id IS NOT NULL GROUP BY status) SELECT status, n FROM k; \
+        SELECT status, n FROM v";
+    let c = ossiec::compile_sql_script(&g, script, &duck()).unwrap();
+    assert_eq!(
+        sorted(duckdb_rows(&duck_db(), &c.sql)),
+        sorted(duckdb_rows(
+            &duck_db(),
+            "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status"
+        ))
+    );
+    refuses(
+        "WITH RECURSIVE r AS (SELECT status FROM orders) SELECT status FROM r",
+        "RECURSIVE",
+    );
+    refuses(
+        "WITH r(s) AS (SELECT status FROM orders) SELECT s FROM r",
+        "column list",
+    );
+    refuses(
+        "WITH r AS (SELECT status FROM orders), R AS (SELECT status FROM orders) SELECT status FROM r",
+        "twice",
+    );
+    refuses(
+        "WITH r AS (SELECT status FROM orders UNION ALL SELECT status FROM orders) SELECT status FROM r",
+        "single SELECT",
+    );
+    // A later CTE isn't in scope for an earlier one.
+    refuses(
+        "WITH a AS (SELECT status FROM b), b AS (SELECT status FROM orders) SELECT status FROM a",
+        "b",
+    );
+}
+
+/// A persisted measure can't keep a view's filter, so HAVING is refused like WHERE.
+#[test]
+fn persisting_a_view_refuses_having() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let mut catalog = Layer2Catalog::new();
+    let view = "CREATE VIEW v AS SELECT status, COUNT(*) TO MEASURE AS n FROM orders \
+        GROUP BY status HAVING AGG(order_count) > 1";
+    let name = ossiec::define_layer2_view(&g, &mut catalog, view, &duck()).unwrap();
+    let e = ossiec::persist_layer2_view(&g, &catalog, &name, &duck())
+        .err()
+        .expect("a view that narrows its rows")
+        .to_string();
+    assert!(e.contains("HAVING"), "{e}");
+}
+
+/// What a target's SQL has to carry, which DuckDB's answers can't show.
+#[test]
+fn having_keeps_each_engines_rules() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let compile = |sql: &str, target: DialectType| {
+        let opts = Options {
+            target: Some(target),
+            ..Default::default()
+        };
+        ossiec::compile_sql(&g, sql, &opts).unwrap().sql
+    };
+    // A grouping column compares as in WHERE: by byte on MySQL.
+    let sql = compile(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING status = 'ada'",
+        DialectType::MySQL,
+    );
+    let where_at = sql.find("WHERE").expect("the condition moved to WHERE");
+    assert!(where_at < sql.find("GROUP BY").unwrap(), "{sql}");
+    assert!(sql[where_at..].contains("utf8mb4_bin"), "{sql}");
+    // `/` is true division, as in every other portable expression.
+    let sql = compile(
+        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING AGG(order_count) / AGG(order_count) > 0.5",
+        DialectType::Trino,
+    );
+    assert!(sql.contains("NULLIF") && sql.contains("DOUBLE"), "{sql}");
+}
+
+/// A window runs after HAVING, so one in a measure can't be compared there.
+#[test]
+fn having_refuses_a_window_metric() {
+    let model = common::MODEL.replace(
+        "      - { name: gross_revenue, expression: { sql: SUM(revenue) } }\n",
+        "      - { name: gross_revenue, expression: { sql: SUM(revenue) } }\n      - { name: running, expression: { sql: \"SUM(SUM(revenue)) OVER (ORDER BY status)\" } }\n",
+    );
+    assert_ne!(model, common::MODEL);
+    let g = ossiec::from_yaml(&model).unwrap();
+    let e = ossiec::compile_sql(
+        &g,
+        "SELECT status FROM orders GROUP BY status HAVING AGG(running) > 1",
+        &duck(),
+    )
+    .expect_err("a window in HAVING")
+    .to_string();
+    assert!(e.contains("window metric"), "{e}");
+}
