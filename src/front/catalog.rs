@@ -97,6 +97,7 @@ pub fn define_layer2_view(
     let (text, to_measures) = to_measure::extract(&stmt)?;
     let ast = parse_one(&text, DialectType::Generic)
         .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
+    let (ast, to_measures) = super::strip_model_from_columns(graph, ast, to_measures)?;
     let cv = match ast {
         Expression::CreateView(cv) => cv,
         Expression::DropView(_) => {
