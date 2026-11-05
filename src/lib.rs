@@ -178,7 +178,7 @@ pub fn compile(graph: &SemanticGraph, request: &Request, opts: &Options) -> Resu
         prefer: opts.prefer_dialect.clone(),
         ..Default::default()
     };
-    let plan = plan::plan(graph, request, &mut ctx)?;
+    let plan = plan::plan(graph, request, plan::Interface::WideTable, &mut ctx)?;
     finish_compile(graph, request, plan, ctx, opts)
 }
 

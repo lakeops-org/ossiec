@@ -298,7 +298,22 @@ fn req_err(m: impl Into<String>) -> Error {
     Error::Request(m.into())
 }
 
-pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<LogicalPlan> {
+/// Which query interface a plan answers. They differ in where measures come
+/// from: the two specs' results differ on purpose (wide table §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Interface {
+    /// Layer 3: the engine chooses the joins, one branch per home dataset.
+    WideTable,
+    /// Layer 2: the consumer's joins decide the rows every measure sees.
+    Relational,
+}
+
+pub(crate) fn plan(
+    g: &SemanticGraph,
+    req: &Request,
+    interface: Interface,
+    ctx: &mut Ctx,
+) -> Result<LogicalPlan> {
     // No metrics: the request lists dimension values (distinct combinations).
     if req.metrics.is_empty() && req.dimensions.is_empty() {
         return Err(req_err("ask for at least one metric or dimension"));
@@ -494,7 +509,8 @@ pub(crate) fn plan(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<Lo
     }
 
     // Join trees (one per fact) and term strategies.
-    let (legs, term_legs) = plan_legs(g, &required, &terms)?;
+    let by_home = interface == Interface::WideTable;
+    let (legs, term_legs) = plan_legs(g, &required, &terms, by_home)?;
     let mut planned = vec![];
     for (term, leg) in terms.into_iter().zip(term_legs) {
         let root = legs[leg].root;
@@ -665,14 +681,34 @@ fn predicate(
     t.build()
 }
 
-/// One join tree for everything, or, when no dataset reaches all of `required`
-/// (independent facts sharing dimensions), one per fact: each term gets the
-/// tree for its own datasets plus every dimension and filter. Returns the legs
-/// and each term's leg.
+/// Wide table §5.2 and §5.4: every term has one home dataset that reaches every
+/// dimension and filter, so each can be evaluated over its own home rows.
+///
+/// A request where this fails is one §5.3 rejects. Until those rejections land,
+/// it keeps the single join tree.
+fn every_term_has_a_branch(g: &SemanticGraph, required: &BTreeSet<Node>, terms: &[Term]) -> bool {
+    terms.iter().all(|t| {
+        let [home] = t.datasets.iter().copied().collect::<Vec<_>>()[..] else {
+            return false;
+        };
+        let paths = g.paths_from(home);
+        required.iter().all(|&(ds, role)| {
+            let target = role.map_or(ds, |r| g.rels[r].from);
+            target == home || paths.contains_key(&target)
+        })
+    })
+}
+
+/// One join tree for everything, or one per root: each term gets the tree for
+/// its own datasets plus every dimension and filter. There are several when no
+/// dataset reaches all of `required` (independent facts sharing dimensions), or
+/// when `by_home` asks for one branch per home dataset. Returns the legs and
+/// each term's leg.
 fn plan_legs(
     g: &SemanticGraph,
     required: &BTreeSet<Node>,
     terms: &[Term],
+    by_home: bool,
 ) -> Result<(Vec<Leg>, Vec<usize>)> {
     let mut all = required.clone();
     for t in terms {
@@ -681,7 +717,8 @@ fn plan_legs(
     let single = join_tree(g, &all);
     let independent =
         matches!(&single, Err(Error::Unsupported(m)) if m.contains("independent facts"));
-    if !independent || terms.is_empty() {
+    let branched = by_home && every_term_has_a_branch(g, required, terms);
+    if !(independent || branched) || terms.is_empty() {
         return Ok((vec![single?], vec![0; terms.len()]));
     }
     // One leg per root: terms whose own tree roots at the same fact share it.

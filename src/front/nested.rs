@@ -434,7 +434,12 @@ impl Compiler<'_> {
             pending.push((placeholder, node));
         }
 
-        let mut logical = plan::plan(graph, &parsed.request, &mut self.ctx)?;
+        let mut logical = plan::plan(
+            graph,
+            &parsed.request,
+            plan::Interface::Relational,
+            &mut self.ctx,
+        )?;
         apply_consumer_joins(graph, &mut logical, &parsed.consumer_joins, &mut self.ctx)?;
         if !parsed.derived.is_empty() {
             // Attach only to legs that host the dataset. A leg that does not

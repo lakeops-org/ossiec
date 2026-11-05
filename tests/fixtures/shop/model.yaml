@@ -92,10 +92,11 @@ metrics:
   # A ratio of two integer counts: true division on every engine (Postgres and Trino would truncate).
   - name: orders_per_customer
     expression: { sql: "COUNT(orders.id) / NULLIF(COUNT(DISTINCT customers.id), 0)" }
-  # One-side COUNT and AVG: computed over primary-key de-duplicated rows.
+  # One-side COUNT and AVG: over their home dataset's rows, or primary-key
+  # de-duplicated rows when requested with dimensions that dataset can't reach.
   - name: products_sold
     expression: { sql: COUNT(products.id) }
-    description: Distinct products sold in the group
+    description: Products in the group
   - name: customer_count
     expression: { sql: COUNT(customers.id) }
   - name: avg_stock

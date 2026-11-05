@@ -44,6 +44,8 @@ YAML ──load──► Model ──bind──► SemanticGraph ──plan(Requ
 
 Relationships go from the many side (`from`) to the one side (`to`). Following them in that direction never multiplies rows of the dataset you start from.
 
+A Layer 3 request with measures usually has several roots: one branch per home dataset (see "Legs"). The rules below pick the root of each tree. A Layer 2 query has one tree, from its own joins.
+
 Requests name **nodes**: a dataset, or a dataset playing a role (`customer_first_sales.d_year` is `date_dim` reached through the `customer_first_sales` relationship). Each node gets its own alias (`date_dim`, `date_dim__customer_first_sales`), so one request can use several roles at once.
 
 1. `R` = every node referenced by the requested dimensions, filters and metric terms. A role node needs its relationship's source.
@@ -52,9 +54,11 @@ Requests name **nodes**: a dataset, or a dataset playing a role (`customer_first
 4. A plain dataset reachable more than one way takes the **unique shortest path** (from `store_sales`, `date_dim` is the one-hop sale date, not a customer date two hops away). A tie is refused with the relationship names, so the caller can name the role.
 5. Joins are `LEFT JOIN`s from the root, so adding a dimension never drops fact rows with a NULL or dangling key; they land in the NULL group.
 
-### Legs: independent facts
+### Legs: home datasets and independent facts
 
-When no dataset reaches all of `R` but the request has measures, each term gets the join tree for its own datasets plus every dimension and filter. Terms whose trees share a root share a **leg**. Each leg contributes its own base part (and its terms' de-duplicated parts), and all parts are stacked as usual, so groups are the union across facts and a metric can combine terms from different legs (`SUM(web) / SUM(store)`). Dimensions or filters several facts could link, with no measure to choose, are refused as ambiguous.
+In a Layer 3 request where each term reads one dataset and that dataset reaches every dimension and filter, each term is evaluated over its home dataset's rows (wide table §5.2, §5.4): `SUM(orders.amount) / COUNT(DISTINCT customers.id)` counts customers with no orders too. Layer 2 never does this: its joins decide the rows, and a measure must not add groups (relational semantics §8.4; wide table §6.1).
+
+Otherwise, when no dataset reaches all of `R` but the request has measures, each term gets the join tree for its own datasets plus every dimension and filter. Terms whose trees share a root share a **leg**. Each leg contributes its own base part (and its terms' de-duplicated parts), and all parts are stacked as usual, so groups are the union across facts and a metric can combine terms from different legs (`SUM(web) / SUM(store)`). Dimensions or filters several facts could link, with no measure to choose, are refused as ambiguous.
 
 ### Dimension-only requests
 
@@ -158,10 +162,11 @@ Rules apply only when a target is given. Callers that translate downstream set n
 | Correctness | `tests/correctness.rs` | Wrong answers. Each case runs on DuckDB against seed data built to trigger fan-out and NULL keys, and compares with hand-written reference SQL. The fan-out cases also check that the naive join gives a *different* answer, so the test can fail. |
 | Drift | `tests/golden.rs`, `tests/golden/*.sql` | Unintended SQL changes, across dialects. Re-snapshot with `UPDATE_GOLDEN=1`. |
 | Model | `tests/model.rs` | Spec conformance: every vendored Ossie example binds, every compliance metric (M0–M3) compiles **and returns the expected answer on DuckDB**, one test per validation rule. |
+| Wide table | `tests/wide_table.rs` | Layer 3's worked examples, on the spec's own data. Unlike Layer 2, a metric can add groups (§6.1), so `Interface` in `plan.rs` keeps branching out of `AGG` queries. |
 | Query compliance | `tests/query_compliance.rs` | Ossie's own `compliance/query` suite (Layer 2, SCOTT data), every vendored case on DuckDB, compared by the suite's rules. |
 | Engines | `tests/engines.rs` | Engine disagreements. Every correctness case runs on Postgres, Trino, StarRocks, ClickHouse and MySQL (Docker, `scripts/engines.sh up`) and must match DuckDB's reference rows exactly, including types. |
 | TPC-DS | `tests/tpcds.rs` | Wrong answers at realistic scale, judged against the benchmark itself. Covers Ossie's TPC-DS example model, unchanged; multi-hop joins (`store_sales → customer → customer_address`), a composite-key relationship and composite primary-key de-duplication (`store_returns → store_sales` on item and ticket); and official queries q3, q7, q12, q26, q42, q43, q48, q52, q55, q96 and q98 compared with TPC-DS's own SQL from DuckDB's `tpcds_queries()`. Runs on six engines. Each reference is transpiled from DuckDB SQL and runs on the engine under test, so data-generator differences cancel out. References avoid `LAG`, `IS NOT DISTINCT FROM` and unaliased derived tables, so they never depend on the rules being tested. |
-| Fuzz | `tests/fuzz.rs` | Planner edge cases nobody thought to write. Random valid requests (metrics × dimensions × filters × grains, fixed seed) compared with an independent reference generated straight from the spec's §9 strategy: groups from all joined rows, and each measure as a correlated subquery over rows de-duplicated to its identity. 100 per run on DuckDB (`OSSIEC_FUZZ=n` for more), 40 per engine on the others. |
+| Fuzz | `tests/fuzz.rs` | Planner edge cases nobody thought to write. Random valid requests (metrics × dimensions × filters × grains, fixed seed) compared with an independent reference generated straight from the spec: each measure as a correlated subquery over its home dataset's rows de-duplicated to its identity (relational semantics §9), and the groups as the union of the branches' (wide table §5.5). 100 per run on DuckDB (`OSSIEC_FUZZ=n` for more), 40 per engine on the others. |
 | Scale | `tests/scale.rs`, `tpcds::trino_sf1_performance` | Super-linear compile time (a 121-table model) and plans that are right but slow (each TPC-DS case on Trino sf=1 must run within 3× its reference). |
 | Requests | `tests/requests.rs` | Error messages, refusals, 11 engines, determinism. |
 
@@ -171,7 +176,7 @@ Rules apply only when a target is given. Callers that translate downstream set n
 
 | Feature | Shape it will take |
 |---|---|
-| Layer 3 conformance (`wide_table_semantics.md`) | Known gaps: a model-scoped metric is computed over one join instead of one branch per home dataset (§5.2); the shortest path is taken where the spec requires `E_AMBIGUOUS_PATH` (§4); no spec error codes (§8); no `filter` expression, aliases or short output names (§3). |
+| Layer 3 conformance (`wide_table_semantics.md`) | Each aggregate reads its home dataset in its own branch (§5.2, §5.4). Known gaps: a request §5.3 rejects, or an aggregate reading several datasets, is answered over one join tree instead of being refused; the shortest path is taken where the spec requires `E_AMBIGUOUS_PATH` (§4); no spec error codes (§8); no `filter` expression, aliases or short output names (§3). |
 | Layer 2 operators (§7) | Refused today: `HAVING`, CTEs, `DISTINCT` and set operators over fields, `ROLLUP`, `GROUP BY ALL`, plain aggregates beside `AGG`, and `WHERE` beyond column comparisons joined by `AND`. |
 | Writing A.7 views into the model | Done: `persist_layer2_view` / `persist-view` / `to_yaml`. |
 | `ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, and the other non-equijoin kinds | Refused. §7.6 covers `INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS` (`CROSS` with `ON` is refused). |

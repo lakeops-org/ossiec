@@ -494,14 +494,12 @@ pub const CASES: &[Case] = &[
               SELECT p.category, SUM(o.amount_cents / 100.0) AS r
               FROM orders o LEFT JOIN products p ON o.product_id = p.product_id GROUP BY p.category
             ), stock AS (
-              SELECT category, SUM(stock) AS s FROM (
-                SELECT DISTINCT p.category, p.product_id, p.stock
-                FROM orders o LEFT JOIN products p ON o.product_id = p.product_id
-                WHERE p.product_id IS NOT NULL
-              ) GROUP BY category
+              -- Each aggregate reads its home dataset (wide table 5.2): all products,
+              -- including product 13, which never sold.
+              SELECT category, SUM(stock) AS s FROM products GROUP BY category
             )
-            SELECT rev.category, rev.r, stock.s, rev.r / NULLIF(stock.s, 0)
-            FROM rev LEFT JOIN stock ON rev.category IS NOT DISTINCT FROM stock.category",
+            SELECT COALESCE(rev.category, stock.category), rev.r, stock.s, rev.r / NULLIF(stock.s, 0)
+            FROM rev FULL JOIN stock ON rev.category IS NOT DISTINCT FROM stock.category",
         prefer: false,
     },
     Case {
