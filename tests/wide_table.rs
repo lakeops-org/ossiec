@@ -410,6 +410,8 @@ datasets:
     fields:
       - { name: date_id, expression: { sql: date_id } }
       - { name: year, expression: { sql: year } }
+    metrics:
+      - { name: date_count, expression: { sql: "COUNT(*)" } }
 relationships:
   - { name: orders_to_customers, from: orders, to: customers, from_columns: [customer_id], to_columns: [customer_id] }
   - { name: returns_to_customers, from: returns, to: customers, from_columns: [customer_id], to_columns: [customer_id] }
@@ -901,6 +903,12 @@ fn a_named_role_picks_the_path() {
     assert_eq!(
         run(r#"{"metrics": ["sales.total_sales"], "filter": "sale_date.year = 2024"}"#),
         rows(&[&["60"]])
+    );
+    // `sales` has two paths to `dates`, but only `dates` reads it here: each leg
+    // joins what its own metrics read, so there's no path to choose.
+    assert_eq!(
+        run(r#"{"metrics": ["sales.total_sales", "dates.date_count"]}"#),
+        rows(&[&["70", "2"]])
     );
     // One field in two roles has one output name, unless aliased (§3.3).
     let e = refused(

@@ -185,11 +185,11 @@ impl Dim<'_> {
     }
 }
 
-/// One metric: its name, its home datasets, and what its aggregates read.
+/// One metric: its name, its home datasets, and what each home's aggregates read.
 struct Metric {
     name: String,
     homes: BTreeSet<usize>,
-    reads: BTreeSet<usize>,
+    reads: BTreeSet<(usize, usize)>,
 }
 
 impl Metric {
@@ -389,7 +389,17 @@ pub(crate) fn check(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<(
                     .iter()
                     .map(|t| plan::grain_of(g, &t.datasets))
                     .collect::<Result<_>>()?,
-                reads: rm.terms.iter().flat_map(|t| t.datasets.clone()).collect(),
+                reads: rm
+                    .terms
+                    .iter()
+                    .map(|t| {
+                        let home = plan::grain_of(g, &t.datasets)?;
+                        Ok(t.datasets.iter().map(move |&d| (home, d)))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             })
         })
         .collect::<Result<_>>()?;
@@ -512,38 +522,40 @@ pub(crate) fn check(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<(
         .flat_map(|m| m.homes.iter().copied())
         .chain(anchors)
         .collect();
-    let needed = dims
+    // Every leg joins every dimension and filter, but only its own terms' reads.
+    let everywhere = dims
         .iter()
         .map(|d| (d.text, target(g, d.node())))
-        .chain(filtered.iter().map(|(t, n)| (t.as_str(), target(g, *n))))
-        .chain(
-            metrics
+        .chain(filtered.iter().map(|(t, n)| (t.as_str(), target(g, *n))));
+    let needed: Vec<(&str, usize, usize)> = everywhere
+        .flat_map(|(text, to)| roots.iter().map(move |&root| (text, root, to)))
+        .chain(metrics.iter().flat_map(|m| {
+            m.reads
                 .iter()
-                .flat_map(|m| m.reads.iter().map(|&to| (m.name.as_str(), to))),
-        );
-    for (text, to) in needed {
-        for &root in &roots {
-            let all = g.paths_from(root);
-            if let Some(paths) = all.get(&to).filter(|p| p.len() > 1) {
-                let shown: Vec<String> = paths
-                    .iter()
-                    .map(|p| {
-                        p.iter()
-                            .map(|&r| g.rels[r].name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" → ")
-                    })
-                    .collect();
-                return reject(
-                    ErrorCode::AmbiguousPath,
-                    format!(
-                        "`{text}`: `{}` reaches `{}` in more than one way ({}); name the one you mean as `<relationship>.<field>`, or use Layer 2",
-                        g.datasets[root].name,
-                        g.datasets[to].name,
-                        shown.join(" | ")
-                    ),
-                );
-            }
+                .map(|&(root, to)| (m.name.as_str(), root, to))
+        }))
+        .collect();
+    for (text, root, to) in needed {
+        let all = g.paths_from(root);
+        if let Some(paths) = all.get(&to).filter(|p| p.len() > 1) {
+            let shown: Vec<String> = paths
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .map(|&r| g.rels[r].name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                })
+                .collect();
+            return reject(
+                ErrorCode::AmbiguousPath,
+                format!(
+                    "`{text}`: `{}` reaches `{}` in more than one way ({}); name the one you mean as `<relationship>.<field>`, or use Layer 2",
+                    g.datasets[root].name,
+                    g.datasets[to].name,
+                    shown.join(" | ")
+                ),
+            );
         }
     }
     Ok(())

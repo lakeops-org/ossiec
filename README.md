@@ -101,6 +101,7 @@ datasets:
     primary_key: [id]
     fields:
       - { name: id, expression: { sql: product_id } }
+      - { name: category, expression: { sql: category } }
       - { name: stock, expression: { sql: stock } }
 relationships:
   - { name: orders_to_customers, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
@@ -388,7 +389,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`wide_table`](tests/wide_table.rs) | **Layer 3's own examples and rejections.** The data and results from `wide_table_semantics.md` (§1.3, §3.4, §5.2, §6.1, Appendix B), every row of §8 and the order between them. |
 | [`query_compliance`](tests/query_compliance.rs) | **Ossie's own query suite.** Every vendored `compliance/query` case returns its expected result on DuckDB, compared by the suite's rules. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including a ratio with a partial-fact derived join), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM|COUNT|AVG|MIN|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
+| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including a ratio with a partial-fact derived join), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM\|COUNT\|AVG\|MIN\|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
 
 ## Known issues
 
