@@ -3477,3 +3477,103 @@ fn having_refuses_a_window_metric() {
     .to_string();
     assert!(e.contains("window metric"), "{e}");
 }
+
+/// §7.5: `ORDER BY` may contain `AGG()` and scalar expressions over it.
+#[test]
+fn order_by_reads_measures_that_are_not_selected() {
+    let ordered = |sql: &str, reference: &str| {
+        let g = ossiec::from_yaml(common::MODEL).unwrap();
+        let db = duckdb();
+        let c = ossiec::compile_sql(&g, sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let want = duckdb_rows(&db, reference);
+        assert_eq!(duckdb_rows(&db, &c.sql), want, "{sql}\n{}", c.sql);
+        assert!(want.len() > 1, "{sql}: proves nothing");
+    };
+    ordered(
+        "SELECT status FROM orders GROUP BY status ORDER BY AGG(order_count) DESC",
+        "SELECT status FROM orders GROUP BY status ORDER BY COUNT(*) DESC",
+    );
+    ordered(
+        "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status ORDER BY AGG(order_count) * -1",
+        "SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY COUNT(*) * -1",
+    );
+    ordered(
+        "SELECT status, AGG(order_count) / AGG(order_count) AS one FROM orders GROUP BY status ORDER BY AGG(order_count) DESC",
+        "SELECT status, 1.0 FROM orders GROUP BY status ORDER BY COUNT(*) DESC",
+    );
+    // A second key, around a named one, in the order written.
+    ordered(
+        "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status ORDER BY AGG(gross_revenue) * 0, status DESC",
+        "SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY status DESC",
+    );
+    ordered(
+        "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status ORDER BY n DESC, LENGTH(status)",
+        "SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY n DESC, LENGTH(status)",
+    );
+    // A measure on the one side is de-duplicated before it sorts: EU has 150 units
+    // from two products; summed over its joined rows it would be 250.
+    ordered(
+        "SELECT c.region FROM orders o \
+         LEFT JOIN customers c ON o.customer_id = c.id \
+         LEFT JOIN products p ON o.product_id = p.id \
+         GROUP BY c.region ORDER BY AGG(p.stock_units) DESC NULLS LAST, c.region",
+        "SELECT region FROM (
+           SELECT g.region, s.stock FROM (SELECT DISTINCT c.region FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id) g
+           LEFT JOIN (SELECT region, SUM(stock) AS stock FROM (
+             SELECT DISTINCT c.region, p.product_id, p.stock FROM orders o
+             LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+             LEFT JOIN products p ON o.product_id = p.product_id
+             WHERE p.product_id IS NOT NULL) GROUP BY region) s
+           ON g.region IS NOT DISTINCT FROM s.region
+         ) ORDER BY stock DESC NULLS LAST, region NULLS FIRST",
+    );
+    // The Top-N it's for: a derived table with only its join column selected.
+    answers(
+        "SELECT o.status, AGG(o.order_count) FROM orders o \
+         JOIN (SELECT customer_id FROM orders GROUP BY customer_id ORDER BY AGG(order_count) DESC, customer_id LIMIT 2) t \
+           ON o.customer_id = t.customer_id GROUP BY o.status",
+        "SELECT o.status, COUNT(*) FROM orders o \
+         JOIN (SELECT customer_id FROM orders GROUP BY customer_id ORDER BY COUNT(*) DESC, customer_id NULLS FIRST LIMIT 2) t \
+           ON o.customer_id = t.customer_id GROUP BY o.status",
+    );
+    // Through a sole derived table.
+    ordered(
+        "SELECT status FROM (SELECT status, order_count AS n FROM orders) t GROUP BY status ORDER BY AGG(n) DESC",
+        "SELECT status FROM orders GROUP BY status ORDER BY COUNT(*) DESC",
+    );
+    refuses(
+        "SELECT status FROM orders GROUP BY status ORDER BY 1",
+        "position",
+    );
+    refuses(
+        "SELECT status FROM orders ORDER BY AGG(order_count)",
+        "need GROUP BY",
+    );
+    refuses(
+        "SELECT status FROM orders GROUP BY status ORDER BY AGG(nope)",
+        "nope",
+    );
+    refuses(
+        "SELECT status FROM orders GROUP BY status ORDER BY LENGTH(customer_id)",
+        "not in GROUP BY",
+    );
+    refuses(
+        "SELECT status FROM orders GROUP BY status ORDER BY SUM(id)",
+        "plain aggregate",
+    );
+    refuses(
+        "SELECT status FROM orders GROUP BY status ORDER BY (SELECT 1)",
+        "subqueries",
+    );
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let sql = "SELECT status FROM orders GROUP BY status ORDER BY AGG(order_count)";
+    let e = ossiec::sql_to_request(&g, sql)
+        .expect_err("no such key in a request")
+        .to_string();
+    assert!(e.contains("ORDER BY"), "{e}");
+    let hash = |o: &str| {
+        let sql = format!("SELECT status FROM orders GROUP BY status ORDER BY {o}");
+        ossiec::compile_sql(&g, &sql, &duck()).unwrap().request_hash
+    };
+    assert_ne!(hash("AGG(order_count)"), hash("AGG(order_count) DESC"));
+}

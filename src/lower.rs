@@ -19,7 +19,8 @@ use polyglot_sql::{get_columns, transform, DialectType, Expression};
 
 use crate::graph::{Ctx, SemanticGraph, TERM};
 use crate::plan::{
-    DerivedJoin, Direction, JoinKind, JoinStep, Leg, LogicalPlan, Nulls, Strategy, OUT_DIM,
+    DerivedJoin, Direction, JoinKind, JoinStep, Leg, LogicalPlan, Nulls, OrderKey, Strategy,
+    OUT_DIM,
 };
 use crate::sql::{self, Tpl};
 use crate::Result;
@@ -139,8 +140,11 @@ pub(crate) fn lower(g: &SemanticGraph, p: &LogicalPlan, ctx: &mut Ctx) -> Result
         let keys: Vec<String> = p
             .order
             .iter()
-            .map(|(name, dir, nulls)| {
-                let a = t.alias(name);
+            .map(|(key, dir, nulls)| {
+                let a = match key {
+                    OrderKey::Output(name) => t.alias(name),
+                    OrderKey::Expr(e) => t.e(over_terms(e)),
+                };
                 let dir = if *dir == Direction::Desc {
                     "DESC"
                 } else {

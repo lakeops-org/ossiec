@@ -183,6 +183,8 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **`HAVING`** (§7.5) takes `AGG()`, expressions over it and selected columns, and the measure needn't be selected. It's computed in its own part like any measure, so a one-side measure is de-duplicated before it's compared. A plain aggregate or a window beside `AGG` is refused.
 
+**`ORDER BY`** (§7.5) takes a selected column or measure by name, or `AGG()` and expressions over it, selected or not, so a Top-N can select only its join column. `ORDER BY 1` is refused, since it means a position in SQL.
+
 **`WITH`** (§7.7) is a named derived table, so a measure passes through a CTE as it does through a subquery. `WITH RECURSIVE`, a column list and a set operator in a CTE are refused.
 
 **`WHERE`** is any row predicate over the query's columns (§7.3): comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT` and expressions, across datasets. Aggregates and windows are refused, and subqueries aren't supported yet.
@@ -451,7 +453,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 3 aliases and short output names
 - [x] Layer 2 `WHERE` as any row predicate (`IN`, `OR`, `LIKE`, `BETWEEN`, `NOT`, expressions)
 - [x] Layer 2 `HAVING` and `WITH`
-- [ ] Layer 2 `ORDER BY` on an unselected `AGG()` or an expression over it (§7.5)
+- [x] Layer 2 `ORDER BY` on an unselected `AGG()` or an expression over it (§7.5)
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, `DISTINCT` and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)

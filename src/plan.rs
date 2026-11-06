@@ -415,6 +415,15 @@ pub(crate) struct DerivedJoin {
     pub kind: JoinKind,
 }
 
+/// What a statement sorts by.
+pub(crate) enum OrderKey {
+    /// An output column, by name.
+    Output(String),
+    /// An expression over term and dimension placeholders, which needn't be selected
+    /// (Layer 2, relational semantics §7.5).
+    Expr(Box<Expression>),
+}
+
 /// Everything `lower` needs; no SQL decisions are left.
 pub(crate) struct LogicalPlan {
     pub legs: Vec<Leg>,
@@ -439,7 +448,7 @@ pub(crate) struct LogicalPlan {
     /// finished rows (after windows), not to groups.
     pub windowed: bool,
     pub include_unmatched: bool,
-    pub order: Vec<(String, Direction, Option<Nulls>)>,
+    pub order: Vec<(OrderKey, Direction, Option<Nulls>)>,
     pub limit: Option<u64>,
 }
 
@@ -690,7 +699,7 @@ pub(crate) fn plan(
                 known.join(", ")
             )));
         };
-        order.push((name, o.direction, o.nulls));
+        order.push((OrderKey::Output(name), o.direction, o.nulls));
     }
 
     // Join trees (one per fact) and term strategies.

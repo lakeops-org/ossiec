@@ -136,9 +136,11 @@ fn rename_consumer_outputs(
             *name = label.clone();
         }
     }
-    for (name, _, _) in &mut logical.order {
-        if let Some(alias) = rename.get(name).or_else(|| dim_rename.get(name)) {
-            *name = alias.clone();
+    for (key, _, _) in &mut logical.order {
+        if let plan::OrderKey::Output(name) = key {
+            if let Some(alias) = rename.get(name).or_else(|| dim_rename.get(name)) {
+                *name = alias.clone();
+            }
         }
     }
 }
@@ -147,9 +149,9 @@ fn rename_consumer_outputs(
 /// represented). Flat queries only: derived tables (A.2–A.3) are not one request.
 pub fn to_request(graph: &SemanticGraph, sql: &str) -> Result<Request> {
     let parsed = parse_layer2(graph, sql)?;
-    if parsed.having.is_some() {
+    if parsed.having.is_some() || !parsed.order_exprs.is_empty() {
         return Err(unsupported(
-            "a request can't carry this HAVING; compile the SQL with compile_sql",
+            "a request can't carry this HAVING or ORDER BY expression; compile the SQL with compile_sql",
         ));
     }
     Ok(parsed.request)
@@ -164,7 +166,9 @@ pub(super) struct Layer2Parsed {
     /// Selected dimension (`dataset.field`) and the label the consumer sees it under.
     pub dim_labels: Vec<(String, String)>,
     /// `HAVING`, once its `AGG()` leaves and columns are placeholders.
-    pub having: Option<ParsedHaving>,
+    pub having: Option<GroupExpr>,
+    /// `ORDER BY` keys that aren't output columns, by their place among the keys.
+    pub order_exprs: Vec<OrderExpr>,
     /// Derived tables joined to the stage (Appendix A.2).
     pub derived: Vec<DerivedSpec>,
     /// Columns of this stage that are measures awaiting a later `AGG()` (§7.7):
@@ -235,11 +239,18 @@ pub(super) struct ConsumerJoin {
     attach_role: Option<usize>,
 }
 
-/// A `HAVING` predicate over placeholders: `__ossiec_h{i}` for `measures[i]`, and
-/// [`plan::OUT_DIM`]`{i}` for selected dimension `i`.
-pub(super) struct ParsedHaving {
-    pub predicate: Expression,
+/// An expression over a finished group, in placeholders: `__ossiec_h{i}` for
+/// `measures[i]`, and [`plan::OUT_DIM`]`{i}` for selected dimension `i`.
+pub(super) struct GroupExpr {
+    pub expr: Expression,
     pub measures: Vec<L2Formula>,
+}
+
+pub(super) struct OrderExpr {
+    pub position: usize,
+    pub key: GroupExpr,
+    pub direction: Direction,
+    pub nulls: Option<Nulls>,
 }
 
 const HAVING_MEASURE: &str = "__ossiec_h";
@@ -645,6 +656,11 @@ pub(super) fn parse_stage_from(
     };
     let filter = (!predicates.is_empty()).then(|| predicates.join(" AND "));
 
+    let selected_measure = |m: &str| {
+        measure_outputs
+            .iter()
+            .any(|(_, f)| matches!(f, L2Formula::Agg(x) if x == m))
+    };
     let order_ctx = OrderCtx {
         graph,
         scope,
@@ -652,28 +668,65 @@ pub(super) fn parse_stage_from(
         metrics: &metrics,
         dimensions: &dimensions,
     };
-    let order_by = match &sel.order_by {
-        None => vec![],
-        Some(ob) => ob
-            .expressions
+    let mut order_by = vec![];
+    let mut order_exprs: Vec<OrderExpr> = vec![];
+    for (position, o) in sel
+        .order_by
+        .iter()
+        .flat_map(|ob| ob.expressions.iter())
+        .enumerate()
+    {
+        let direction = if o.desc {
+            Direction::Desc
+        } else {
+            Direction::Asc
+        };
+        let nulls = match o.nulls_first {
+            Some(true) => Some(Nulls::First),
+            Some(false) => Some(Nulls::Last),
+            None => None,
+        };
+        // A selected measure or a column sorts by name; anything else by value.
+        let arg = take_agg(&o.this)?;
+        let by_name = match arg {
+            Some(arg) => matches!(
+                resolve_agg(graph, scope, arg)?,
+                L2Formula::Agg(m) if selected_measure(&m)
+            ),
+            None => as_column(&o.this).is_some(),
+        };
+        if by_name {
+            order_by.push(OrderBy {
+                field: order_field(&order_ctx, &o.this)?,
+                direction,
+                nulls,
+            });
+        } else {
+            order_exprs.push(OrderExpr {
+                position,
+                key: order_key(graph, scope, &o.this, &dimensions)?,
+                direction,
+                nulls,
+            });
+        }
+    }
+    if !order_exprs.is_empty() {
+        let reads_measure = order_exprs.iter().any(|o| !o.key.measures.is_empty());
+        if reads_measure && sel.group_by.is_none() && !dimensions.is_empty() {
+            return Err(Error::Request(
+                "Layer 2 ORDER BY AGG() makes a query aggregated, so its selected columns need GROUP BY".into(),
+            ));
+        }
+        for leaf in order_exprs
             .iter()
-            .map(|o| {
-                Ok(OrderBy {
-                    field: order_field(&order_ctx, &o.this)?,
-                    direction: if o.desc {
-                        Direction::Desc
-                    } else {
-                        Direction::Asc
-                    },
-                    nulls: match o.nulls_first {
-                        Some(true) => Some(Nulls::First),
-                        Some(false) => Some(Nulls::Last),
-                        None => None,
-                    },
-                })
-            })
-            .collect::<Result<_>>()?,
-    };
+            .flat_map(|o| o.key.measures.iter())
+            .flat_map(formula_leaves)
+        {
+            if !metrics.contains(&leaf) {
+                metrics.push(leaf);
+            }
+        }
+    }
 
     let limit = match &sel.limit {
         None => None,
@@ -699,6 +752,7 @@ pub(super) fn parse_stage_from(
         measure_outputs,
         dim_labels,
         having,
+        order_exprs,
         derived: parsed_from.derived,
         unevaluated,
         ephemeral,
@@ -1194,11 +1248,11 @@ fn apply_select_formulas(
     _graph: &SemanticGraph,
     logical: &mut LogicalPlan,
     measure_outputs: &[(String, L2Formula)],
-    has_having: bool,
+    has_hidden_measures: bool,
 ) -> Result<()> {
     if measure_outputs.is_empty() {
-        // Measures only `HAVING` reads aren't columns of the result.
-        if has_having {
+        // Measures only `HAVING` or `ORDER BY` read aren't columns of the result.
+        if has_hidden_measures {
             logical.outputs.clear();
         }
         return Ok(());
@@ -2235,7 +2289,7 @@ fn parse_having(
     scope: &QueryScope,
     e: &Expression,
     dimensions: &[String],
-) -> Result<(Vec<Conjunct>, Option<ParsedHaving>)> {
+) -> Result<(Vec<Conjunct>, Option<GroupExpr>)> {
     fn split<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
         match e {
             Expression::And(a) => {
@@ -2283,11 +2337,48 @@ fn parse_having(
             "Layer 2 HAVING does not support subqueries yet",
         ));
     }
+    Ok((pushed, Some(group_expr(graph, scope, joined, dimensions)?)))
+}
+
+/// An `ORDER BY` key that isn't an output column (§7.5). An expression has to read
+/// something: `ORDER BY 1` means a position in SQL, not a constant.
+fn order_key(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+    dimensions: &[String],
+) -> Result<GroupExpr> {
+    if contains_aggregate(e) || contains_window_function(e) {
+        return Err(unsupported(
+            "Layer 2 ORDER BY takes AGG(measure) and selected columns; a plain aggregate or a window beside AGG is not supported",
+        ));
+    }
+    if e.contains(|x| is_query(x) || is_subquery(x)) {
+        return Err(unsupported(
+            "Layer 2 ORDER BY does not support subqueries yet",
+        ));
+    }
+    let key = group_expr(graph, scope, e.clone(), dimensions)?;
+    if key.measures.is_empty() && get_columns(&key.expr).is_empty() {
+        return Err(unsupported(
+            "Layer 2 ORDER BY must name a selected dimension, measure, or AGG(...); a position like `ORDER BY 1` is not supported",
+        ));
+    }
+    Ok(key)
+}
+
+/// `e` over placeholders: each `AGG()` a measure, each column a selected dimension.
+fn group_expr(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: Expression,
+    dimensions: &[String],
+) -> Result<GroupExpr> {
     let failure = RefCell::new(None);
     let measures = RefCell::new(Vec::<L2Formula>::new());
     // Two passes: an AGG()'s argument is not a column of the group, whichever
     // order the walk visits a node and its children in.
-    let without_aggs = transform(joined, &|x| {
+    let without_aggs = transform(e, &|x| {
         let found = match take_agg(&x) {
             Ok(Some(arg)) => resolve_agg(graph, scope, arg).map(Some),
             Ok(None) => Ok(None),
@@ -2307,7 +2398,7 @@ fn parse_having(
         }))
     })
     .map_err(|e| Error::Internal(e.to_string()))?;
-    let predicate = transform(without_aggs, &|x| {
+    let expr = transform(without_aggs, &|x| {
         Ok(Some(match x {
             Expression::Column(c) if !c.name.name.starts_with(HAVING_MEASURE) => {
                 match selected_dimension(graph, scope, &c, dimensions) {
@@ -2325,13 +2416,10 @@ fn parse_having(
     if let Some(err) = failure.into_inner() {
         return Err(err);
     }
-    Ok((
-        pushed,
-        Some(ParsedHaving {
-            predicate: graph::true_division(predicate),
-            measures: measures.into_inner(),
-        }),
-    ))
+    Ok(GroupExpr {
+        expr: graph::true_division(expr),
+        measures: measures.into_inner(),
+    })
 }
 
 /// A `HAVING` column: which selected dimension it is.
@@ -2344,32 +2432,54 @@ fn selected_dimension(
     let dim = resolve_dim(graph, scope, col)?;
     dimensions.iter().position(|d| *d == dim).ok_or_else(|| {
         Error::Request(format!(
-            "Layer 2 HAVING reads `{dim}`, which is not in GROUP BY; put it in WHERE, or group by it"
+            "Layer 2 HAVING or ORDER BY reads `{dim}`, which is not in GROUP BY; group by it"
         ))
     })
 }
 
-/// Add a parsed `HAVING` to the plan. Runs before the select list replaces the plan's
-/// outputs, while each measure's expression can still be read from them.
-fn apply_having(logical: &mut LogicalPlan, having: Option<&ParsedHaving>) -> Result<()> {
-    let Some(having) = having else {
+/// Add `HAVING` and `ORDER BY` expressions to the plan. Runs before the select list
+/// replaces the plan's outputs, while each measure's expression can still be read.
+fn apply_group_exprs(
+    logical: &mut LogicalPlan,
+    having: Option<&GroupExpr>,
+    order: &[OrderExpr],
+) -> Result<()> {
+    if having.is_none() && order.is_empty() {
         return Ok(());
-    };
+    }
     if logical.windowed {
         return Err(unsupported(
-            "Layer 2 HAVING over a window metric is not supported",
+            "Layer 2 HAVING or ORDER BY expression over a window metric is not supported",
         ));
     }
     let metrics: HashMap<String, Expression> = logical.outputs.iter().cloned().collect();
+    if let Some(having) = having {
+        let predicate = over_measures(having, &metrics)?;
+        logical.metric_filters.push((predicate.clone(), predicate));
+    }
+    for o in order {
+        logical.order.insert(
+            o.position,
+            (
+                plan::OrderKey::Expr(Box::new(over_measures(&o.key, &metrics)?)),
+                o.direction,
+                o.nulls,
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn over_measures(e: &GroupExpr, metrics: &HashMap<String, Expression>) -> Result<Expression> {
     let failure = RefCell::new(None);
-    let predicate = transform(having.predicate.clone(), &|x| {
+    let out = transform(e.expr.clone(), &|x| {
         Ok(Some(match x {
             Expression::Column(c) if c.name.name.starts_with(HAVING_MEASURE) => {
                 let i: usize = c.name.name[HAVING_MEASURE.len()..]
                     .parse()
-                    .expect("HAVING placeholder");
-                match formula_to_expr(&having.measures[i], &metrics) {
-                    Ok(e) => e,
+                    .expect("measure placeholder");
+                match formula_to_expr(&e.measures[i], metrics) {
+                    Ok(f) => f,
                     Err(err) => {
                         failure.borrow_mut().get_or_insert(err);
                         Expression::Column(c)
@@ -2380,11 +2490,7 @@ fn apply_having(logical: &mut LogicalPlan, having: Option<&ParsedHaving>) -> Res
         }))
     })
     .map_err(|e| Error::Internal(e.to_string()))?;
-    if let Some(err) = failure.into_inner() {
-        return Err(err);
-    }
-    logical.metric_filters.push((predicate.clone(), predicate));
-    Ok(())
+    failure.into_inner().map_or(Ok(out), Err)
 }
 
 /// A predicate as `filter` text, each column as its `dataset.field`.
