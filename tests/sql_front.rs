@@ -168,8 +168,7 @@ fn a1_status_order_count_matches_layer3() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":[{"metric":"orders.order_count","alias":"orders.order_count"}],
-                "dimensions":[{"field":"orders.status","alias":"orders.status"}]}"#,
+            r#"{"metrics":["orders.order_count"],"dimensions":["orders.status"]}"#,
         )
         .unwrap(),
         &Options {
@@ -246,8 +245,7 @@ fn inner_join_customers_emits_inner_join() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":[{"metric":"orders.order_count","alias":"orders.order_count"}],
-                "dimensions":[{"field":"customers.region","alias":"customers.region"}]}"#,
+            r#"{"metrics":["orders.order_count"],"dimensions":["customers.region"]}"#,
         )
         .unwrap(),
         &opts,
@@ -270,8 +268,7 @@ fn left_join_customers_matches_layer3_agg_shape() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":[{"metric":"orders.order_count","alias":"orders.order_count"}],
-                "dimensions":[{"field":"customers.region","alias":"customers.region"}]}"#,
+            r#"{"metrics":["orders.order_count"],"dimensions":["customers.region"]}"#,
         )
         .unwrap(),
         &opts,
@@ -447,9 +444,7 @@ fn a4_independent_measures_via_joins_match_layer3() {
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
-            r#"{"metrics":[{"metric":"orders.order_amt","alias":"orders.order_amt"},
-                            {"metric":"tickets.ticket_count","alias":"tickets.ticket_count"}],
-                "dimensions":[{"field":"customers.region","alias":"customers.region"}]}"#,
+            r#"{"metrics":["orders.order_amt","tickets.ticket_count"],"dimensions":["customers.region"]}"#,
         )
         .unwrap(),
         &opts,
@@ -472,14 +467,8 @@ fn a4_comma_from_lists_independent_facts() {
     );
     assert_eq!(req.dimensions, vec!["customers.region"]);
     let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
-    // Layer 3 names its columns by final part; the plan is the same.
     let l3 = ossiec::compile(&g, &req, &opts).unwrap();
-    let short = l2
-        .sql
-        .replace("orders.order_amt", "order_amt")
-        .replace("tickets.ticket_count", "ticket_count")
-        .replace("customers.region", "region");
-    assert_eq!(short, l3.sql);
+    assert_eq!(l2.sql, l3.sql);
 }
 
 #[test]
@@ -626,18 +615,6 @@ fn consumer_aliases_name_output_columns() {
         "SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY n DESC, status",
     );
     assert_eq!(got, want);
-}
-
-#[test]
-fn unaliased_output_names_are_unchanged() {
-    let c = ossiec::compile_layer2(
-        &graph(),
-        "SELECT status, AGG(order_count) FROM orders GROUP BY status",
-        &duck(),
-    )
-    .unwrap();
-    assert!(c.sql.contains("\"orders.status\""), "{}", c.sql);
-    assert!(c.sql.contains("\"orders.order_count\""), "{}", c.sql);
 }
 
 #[test]
@@ -2067,8 +2044,7 @@ fn role_playing_dimension_matches_layer3_and_duckdb() {
     let bare = ossiec::compile_layer2(&g, implicit, &duck()).unwrap();
     let layer3 = l3(
         &g,
-        r#"{"metrics":[{"metric":"flights.total_delay","alias":"flights.total_delay"}],
-            "dimensions":[{"field":"departs_from.city","alias":"departs_from.city"}]}"#,
+        r#"{"metrics":["flights.total_delay"],"dimensions":["departs_from.city"]}"#,
     );
     assert_eq!(joined.sql, layer3.sql);
     assert_eq!(bare.sql, layer3.sql);
@@ -2095,7 +2071,8 @@ fn both_roles_and_a_derived_join_on_one_of_them() {
     // derived ON qualify by role. `code <> 'CDG'` keeps JFK and LHR, so
     // CDG→JFK drops and JFK→CDG (arrival Paris) stays. Attaching the derived
     // table to `arrives_at` would do the opposite.
-    let sql = "SELECT departs_from.city, arrives_at.city, AGG(f.total_delay) \
+    let sql =
+        "SELECT departs_from.city AS origin, arrives_at.city AS destination, AGG(f.total_delay) \
          FROM flights f \
          LEFT JOIN airports dep ON f.origin = dep.code \
          LEFT JOIN airports arr ON f.dest = arr.code \
@@ -3201,4 +3178,52 @@ fn where_accepts_any_row_predicate() {
             .to_string();
         assert!(e.contains(want), "{predicate}: {e}");
     }
+}
+
+/// §3.1: columns behave as in standard SQL, named by their final part, and a
+/// relation's column names are unique.
+#[test]
+fn columns_are_named_as_in_standard_sql() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let columns = |sql: &str| {
+        let compiled = ossiec::compile_sql(&g, sql, &duck()).unwrap();
+        let mut st = db.prepare(&compiled.sql).unwrap();
+        drop(st.query([]).unwrap());
+        st.column_names()
+    };
+    assert_eq!(
+        columns("SELECT o.status, AGG(o.order_count) FROM orders o GROUP BY o.status"),
+        ["status", "order_count"]
+    );
+    assert_eq!(
+        columns("SELECT status AS s, AGG(order_count) AS n FROM orders GROUP BY status"),
+        ["s", "n"]
+    );
+    assert_eq!(
+        columns("SELECT status FROM orders GROUP BY status"),
+        ["status"]
+    );
+    // ORDER BY takes the short name, the qualified column, or the alias.
+    for order in ["status", "o.status", "order_count", "AGG(o.order_count)"] {
+        let sql = format!(
+            "SELECT o.status, AGG(o.order_count) FROM orders o GROUP BY o.status ORDER BY {order}"
+        );
+        assert_eq!(columns(&sql), ["status", "order_count"], "{order}");
+    }
+    // Two columns can't share a name, spelled either way.
+    for sql in [
+        "SELECT o.id, c.id FROM orders o LEFT JOIN customers c ON o.customer_id = c.id GROUP BY o.id, c.id",
+        "SELECT status, status FROM orders GROUP BY status",
+        "SELECT status AS n, AGG(order_count) AS N FROM orders GROUP BY status",
+    ] {
+        let e = ossiec::compile_sql(&g, sql, &duck()).expect_err(sql).to_string();
+        assert!(e.contains("two output columns named"), "{sql}: {e}");
+    }
+    assert_eq!(
+        columns(
+            "SELECT o.id, c.id AS customer FROM orders o LEFT JOIN customers c ON o.customer_id = c.id GROUP BY o.id, c.id"
+        ),
+        ["id", "customer"]
+    );
 }

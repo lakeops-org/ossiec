@@ -2,9 +2,9 @@
 -- dialect: clickhouse (source: generic)
 -- warning: FAN_TRAP_RISK: `SUM("products".stock)` is computed over `products` rows de-duplicated by primary key; a `products` row that belongs to several groups counts in each, so groups do not add up to a grand total
 SELECT
-  stacked.d0 AS "customers.region",
-  MAX(stacked.t0) AS "products.stock_units",
-  MAX(stacked.t1) AS "orders.gross_revenue"
+  stacked.d0 AS "region",
+  MAX(stacked.t0) AS "stock_units",
+  MAX(stacked.t1) AS "gross_revenue"
 FROM (
   SELECT
     "customers".region AS d0,

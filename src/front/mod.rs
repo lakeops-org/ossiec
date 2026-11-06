@@ -510,14 +510,8 @@ pub(super) fn parse_stage_from(
                 return Err(e);
             }
         };
-        // A derived table is read by column name: dimensions default to the bare
-        // field name (`customer_id`), not `orders.customer_id`.
-        let default_label = if cfg.derived {
-            bare_field(&dim).to_string()
-        } else {
-            dim.clone()
-        };
-        let label = alias.unwrap_or(default_label);
+        // As in standard SQL (§3.1), a column is named by its final part: `status`.
+        let label = alias.unwrap_or_else(|| bare_field(&dim).to_string());
         match dim_labels.iter().find(|(d, _)| d == &dim) {
             Some((_, first)) if first != &label => {
                 return Err(unsupported(format!(
@@ -537,6 +531,18 @@ pub(super) fn parse_stage_from(
         return Err(Error::Request(
             "Layer 2 query must select at least one AGG(measure) or dimension".into(),
         ));
+    }
+    // Column names within a relation MUST be unique (§3.1), and not every engine
+    // takes two output columns with one name.
+    for (i, (label, _)) in outputs.iter().enumerate() {
+        if outputs[..i]
+            .iter()
+            .any(|(p, _)| p.eq_ignore_ascii_case(label))
+        {
+            return Err(Error::Request(format!(
+                "Layer 2 query has two output columns named `{label}`; give one an alias"
+            )));
+        }
     }
 
     // `GROUP BY` must name exactly the selected dimensions. With `AGG` it is
@@ -1305,7 +1311,7 @@ fn formula_leaves(f: &L2Formula) -> Vec<String> {
 
 fn default_measure_name(f: &L2Formula, idx: usize) -> String {
     match f {
-        L2Formula::Agg(m) => m.clone(),
+        L2Formula::Agg(m) => bare_field(m).to_string(),
         _ => format!("__l2_{idx}"),
     }
 }
