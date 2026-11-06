@@ -46,6 +46,7 @@
 //! Only **dataset-scoped** metrics are measures (spec §10.3). Model-scoped
 //! metrics are refused inside `AGG()`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use polyglot_sql::builder::{func, lit, Expr};
@@ -54,13 +55,15 @@ use polyglot_sql::expressions::{
     TableRef,
 };
 use polyglot_sql::{
-    get_columns, parse_one, transform_all, DialectType, Expression, ExpressionWalk,
+    contains_aggregate, contains_window_function, get_columns, is_query, is_subquery, parse_one,
+    transform, transform_all, DialectType, Expression, ExpressionWalk,
 };
 
 use crate::graph::{self, SemanticGraph};
 use crate::plan::{
     self, Direction, Filter, JoinKind, JoinStep, LogicalPlan, Nulls, Op, OrderBy, Request, Strategy,
 };
+use crate::sql;
 use crate::{Compiled, Error, Options, Result};
 
 mod catalog;
@@ -578,10 +581,17 @@ pub(super) fn parse_stage_from(
         }
     }
 
-    let filters = match &sel.where_clause {
-        None => vec![],
-        Some(w) => where_to_filters(graph, scope, &w.this)?,
-    };
+    let mut filters = vec![];
+    let mut predicates = vec![];
+    if let Some(w) = &sel.where_clause {
+        for conjunct in where_to_filters(graph, scope, &w.this)? {
+            match conjunct {
+                Conjunct::Filter(f) => filters.push(f),
+                Conjunct::Predicate(p) => predicates.push(format!("({p})")),
+            }
+        }
+    }
+    let filter = (!predicates.is_empty()).then(|| predicates.join(" AND "));
 
     let order_ctx = OrderCtx {
         graph,
@@ -625,8 +635,9 @@ pub(super) fn parse_stage_from(
 
     Ok(Layer2Parsed {
         request: Request {
-            metrics,
-            dimensions,
+            metrics: metrics.into_iter().map(Into::into).collect(),
+            dimensions: dimensions.into_iter().map(Into::into).collect(),
+            filter,
             filters,
             order_by,
             limit,
@@ -2116,62 +2127,102 @@ fn on_attach_role(
     Ok(found.flatten())
 }
 
+/// A conjunct of `WHERE`: a structured filter where it fits, so a literal is typed
+/// by its field, or else a row predicate over the query's columns (§7.3).
+enum Conjunct {
+    Filter(Filter),
+    Predicate(String),
+}
+
 fn where_to_filters(
     graph: &SemanticGraph,
     scope: &QueryScope,
     e: &Expression,
-) -> Result<Vec<Filter>> {
-    match e {
-        Expression::And(a) => {
-            let mut out = where_to_filters(graph, scope, &a.left)?;
-            out.extend(where_to_filters(graph, scope, &a.right)?);
-            Ok(out)
-        }
-        Expression::Eq(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Eq),
-        Expression::Neq(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Ne),
-        Expression::Lt(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Lt),
-        Expression::Lte(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Le),
-        Expression::Gt(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Gt),
-        Expression::Gte(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Ge),
-        Expression::IsNull(i) => {
-            let col = as_column(&i.this).ok_or_else(simple_where)?;
-            Ok(vec![Filter {
+) -> Result<Vec<Conjunct>> {
+    if let Expression::And(a) = e {
+        let mut out = where_to_filters(graph, scope, &a.left)?;
+        out.extend(where_to_filters(graph, scope, &a.right)?);
+        return Ok(out);
+    }
+    let structured = match e {
+        Expression::Eq(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Eq)?,
+        Expression::Neq(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Ne)?,
+        Expression::Lt(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Lt)?,
+        Expression::Lte(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Le)?,
+        Expression::Gt(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Gt)?,
+        Expression::Gte(b) => cmp_filter(graph, scope, &b.left, &b.right, Op::Ge)?,
+        Expression::IsNull(i) => match as_column(&i.this) {
+            Some(col) => Some(Filter {
                 field: resolve_dim(graph, scope, col)?,
                 op: if i.not { Op::IsNotNull } else { Op::IsNull },
                 value: None,
                 values: vec![],
-            }])
-        }
-        _ => Err(simple_where()),
+            }),
+            None => None,
+        },
+        _ => None,
+    };
+    Ok(vec![match structured {
+        Some(f) => Conjunct::Filter(f),
+        None => Conjunct::Predicate(where_predicate(graph, scope, e)?),
+    }])
+}
+
+/// A predicate as `filter` text, each column as its `dataset.field`.
+fn where_predicate(graph: &SemanticGraph, scope: &QueryScope, e: &Expression) -> Result<String> {
+    if contains_aggregate(e) || contains_window_function(e) || e.contains(is_measure_agg_expr) {
+        return Err(Error::Request(
+            "Layer 2 WHERE cannot contain an aggregate or a window function; use HAVING, or a measure's FILTER".into(),
+        ));
     }
+    if e.contains(|x| is_query(x) || is_subquery(x)) {
+        return Err(unsupported("Layer 2 WHERE does not support subqueries yet"));
+    }
+    let failure = RefCell::new(None);
+    let resolved = transform(e.clone(), &|x| {
+        let Expression::Column(c) = x else {
+            return Ok(Some(x));
+        };
+        let field = resolve_dim(graph, scope, &c)
+            .and_then(|field| sql::parse(&field, DialectType::Generic).map_err(Error::Internal));
+        Ok(Some(match field {
+            Ok(column) => column,
+            Err(err) => {
+                failure.borrow_mut().get_or_insert(err);
+                Expression::Column(c)
+            }
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))?;
+    if let Some(err) = failure.into_inner() {
+        return Err(err);
+    }
+    polyglot_sql::generate(&resolved, DialectType::Generic)
+        .map_err(|e| Error::Internal(e.to_string()))
 }
 
-fn simple_where() -> Error {
-    unsupported(
-        "Layer 2 WHERE currently accepts column comparisons and AND (e.g. status = 'completed')",
-    )
-}
-
+/// `column <op> literal` as a filter, or `None` if the comparison is something else.
 fn cmp_filter(
     graph: &SemanticGraph,
     scope: &QueryScope,
     left: &Expression,
     right: &Expression,
     op: Op,
-) -> Result<Vec<Filter>> {
-    let (col_e, lit_e) = match (as_column(left), as_column(right)) {
-        (Some(_), None) => (left, right),
-        (None, Some(_)) if matches!(op, Op::Eq | Op::Ne) => (right, left),
-        _ => return Err(simple_where()),
+) -> Result<Option<Filter>> {
+    let (col, lit) = match (as_column(left), as_column(right)) {
+        (Some(col), None) => (col, right),
+        (None, Some(col)) if matches!(op, Op::Eq | Op::Ne) => (col, left),
+        _ => return Ok(None),
     };
-    let col = as_column(col_e).unwrap();
-    let value = literal_json(lit_e).ok_or_else(simple_where)?;
-    Ok(vec![Filter {
+    let Some(value) = literal_json(lit) else {
+        return Ok(None);
+    };
+    Ok(Some(Filter {
         field: resolve_dim(graph, scope, col)?,
         op,
         value: Some(value),
         values: vec![],
-    }])
+    }))
 }
 
 fn literal_json(e: &Expression) -> Option<serde_json::Value> {

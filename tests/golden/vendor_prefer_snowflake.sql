@@ -1,7 +1,7 @@
 -- request: {"metrics": ["users"], "dimensions": ["events.day"]}
 -- dialect: snowflake (source: snowflake)
 SELECT
-  base.d0 AS "events.day",
+  base.d0 AS "day",
   base.t0 AS "users"
 FROM (
   SELECT

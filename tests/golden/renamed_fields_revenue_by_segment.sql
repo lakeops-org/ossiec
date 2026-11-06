@@ -1,7 +1,7 @@
 -- request: {"metrics": ["total_revenue"], "dimensions": ["customers.segment"]}
 -- dialect: generic (source: generic)
 SELECT
-  base.d0 AS "customers.segment",
+  base.d0 AS "segment",
   base.t0 AS "total_revenue"
 FROM (
   SELECT

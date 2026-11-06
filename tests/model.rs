@@ -42,7 +42,7 @@ fn every_compliance_metric_compiles() {
         let g = ossiec::from_yaml(&fixture_file(&format!("{f}.ossie.yaml"))).unwrap();
         for m in g.describe().metrics {
             let req = ossiec::Request {
-                metrics: vec![m.name.clone()],
+                metrics: vec![m.name.clone().into()],
                 ..Default::default()
             };
             ossiec::compile(&g, &req, &Default::default())
@@ -57,8 +57,13 @@ fn tpcds_window_metrics_compile_with_their_dimensions() {
     for m in g.describe().metrics {
         assert!(m.queryable, "{}", m.name);
         let req = ossiec::Request {
-            metrics: vec![m.name.clone()],
-            dimensions: m.requires_dimensions.clone(),
+            metrics: vec![m.name.clone().into()],
+            dimensions: m
+                .requires_dimensions
+                .iter()
+                .map(|d| d.as_str().into())
+                .collect(),
+            deferred_metrics: m.requires_deferred_metrics,
             ..Default::default()
         };
         ossiec::compile(&g, &req, &Default::default())
@@ -115,11 +120,11 @@ fn validation_rules() {
             "same length",
         ),
         (
-            "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}]}\nmetrics:\n  - {name: m, expression: {sql: a.x + 1}}\n",
+            "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}]}\nmetrics:\n  - {name: m, expression: {sql: 1 + 1}}\n",
             "a metric must aggregate",
         ),
         (
-            "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}]}\nmetrics:\n  - {name: m, expression: {sql: SUM(a.x) + a.x}}\n",
+            "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}], metrics: [{name: m, expression: {sql: SUM(x) + x}}]}\n",
             "references a field outside an aggregate",
         ),
         (
@@ -129,14 +134,6 @@ fn validation_rules() {
         (
             "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}]}\n  - {name: b, source: u, fields: [{name: y, expression: {sql: y}}], metrics: [{name: m, expression: {sql: SUM(a.x)}}]}\n",
             "can only reference fields of its own dataset `b`",
-        ),
-        (
-            "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}]}\nmetrics:\n  - {name: m, expression: {sql: COUNT(*)}}\n",
-            "must be a dataset-scoped metric",
-        ),
-        (
-            "datasets:\n  - {name: a, source: t, fields: [{name: x, expression: {sql: x}}, {name: s, expression: {sql: s}}]}\n  - {name: b, source: u, fields: [{name: y, expression: {sql: y}}]}\nmetrics:\n  - {name: m, expression: {sql: \"SUM(a.x) FILTER (WHERE b.y = 1)\"}}\n",
-            "FILTER (WHERE",
         ),
     ];
     for (body, want) in cases {
@@ -188,7 +185,7 @@ fn compliance_fixtures_execute_with_expected_answers() {
     for (fixture, metric, want) in expected {
         let g = ossiec::from_yaml(&fixture_file(&format!("{fixture}.ossie.yaml"))).unwrap();
         let req = ossiec::Request {
-            metrics: vec![metric.to_string()],
+            metrics: vec![metric.to_string().into()],
             ..Default::default()
         };
         let opts = ossiec::Options {

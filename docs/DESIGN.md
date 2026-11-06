@@ -10,7 +10,7 @@ Ossie's core spec (`0.2.0.dev0`) defines a **model**: datasets, fields, relation
 |---|---|---|
 | 1 | Model and expression language | Read in full |
 | 2 | SQL with `AGG(measure)` (draft, `relational_semantics.md`) | Appendix A.1; A.4 (multi-fact measures sharing dimensions and `AGG` arithmetic in the select list); A.5 (consumer joins, including unused many→one and reverse fan-out with G2 via `PkDedup`); A.6 (`INNER`/`LEFT`) and §7.6 (`RIGHT`/`FULL`/`CROSS`: the join is emitted as written, and a non-duplicate-insensitive measure is primary-key de-duplicated so null-extension and Cartesian products do not inflate it). A.2 (derived table joined into an `AGG` stage) and A.3 (outer `AVG`/`SUM`/`COUNT`/`MIN`/`MAX` over derived tables), as one recursive compile. §7.7 unevaluated-measure pass-through and query-local `TO MEASURE` (an ad-hoc `AGG()` composition, or a base `SUM|COUNT|AVG|MIN|MAX(...)`, in a derived table, consumed by an outer `AGG`). Role-playing dimensions (`relationship.field`) and `includeUnmatched` (an `Options` flag or `-- ossiec: includeUnmatched`), including derived joins that attach inside the unmatched subtree. A.7 `CREATE VIEW` measure relations in a session `Layer2Catalog` (`define_layer2_view` / `compile_sql_with`); `persist_layer2_view` / `persist-view` writes `TO MEASURE` items into the model YAML. `compile_sql` / `compile-sql` (aliases: `compile_layer2` / `compile-l2`); `layer2_to_request` exposes leaf measures of flat queries only (nested SQL is `Unsupported` there). |
-| 3 | Wide table: metrics + dimensions + filter in, joins resolved (draft, `wide_table_semantics.md`) | **Basis of ossiec's request format**, which predates the merged spec and does not conform yet (see "Not yet") |
+| 3 | Wide table: metrics + dimensions + filter in, joins resolved (draft, `wide_table_semantics.md`) | Branches per home dataset, the `filter` expression, and every §8 rejection and its order (`wide_table.rs`), with ossiec's own explicit properties on top (§9). Aliases and output names (§3.3): Layer 3 names columns by alias or final part, while Layer 2 keeps full references unless the query aliases them. |
 
 The planner follows the same guarantee Layer 2 states (spec §8.3, "G2"): **a measure is aggregated over its own source rows, never over rows a join duplicated.**
 
@@ -25,7 +25,7 @@ YAML ──load──► Model ──bind──► SemanticGraph ──plan(Requ
 |---|---|---|
 | `load` | text → serde `Model`. Unknown keys are ignored. Pre-0.2 and ontology documents are rejected. | `Error::Load` |
 | `bind` | `Model` → `SemanticGraph`. Every expression is parsed and every name resolved; all problems are reported together. | `Error::InvalidModel` |
-| `plan` | request → `LogicalPlan`. All semantic decisions are made here. | `Error::Request`, `Error::Unsupported` |
+| `plan` | request → `LogicalPlan`. All semantic decisions are made here. A Layer 3 request first passes `wide_table::check`, §8 in order. | `Error::Query` (Layer 3, with its code), `Error::Request` (Layer 2), `Error::Unsupported` |
 | `lower` | plan → polyglot AST. Mechanical. | — |
 | `render` | AST → SQL in the source dialect, then transpiled to the target by polyglot | `Error::Unsupported` |
 
@@ -44,32 +44,44 @@ YAML ──load──► Model ──bind──► SemanticGraph ──plan(Requ
 
 Relationships go from the many side (`from`) to the one side (`to`). Following them in that direction never multiplies rows of the dataset you start from.
 
-A Layer 3 request with measures usually has several roots: one branch per home dataset (see "Legs"). The rules below pick the root of each tree. A Layer 2 query has one tree, from its own joins.
+A Layer 3 request with measures has one root per home dataset (see "Legs"), and one without measures roots at its anchor. The rules below pick the root in Layer 2, whose query has one tree from its own joins, or one per independent fact.
 
-Requests name **nodes**: a dataset, or a dataset playing a role (`customer_first_sales.d_year` is `date_dim` reached through the `customer_first_sales` relationship). Each node gets its own alias (`date_dim`, `date_dim__customer_first_sales`), so one request can use several roles at once.
+Requests name **nodes**: a dataset, or a dataset playing a role (`sale_date.year` is `dates` reached through the `sale_date` relationship). Each node gets its own alias (`dates`, `dates__sale_date`), so one request can use several roles at once.
 
 1. `R` = every node referenced by the requested dimensions, filters and metric terms. A role node needs its relationship's source.
 2. Candidates = datasets from which every member of `R` is reachable along many→one edges.
 3. Root = the candidate inside `R`. If there is none (for example, a one-side metric grouped by another dimension), it's the deepest candidate outside `R`: the one every other candidate reaches.
-4. A plain dataset reachable more than one way takes the **unique shortest path** (from `store_sales`, `date_dim` is the one-hop sale date, not a customer date two hops away). A tie is refused with the relationship names, so the caller can name the role.
+4. A plain dataset reachable more than one way takes the **unique shortest path** in Layer 2. A tie is refused with the relationship names, so the caller can name the role. Layer 3 refuses any second path with `E_AMBIGUOUS_PATH` (§4).
 5. Joins are `LEFT JOIN`s from the root, so adding a dimension never drops fact rows with a NULL or dangling key; they land in the NULL group.
 
 ### Legs: home datasets and independent facts
 
-In a Layer 3 request where each term reads one dataset and that dataset reaches every dimension and filter, each term is evaluated over its home dataset's rows (wide table §5.2, §5.4): `SUM(orders.amount) / COUNT(DISTINCT customers.id)` counts customers with no orders too. Layer 2 never does this: its joins decide the rows, and a measure must not add groups (relational semantics §8.4; wide table §6.1).
+A Layer 3 term is evaluated over its home dataset's rows (wide table §5.2, §5.4): `SUM(orders.amount) / COUNT(DISTINCT customers.id)` counts customers with no orders too. Terms with the same home share a **leg**, joined to every dimension and filter along the one path `wide_table::check` has confirmed. The root is the home even when relationships run both ways. Layer 2 never does this: its joins decide the rows, and a measure must not add groups (relational semantics §8.4; wide table §6.1).
 
-Otherwise, when no dataset reaches all of `R` but the request has measures, each term gets the join tree for its own datasets plus every dimension and filter. Terms whose trees share a root share a **leg**. Each leg contributes its own base part (and its terms' de-duplicated parts), and all parts are stacked as usual, so groups are the union across facts and a metric can combine terms from different legs (`SUM(web) / SUM(store)`). Dimensions or filters several facts could link, with no measure to choose, are refused as ambiguous.
+With `deferredMetrics`, a term reading several datasets has as its home the one that reaches the others, and its leg also joins what the term reads.
+
+In Layer 2, when no dataset reaches all of `R` but the query has measures, each term gets the join tree for its own datasets plus every dimension and filter, and terms whose trees share a root share a leg. Dimensions or filters several facts could link, with no measure to choose, are refused as ambiguous.
+
+Either way, each leg contributes its own base part (and in Layer 2 its terms' de-duplicated parts), and all parts are stacked as usual, so groups are the union across legs and a metric can combine terms from different ones (`SUM(web) / SUM(store)`).
+
+### Layer 3 rejections
+
+`wide_table::check` runs §8's rows in order before planning, since the first that holds decides the code. A metric's rejections (rows 10 to 12) are computed by `metric_rejections`, per metric and at the query, because §5.2 rejects a query naming the metric, not the model: `bind` only marks such a metric not queryable. Names that don't resolve are still an invalid model. One reading of the spec: **row 10 doesn't count a window's own clauses.** Read literally, `SUM(orders.amount) OVER (ORDER BY orders.order_date)` has a field outside every aggregate, but §5.2 gives it as the example of `E_DEFERRED_WINDOWED_METRIC`.
+
+`filter` is read as the `WHERE` clause of `SELECT 1 WHERE …`, and anything but that clause coming out is `E_INVALID_QUERY`. polyglot can't parse `((a)) AND b` as a bare expression, and a role's output name is its final part like any other, so one field in two roles needs aliases.
+
+Properties §9 allows because a query asks for them: `relationship.field`, `filters` entries across datasets (each must still be reachable from every metric), `deferredMetrics`, `timeGrain`, `metricFilters`, `orderBy` and `limit`.
 
 ### Dimension-only requests
 
-A request with dimensions but no metrics lists their distinct values: one part with no terms, `SELECT dims … GROUP BY dims`. The join-root rule decides what that means. One dataset roots at itself, so it lists all of that dataset's values. Dimensions spread over several datasets root at the fact joining them, so only combinations that occur are listed.
+A request with dimensions but no metrics lists their distinct values: one part with no terms, `SELECT dims … GROUP BY dims`. In Layer 3 it roots at the anchor (§5.6), a dimension's dataset that reaches the others, so one dataset lists all its values and several list the combinations the anchor links. In Layer 2 the join-root rule decides.
 
 ### Term strategies
 
 | Strategy | When | Why it's correct |
 |---|---|---|
 | `Inline` | The term reads the root dataset, or is duplicate-insensitive (`MIN`, `MAX`, `COUNT(DISTINCT …)`, `APPROX_COUNT_DISTINCT`, `ANY_VALUE`) | Each root row appears once after many→one joins, and duplicates can't change a distinct-insensitive aggregate |
-| `PkDedup` | The term reads only one-side datasets (`SUM(store.employees)` over a `store_sales` root) | Joined rows repeat one-side values; the term is evaluated over `SELECT DISTINCT dims, <primary key>, <inputs>`, which is spec §9's reference strategy |
+| `PkDedup` (Layer 2 only) | The term reads only one-side datasets (`SUM(store.employees)` over a `store_sales` root) | Joined rows repeat one-side values; the term is evaluated over `SELECT DISTINCT dims, <primary key>, <inputs>`, which is spec §9's reference strategy |
 
 `PkDedup` needs a `primary_key` on the term's grain dataset (the term's dataset that reaches its others). Without one the request is refused. It always adds a `FAN_TRAP_RISK` warning: a one-side row in several groups counts in each, so the groups don't sum to a grand total.
 
@@ -176,8 +188,7 @@ Rules apply only when a target is given. Callers that translate downstream set n
 
 | Feature | Shape it will take |
 |---|---|
-| Layer 3 conformance (`wide_table_semantics.md`) | Each aggregate reads its home dataset in its own branch (§5.2, §5.4). Known gaps: a request §5.3 rejects, or an aggregate reading several datasets, is answered over one join tree instead of being refused; the shortest path is taken where the spec requires `E_AMBIGUOUS_PATH` (§4); no spec error codes (§8); no `filter` expression, aliases or short output names (§3). |
-| Layer 2 operators (§7) | Refused today: `HAVING`, CTEs, `DISTINCT` and set operators over fields, `ROLLUP`, `GROUP BY ALL`, plain aggregates beside `AGG`, and `WHERE` beyond column comparisons joined by `AND`. |
+| Layer 2 operators (§7) | Refused today: `HAVING`, CTEs, `DISTINCT` and set operators over fields, `ROLLUP`, `GROUP BY ALL`, plain aggregates beside `AGG`, and subqueries in `WHERE`. Other `WHERE` predicates go through `Request.filter`, with each column as its `dataset.field`. |
 | Writing A.7 views into the model | Done: `persist_layer2_view` / `persist-view` / `to_yaml`. |
 | `ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, and the other non-equijoin kinds | Refused. §7.6 covers `INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS` (`CROSS` with `ON` is refused). |
 | Model-side nested aggregates (`AVG(SUM(x))`) | Not Layer 2; see "Why not `ChildAggregate`" under Layer 2 nested queries. |

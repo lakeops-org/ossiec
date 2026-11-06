@@ -69,11 +69,18 @@ pub(super) fn adapt(ast: Expression, _plan: &LogicalPlan) -> Result<Expression> 
 /// lands under segment '' instead of NULL) and `integer_ratio` (the default id
 /// `0` is counted as a customer).
 ///
+/// Its `sum`, `max` and `avg` over no rows are likewise 0 and `nan`, not the NULL
+/// the spec requires (wide table §5.2), unless `aggregate_functions_null_for_empty
+/// = 1`. `count` stays 0. Evidence: `filter_without_a_dataset`.
+///
 /// Typed `CAST(NULL AS T)` → `Nullable(T)` is left to polyglot (≥0.13.5)
 /// ([polyglot#514](https://github.com/tobilg/polyglot/issues/514)).
 pub(super) fn finish(sql: String, pretty: bool) -> Result<String> {
     let ch = DialectType::ClickHouse;
-    let settings = match sql::parse("SELECT 1 SETTINGS join_use_nulls = 1", ch) {
+    let settings = match sql::parse(
+        "SELECT 1 SETTINGS join_use_nulls = 1, aggregate_functions_null_for_empty = 1",
+        ch,
+    ) {
         Ok(Expression::Select(s)) => s.settings,
         _ => return Err(Error::Internal("settings template".into())),
     };

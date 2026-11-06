@@ -7,7 +7,7 @@ const DIMS: usize = 120;
 const ONE_SIDE_METRICS: usize = 40;
 
 /// A star: one fact joined to 120 tables, each with a key and two fields;
-/// 40 metrics on joined tables (de-duplicated when grouped by another table).
+/// 40 metrics on joined tables, each its own branch.
 fn big_model() -> String {
     let mut y = String::from("version: \"0.2.0.dev0\"\nname: big\ndatasets:\n  - name: fact\n    source: f\n    primary_key: [id]\n    fields:\n      - { name: id, expression: { sql: id } }\n      - { name: amount, expression: { sql: amount } }\n");
     for k in 0..DIMS {
@@ -50,12 +50,11 @@ fn large_model_binds_and_compiles_quickly() {
     let requests = 200;
     let t = Instant::now();
     for _ in 0..requests {
-        let dims: Vec<String> = (0..3).map(|_| format!("dim{}.label", next(DIMS))).collect();
-        let metrics = vec![
-            "total".to_string(),
-            format!("v{}", next(ONE_SIDE_METRICS)),
-            format!("v{}", next(ONE_SIDE_METRICS)),
-        ];
+        // A joined table's metric reaches only that table, so a request with one
+        // and a dimension of the same table gets a branch for each.
+        let k = next(ONE_SIDE_METRICS);
+        let dims = vec![format!("dim{k}.label").into()];
+        let metrics = vec!["total".into(), format!("v{k}").into()];
         let req = ossiec::Request {
             metrics,
             dimensions: dims,
@@ -72,7 +71,7 @@ fn large_model_binds_and_compiles_quickly() {
         .unwrap();
     }
     let per_request = t.elapsed() / requests;
-    println!("bind: {bind:?}, compile: {per_request:?} per request (121 datasets, 3 dims, 3 metrics, 1-3 stacked parts)");
+    println!("bind: {bind:?}, compile: {per_request:?} per request (121 datasets, 1 dim, 2 metrics, 2 branches)");
     // Generous ceilings for unoptimized test builds: they catch a quadratic or
     // exponential regression, not small drifts.
     assert!(bind < Duration::from_secs(5), "bind took {bind:?}");

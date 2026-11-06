@@ -1,4 +1,4 @@
--- request: {"metrics": ["brand_rank_in_store", "total_sales"], "dimensions": ["store.s_store_sk", "item.i_brand"],
+-- request: {"metrics": ["brand_rank_in_store", "total_sales"], "dimensions": ["store.s_store_sk", "item.i_brand"], "deferredMetrics": true,
             "metricFilters": [{"metric": "brand_rank_in_store", "op": "<=", "value": 3}],
             "orderBy": [{"field": "store.s_store_sk"}, {"field": "brand_rank_in_store"}]}
 -- dialect: trino (source: generic)
@@ -6,8 +6,8 @@ SELECT
   *
 FROM (
   SELECT
-    base.d0 AS "store.s_store_sk",
-    base.d1 AS "item.i_brand",
+    base.d0 AS "s_store_sk",
+    base.d1 AS "i_brand",
     RANK() OVER (PARTITION BY base.d0 ORDER BY base.t0 DESC) AS "brand_rank_in_store",
     base.t0 AS "total_sales"
   FROM (
@@ -28,5 +28,5 @@ FROM (
 WHERE
   "brand_rank_in_store" <= 3
 ORDER BY
-  "store.s_store_sk" ASC NULLS FIRST,
+  "s_store_sk" ASC NULLS FIRST,
   "brand_rank_in_store" ASC NULLS FIRST

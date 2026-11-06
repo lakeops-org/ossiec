@@ -1,7 +1,7 @@
 -- request: {"metrics": ["total_revenue"], "dimensions": ["orders.order_date"], "timeGrain": "week"}
 -- dialect: bigquery (source: generic)
 SELECT
-  base.d0 AS `orders.order_date`,
+  base.d0 AS `order_date`,
   base.t0 AS `total_revenue`
 FROM (
   SELECT

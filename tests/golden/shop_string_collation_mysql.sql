@@ -2,7 +2,7 @@
             "filters": [{"field": "customers.region", "op": "IN", "values": ["EU", "US"]}]}
 -- dialect: mysql (source: generic)
 SELECT
-  base.d0 AS `customers.segment`,
+  base.d0 AS `segment`,
   base.t0 AS `total_revenue`
 FROM (
   SELECT

@@ -40,6 +40,7 @@ enum Reference {
 struct Case {
     name: &'static str,
     model: &'static str,
+    /// A JSON request (Layer 3) or AGG SQL (Layer 2).
     request: &'static str,
     reference: Reference,
 }
@@ -57,46 +58,44 @@ const CASES: &[Case] = &[
         ),
     },
     Case {
-        name: "ossie_customer_lifetime_value_by_year",
+        // Two branches: sales by their customer's first name, and every customer,
+        // including one with no sales. A sale with no customer is a NULL group.
+        name: "ossie_customer_lifetime_value_by_first_name",
         model: OSSIE,
-        request: r#"{"metrics": ["customer_lifetime_value"], "dimensions": ["date_dim.d_year"],
-            "filters": [{"field": "date_dim.d_year", "op": "IN", "values": [1999, 2000, 2001]}]}"#,
+        request: r#"{"metrics": ["customer_lifetime_value"], "dimensions": ["customer.c_first_name"]}"#,
         reference: Reference::Sql(
-            "SELECT d.d_year, SUM(ss.ss_ext_sales_price) / COUNT(DISTINCT c.c_customer_sk)
-             FROM store_sales ss
-             LEFT JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
-             LEFT JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk
-             WHERE d.d_year IN (1999, 2000, 2001)
-             GROUP BY d.d_year",
+            "WITH s AS (
+               SELECT c.c_first_name AS k, SUM(ss.ss_ext_sales_price) AS v
+               FROM store_sales ss LEFT JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk
+               GROUP BY c.c_first_name
+             ), n AS (SELECT c_first_name AS k, COUNT(DISTINCT c_customer_sk) AS v FROM customer GROUP BY c_first_name),
+             g AS (SELECT k FROM s UNION SELECT k FROM n)
+             SELECT g.k, CAST(s.v AS DOUBLE) / NULLIF(n.v, 0) FROM g
+             LEFT JOIN s ON COALESCE(g.k, '~') = COALESCE(s.k, '~')
+             LEFT JOIN n ON COALESCE(g.k, '~') = COALESCE(n.k, '~')",
         ),
     },
     Case {
-        // Employees live on store: counted once per (category, store), not once per sale.
-        name: "ossie_store_productivity_by_category",
+        // Employees live on store: read from store, not once per sale.
+        name: "ossie_store_productivity_by_state",
         model: OSSIE,
-        request: r#"{"metrics": ["store_productivity", "total_sales"], "dimensions": ["item.i_category"]}"#,
+        request: r#"{"metrics": ["store_productivity", "total_sales"], "dimensions": ["store.s_state"]}"#,
         reference: Reference::Sql(
             "WITH sales AS (
-               SELECT i.i_category AS cat, SUM(ss.ss_ext_sales_price) AS s
-               FROM store_sales ss LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk
-               GROUP BY i.i_category
-             ), staff AS (
-               SELECT cat, SUM(emp) AS e FROM (
-                 SELECT DISTINCT i.i_category AS cat, st.s_store_sk, st.s_number_employees AS emp
-                 FROM store_sales ss
-                 LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk
-                 LEFT JOIN store st ON ss.ss_store_sk = st.s_store_sk
-                 WHERE st.s_store_sk IS NOT NULL
-               ) AS per_store GROUP BY cat
-             )
-             SELECT sales.cat, sales.s / NULLIF(staff.e, 0), sales.s
-             FROM sales LEFT JOIN staff ON COALESCE(sales.cat, '~') = COALESCE(staff.cat, '~')",
+               SELECT st.s_state AS k, SUM(ss.ss_ext_sales_price) AS s
+               FROM store_sales ss LEFT JOIN store st ON ss.ss_store_sk = st.s_store_sk
+               GROUP BY st.s_state
+             ), staff AS (SELECT s_state AS k, SUM(s_number_employees) AS e FROM store GROUP BY s_state),
+             g AS (SELECT k FROM sales UNION SELECT k FROM staff)
+             SELECT g.k, CAST(sales.s AS DOUBLE) / NULLIF(staff.e, 0), sales.s FROM g
+             LEFT JOIN sales ON COALESCE(g.k, '~') = COALESCE(sales.k, '~')
+             LEFT JOIN staff ON COALESCE(g.k, '~') = COALESCE(staff.k, '~')",
         ),
     },
     Case {
         name: "ossie_cumulative_sales_november_2000",
         model: OSSIE,
-        request: r#"{"metrics": ["total_sales", "cumulative_sales"], "dimensions": ["date_dim.d_date"],
+        request: r#"{"metrics": ["total_sales", "cumulative_sales"], "dimensions": ["date_dim.d_date"], "deferredMetrics": true,
             "filters": [{"field": "date_dim.d_year", "op": "=", "value": 2000}, {"field": "date_dim.d_moy", "op": "=", "value": 11}],
             "orderBy": [{"field": "date_dim.d_date"}]}"#,
         reference: Reference::Sql(
@@ -111,7 +110,7 @@ const CASES: &[Case] = &[
     Case {
         name: "ossie_top3_brands_per_store",
         model: OSSIE,
-        request: r#"{"metrics": ["brand_rank_in_store", "total_sales"], "dimensions": ["store.s_store_sk", "item.i_brand"],
+        request: r#"{"metrics": ["brand_rank_in_store", "total_sales"], "dimensions": ["store.s_store_sk", "item.i_brand"], "deferredMetrics": true,
             "metricFilters": [{"metric": "brand_rank_in_store", "op": "<=", "value": 3}]}"#,
         reference: Reference::Sql(
             "SELECT * FROM (
@@ -128,7 +127,7 @@ const CASES: &[Case] = &[
     Case {
         name: "ossie_monthly_sales_change",
         model: OSSIE,
-        request: r#"{"metrics": ["monthly_sales_change"], "dimensions": ["date_dim.d_year", "date_dim.d_moy"],
+        request: r#"{"metrics": ["monthly_sales_change"], "dimensions": ["date_dim.d_year", "date_dim.d_moy"], "deferredMetrics": true,
             "filters": [{"field": "date_dim.d_year", "op": "IN", "values": [1999, 2000]}],
             "orderBy": [{"field": "date_dim.d_year"}, {"field": "date_dim.d_moy"}]}"#,
         reference: Reference::Sql(
@@ -164,9 +163,10 @@ const CASES: &[Case] = &[
     Case {
         name: "ossie_dimension_combinations",
         model: OSSIE,
-        request: r#"{"dimensions": ["store.s_state", "item.i_category"]}"#,
+        // The anchor is store_sales, which reaches the other two.
+        request: r#"{"dimensions": ["store_sales.ss_quantity", "store.s_state", "item.i_category"]}"#,
         reference: Reference::Sql(
-            "SELECT DISTINCT st.s_state, i.i_category
+            "SELECT DISTINCT ss.ss_quantity, st.s_state, i.i_category
              FROM store_sales ss
              LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk
              LEFT JOIN store st ON ss.ss_store_sk = st.s_store_sk",
@@ -189,10 +189,14 @@ const CASES: &[Case] = &[
         ),
     },
     Case {
-        // A measure two hops away: each address counts once per category.
+        // Layer 2: a measure two hops away, each address counted once per category.
         name: "two_hop_deduplicated_measure",
         model: SWEEP,
-        request: r#"{"metrics": ["address_gmt_total"], "dimensions": ["item.i_category"]}"#,
+        request: "SELECT i.i_category, AGG(ca.gmt_total) FROM store_sales ss \
+            LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk \
+            LEFT JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk \
+            LEFT JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk \
+            GROUP BY i.i_category",
         reference: Reference::Sql(
             "SELECT g.cat, s.v
              FROM (SELECT DISTINCT i.i_category AS cat FROM store_sales ss LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk) AS g
@@ -223,9 +227,8 @@ const CASES: &[Case] = &[
         ),
     },
     Case {
-        // Rooted at store_returns, sales are a one-side measure: de-duplicated on
-        // store_sales' composite primary key (item, ticket).
-        name: "composite_primary_key_dedup",
+        // Two branches: a composite-key path from store_returns, and sales' own rows.
+        name: "branch_over_a_composite_key",
         model: SWEEP,
         request: r#"{"metrics": ["returned_amount", "total_sales"], "dimensions": ["item.i_category"]}"#,
         reference: Reference::Sql(
@@ -245,7 +248,7 @@ const CASES: &[Case] = &[
     },
     // ---- Role-playing dimensions ----
     Case {
-        // `customer_first_sales.d_year`: date_dim reached through the customer's
+        // `customer_first_sales.d_year`: the date reached through the customer's
         // first-sale relationship, not the sale's own date.
         name: "role_dimension",
         model: SWEEP,
@@ -262,11 +265,11 @@ const CASES: &[Case] = &[
         ),
     },
     Case {
-        // Three date_dim roles in one request: the sale date (shortest path, by
-        // default), the first-sale date and the first-ship-to date.
+        // Three dates in one request: the sale date, the first-sale date and the
+        // first-ship-to date.
         name: "three_date_roles_at_once",
         model: SWEEP,
-        request: r#"{"metrics": ["total_sales"], "dimensions": ["customer_first_sales.d_year", "customer_first_shipto.d_year"],
+        request: r#"{"metrics": ["total_sales"], "dimensions": [{"field": "customer_first_sales.d_year", "alias": "first_sale_year"}, {"field": "customer_first_shipto.d_year", "alias": "first_shipto_year"}],
             "filters": [{"field": "date_dim.d_year", "op": "=", "value": 2000}, {"field": "customer_first_sales.d_year", "op": ">=", "value": 2000}]}"#,
         reference: Reference::Sql(
             "SELECT fs.d_year AS first_sales, fsh.d_year AS first_shipto, SUM(ss.ss_ext_sales_price)
@@ -324,14 +327,16 @@ const CASES: &[Case] = &[
              LEFT JOIN w ON COALESCE(g.cat, '~') = COALESCE(w.cat, '~')",
         ),
     },
-    // ---- Parents without children (includeUnmatched) ----
+    // ---- Parents without children (Layer 2's includeUnmatched) ----
     Case {
         // Items no store sale reaches join the NULL-year group with their price.
         name: "unmatched_items_included",
         model: SWEEP,
-        // With only an item measure, which fact links items to years would be
-        // ambiguous (store, web, returns); the store count names store_sales.
-        request: r#"{"metrics": ["item_price_total", "store_sales.sales_count"], "dimensions": ["date_dim.d_year"], "includeUnmatched": true}"#,
+        request: "-- ossiec: includeUnmatched\n\
+            SELECT d.d_year, AGG(i.price_total), AGG(ss.sales_count) FROM store_sales ss \
+            LEFT JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk \
+            LEFT JOIN item i ON ss.ss_item_sk = i.i_item_sk \
+            GROUP BY d.d_year",
         reference: Reference::Sql(
             "WITH matched AS (
                SELECT DISTINCT d.d_year AS y, i.i_item_sk, i.i_current_price AS p
@@ -401,7 +406,7 @@ const CASES: &[Case] = &[
         // OR-of-AND filter groups live in the metric CASE; year is a request filter.
         name: "q48",
         model: SWEEP,
-        request: r#"{"metrics": ["q48_quantity"],
+        request: r#"{"metrics": ["q48_quantity"], "deferredMetrics": true,
             "filters": [{"field": "date_dim.d_year", "op": "=", "value": 2000}]}"#,
         reference: Reference::Official(48),
     },
@@ -438,7 +443,7 @@ const CASES: &[Case] = &[
     Case {
         name: "q98",
         model: SWEEP,
-        request: r#"{"metrics": ["total_sales", "revenue_ratio"],
+        request: r#"{"metrics": ["total_sales", "revenue_ratio"], "deferredMetrics": true,
             "dimensions": ["item.i_item_id", "item.i_item_desc", "item.i_category", "item.i_class", "item.i_current_price"],
             "filters": [{"field": "item.i_category", "op": "IN", "values": ["Sports", "Books", "Home"]},
                         {"field": "date_dim.d_date", "op": "BETWEEN", "values": ["1999-02-22", "1999-03-24"]}],
@@ -450,7 +455,7 @@ const CASES: &[Case] = &[
     Case {
         name: "q12",
         model: SWEEP,
-        request: r#"{"metrics": ["web_sales_total", "web_revenue_ratio"],
+        request: r#"{"metrics": ["web_sales_total", "web_revenue_ratio"], "deferredMetrics": true,
             "dimensions": ["item.i_item_id", "item.i_item_desc", "item.i_category", "item.i_class", "item.i_current_price"],
             "filters": [{"field": "item.i_category", "op": "IN", "values": ["Sports", "Books", "Home"]},
                         {"field": "date_dim.d_date", "op": "BETWEEN", "values": ["1999-02-22", "1999-03-24"]}],
@@ -464,7 +469,7 @@ const CASES: &[Case] = &[
     Case {
         name: "q43",
         model: SWEEP,
-        request: r#"{"metrics": ["sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"],
+        request: r#"{"metrics": ["sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"], "deferredMetrics": true,
             "dimensions": ["store.s_store_name", "store.s_store_id"],
             "filters": [{"field": "store.s_gmt_offset", "op": "=", "value": -5}, {"field": "date_dim.d_year", "op": "=", "value": 2000}],
             "orderBy": [{"field": "store.s_store_name"}, {"field": "store.s_store_id"}, {"field": "sun_sales"}, {"field": "mon_sales"},
@@ -697,17 +702,33 @@ fn duckdb_null_order(sql: &str, engine: Engine) -> String {
     polyglot_sql::generate(&ast, DialectType::DuckDB).unwrap()
 }
 
+/// Compile a case. Rows have a fixed order when its request has an `orderBy`.
+fn compile_case(
+    graph: &ossiec::SemanticGraph,
+    c: &Case,
+    opts: &ossiec::Options,
+) -> ossiec::Result<(ossiec::Compiled, bool)> {
+    if c.request.starts_with('{') {
+        let req: ossiec::Request = serde_json::from_str(c.request).unwrap();
+        Ok((
+            ossiec::compile(graph, &req, opts)?,
+            !req.order_by.is_empty(),
+        ))
+    } else {
+        Ok((ossiec::compile_sql(graph, c.request, opts)?, false))
+    }
+}
+
 fn sweep(engine: Engine) {
     let duck = duckdb_tpcds();
     load(engine, &duck);
     let mut failures = vec![];
     for c in CASES {
-        let req: ossiec::Request = serde_json::from_str(c.request).unwrap();
         let opts = ossiec::Options {
             target: Some(engine.dialect()),
             ..Default::default()
         };
-        let compiled = match ossiec::compile(&graph_for(c.model, engine), &req, &opts) {
+        let (compiled, ordered) = match compile_case(&graph_for(c.model, engine), c, &opts) {
             Ok(c) => c,
             Err(e) => {
                 failures.push(format!("{}: compile: {e}", c.name));
@@ -759,7 +780,7 @@ fn sweep(engine: Engine) {
                 }
             }
         };
-        let (got, want) = if req.order_by.is_empty() {
+        let (got, want) = if !ordered {
             let (mut g, mut w) = (got, want);
             g.sort();
             w.sort();
@@ -835,12 +856,11 @@ fn trino_sf1_performance() {
     let mut slow = vec![];
     for c in CASES {
         let graph = ossiec::from_yaml(&c.model.replace("tpcds.public.", "tpcds.sf1.")).unwrap();
-        let req: ossiec::Request = serde_json::from_str(c.request).unwrap();
         let opts = ossiec::Options {
             target: Some(ossiec::DialectType::Trino),
             ..Default::default()
         };
-        let sql = ossiec::compile(&graph, &req, &opts).unwrap().sql;
+        let sql = compile_case(&graph, c, &opts).unwrap().0.sql;
         let reference = match &c.reference {
             Reference::Sql(s) => s.to_string(),
             Reference::Official(n) => official(&duck, *n),

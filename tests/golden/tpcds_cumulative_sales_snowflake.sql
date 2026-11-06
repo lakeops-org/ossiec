@@ -1,7 +1,7 @@
--- request: {"metrics": ["cumulative_sales", "total_sales"], "dimensions": ["date_dim.d_date"], "orderBy": [{"field": "date_dim.d_date"}]}
+-- request: {"metrics": ["cumulative_sales", "total_sales"], "dimensions": ["date_dim.d_date"], "deferredMetrics": true, "orderBy": [{"field": "date_dim.d_date"}]}
 -- dialect: snowflake (source: generic)
 SELECT
-  base.d0 AS "date_dim.d_date",
+  base.d0 AS "d_date",
   SUM(base.t0) OVER (ORDER BY base.d0 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cumulative_sales",
   base.t0 AS "total_sales"
 FROM (
@@ -15,4 +15,4 @@ FROM (
     "date_dim".d_date
 ) AS base
 ORDER BY
-  "date_dim.d_date" ASC NULLS FIRST
+  "d_date" ASC NULLS FIRST

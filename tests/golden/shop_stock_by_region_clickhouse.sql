@@ -1,10 +1,10 @@
--- request: {"metrics": ["total_stock", "total_revenue"], "dimensions": ["customers.region"]}
+-- request: SELECT c.region, AGG(p.stock_units), AGG(o.gross_revenue) FROM orders o LEFT JOIN customers c ON o.customer_id = c.id LEFT JOIN products p ON o.product_id = p.id GROUP BY c.region
 -- dialect: clickhouse (source: generic)
 -- warning: FAN_TRAP_RISK: `SUM("products".stock)` is computed over `products` rows de-duplicated by primary key; a `products` row that belongs to several groups counts in each, so groups do not add up to a grand total
 SELECT
   stacked.d0 AS "customers.region",
-  MAX(stacked.t0) AS "total_stock",
-  MAX(stacked.t1) AS "total_revenue"
+  MAX(stacked.t0) AS "products.stock_units",
+  MAX(stacked.t1) AS "orders.gross_revenue"
 FROM (
   SELECT
     "customers".region AS d0,
@@ -54,4 +54,4 @@ FROM (
 ) AS stacked
 GROUP BY
   stacked.d0
-SETTINGS join_use_nulls = 1
+SETTINGS join_use_nulls = 1, aggregate_functions_null_for_empty = 1
