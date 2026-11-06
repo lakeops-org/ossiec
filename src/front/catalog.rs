@@ -136,7 +136,8 @@ pub fn define_layer2_view(
             "Layer 2 CREATE VIEW body must be a single SELECT",
         ));
     };
-    let select = *sel;
+    let mut select = *sel;
+    super::cte::expand(&mut select)?;
     let mut expanded = select.clone();
     let mut expanded_measures = to_measures.clone();
     expand_query(catalog, &mut expanded, &mut expanded_measures, Some(&name))?;

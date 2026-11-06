@@ -26,7 +26,7 @@
 //! evaluates no `AGG()`, so it needs no such rule.
 
 use polyglot_sql::expressions::Select;
-use polyglot_sql::{generate, DialectType, Expression};
+use polyglot_sql::{generate, DialectType, Expression, ExpressionWalk};
 
 use super::catalog::{self, Layer2Catalog};
 use super::{
@@ -252,7 +252,14 @@ fn classify(sel: &Select) -> Result<Kind> {
         .map(|e| super::as_derived(e).map(|d| d.is_some()))
         .collect::<Result<_>>()?;
     match derived.as_slice() {
-        [true] if sel.joins.is_empty() && sel.expressions.iter().any(super::fold::has_agg) => {
+        [true]
+            if sel.joins.is_empty()
+                && (sel.expressions.iter().any(super::fold::has_agg)
+                    || sel
+                        .having
+                        .as_ref()
+                        .is_some_and(|h| h.this.contains(super::is_measure_agg_expr))) =>
+        {
             Ok(Kind::Fold)
         }
         [true] => Ok(Kind::Shell),
@@ -378,7 +385,7 @@ impl Compiler<'_> {
                 parsed.request.ensure_datasets.push(spec.attach_ds);
             }
         }
-        if depth == 0 && parsed.derived.is_empty() {
+        if depth == 0 && parsed.derived.is_empty() && parsed.having.is_none() {
             self.flat_request = Some(parsed.request.clone());
         }
         let graph = &self.graph;
@@ -489,7 +496,13 @@ impl Compiler<'_> {
             }
         }
         protect_inflating_joins(graph, &mut logical, &mut self.ctx)?;
-        apply_select_formulas(graph, &mut logical, &parsed.measure_outputs)?;
+        super::apply_having(&mut logical, parsed.having.as_ref())?;
+        apply_select_formulas(
+            graph,
+            &mut logical,
+            &parsed.measure_outputs,
+            parsed.having.is_some(),
+        )?;
         rename_consumer_outputs(&mut logical, &parsed.measure_outputs, &parsed.dim_labels);
 
         let mut outputs: Vec<OutCol> = logical
