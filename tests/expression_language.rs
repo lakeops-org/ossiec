@@ -11,184 +11,64 @@ mod common;
 use common::{duckdb_rows, norm_text, run, Engine};
 use ossiec::{Options, Request};
 
-/// What each engine can't do yet. Every entry fails or errors today; a wrong answer
-/// here is a bug to fix, not a difference to accept.
+/// What each engine can't do. Each is a clear refusal or an engine's error: the test
+/// fails on a wrong answer, and when an entry starts to work.
 fn gaps(e: Engine) -> &'static [&'static str] {
     match e {
-        Engine::DuckDb => &[
-            "ts < CURRENT_TIMESTAMP()",
-            "CURRENT_TIME() IS NOT NULL",
-            "HOUR(TO_TIMESTAMP(tsstr))",
-            "HOUR(TO_TIMESTAMP(tsstr, 'YYYY-MM-DD HH24:MI:SS'))",
-            "TO_CHAR(d, 'YYYY-MM-DD')",
-            "TO_CHAR(ts, 'HH24:MI:SS')",
-            "TO_CHAR(ts, 'YY')",
-            "REGEXP_EXTRACT(s, 'l+')",
-            "REGEXP_REPLACE(s, 'l', 'L')",
-            "REGEXP_COUNT(s, 'l')",
-            "APPROX_PERCENTILE(v, 0.5) BETWEEN 1 AND 4",
-            "SUM(YEAR(DATEADD(day, 1, DATE '2024-01-01'))) FILTER (WHERE g = 'a')",
-        ],
+        Engine::DuckDb => &[],
         Engine::Postgres => &[
-            "d < CURRENT_DATE()",
-            "ts < CURRENT_TIMESTAMP()",
-            "CURRENT_TIME() IS NOT NULL",
-            "YEAR(d)",
-            "QUARTER(d)",
-            "MONTH(d)",
-            "DAY(d)",
-            "DAYOFYEAR(d)",
-            "HOUR(ts)",
-            "MINUTE(ts)",
-            "SECOND(ts)",
-            "DATE_PART('dayofweek', d)",
-            "DATE_PART('dayofyear', d)",
-            "HOUR(DATE_TRUNC('hour', ts))",
-            "MINUTE(DATE_TRUNC('hour', ts))",
-            "MINUTE(DATE_TRUNC('minute', ts))",
-            "SECOND(DATE_TRUNC('minute', ts))",
-            "SECOND(DATE_TRUNC('second', ts))",
-            "DATEDIFF(month, DATE '2024-01-31', DATE '2024-02-01')",
-            "DATEDIFF(year, DATE '2024-12-31', DATE '2025-01-01')",
-            "YEAR(DATE '2024-01-15')",
-            "HOUR(TIMESTAMP_NTZ '2024-01-15 10:30:00')",
-            "HOUR(CAST('2024-01-15 10:30:00' AS TIMESTAMP_NTZ))",
-            "HOUR(CAST(tsstr AS TIMESTAMP_NTZ))",
-            "TO_DATE(datestr)",
-            "HOUR(TO_TIMESTAMP(tsstr))",
-            "HOUR(TO_TIMESTAMP(tsstr, 'YYYY-MM-DD HH24:MI:SS'))",
-            "CONTAINS(s, 'ell')",
-            "CONTAINS(s, 'zzz')",
-            "ENDSWITH(s, 'lo')",
-            "ENDSWITH(s, 'He')",
-            "REGEXP_EXTRACT(s, 'l+')",
-            "REGEXP_REPLACE(s, 'l', 'L')",
-            "ROUND(pi, 2)",
-            "TRUNC(pi, 2)",
-            "TRUNCATE(pi, 2)",
-            "ZEROIFNULL(nul)",
-            "ZEROIFNULL(i)",
-            "NULLIFZERO(z)",
-            "NULLIFZERO(i)",
-            "HOUR(CAST(tsstr AS TIMESTAMP))",
+            "TRY_CAST('12' AS INT)",
             "TRY_CAST(s AS INT)",
-            "MEDIAN(v)",
-            "APPROX_COUNT_DISTINCT(v)",
-            "APPROX_PERCENTILE(v, 0.5) BETWEEN 1 AND 4",
-            "MEDIAN(v) FILTER (WHERE g = 'a')",
-            "SUM(YEAR(DATEADD(day, 1, DATE '2024-01-01'))) FILTER (WHERE g = 'a')",
-            "APPROX_COUNT_DISTINCT(v) FILTER (WHERE g = 'a')",
         ],
         Engine::MySql => &[
-            "s LIKE 'he%'",
-            "EXTRACT(WEEK FROM d)",
-            "EXTRACT(DAYOFWEEK FROM d)",
-            "EXTRACT(DAYOFYEAR FROM d)",
-            "EXTRACT(MILLISECOND FROM ts)",
-            "DATE_PART('year', d)",
-            "DATE_PART('quarter', d)",
-            "DATE_PART('month', d)",
-            "DATE_PART('week', d)",
-            "DATE_PART('day', d)",
-            "DATE_PART('dayofweek', d)",
-            "DATE_PART('dayofyear', d)",
-            "DATE_PART('hour', ts)",
-            "DATE_PART('minute', ts)",
-            "DATE_PART('second', ts)",
-            "DATE_PART('millisecond', ts)",
-            "HOUR(DATE_TRUNC('hour', ts))",
-            "MINUTE(DATE_TRUNC('hour', ts))",
-            "MINUTE(DATE_TRUNC('minute', ts))",
-            "SECOND(DATE_TRUNC('minute', ts))",
-            "SECOND(DATE_TRUNC('second', ts))",
-            "DATEDIFF(day, d, DATE '2024-04-15')",
-            "DATEDIFF(month, d, DATE '2024-05-15')",
-            "DATEDIFF(year, d, DATE '2026-03-15')",
-            "DATEDIFF(month, DATE '2024-01-31', DATE '2024-02-01')",
-            "DATEDIFF(year, DATE '2024-12-31', DATE '2025-01-01')",
-            "TO_DATE(datestr)",
-            "HOUR(TO_TIMESTAMP(tsstr))",
-            "TO_DATE(datestr, 'YYYY-MM-DD')",
-            "HOUR(TO_TIMESTAMP(tsstr, 'YYYY-MM-DD HH24:MI:SS'))",
-            "TO_CHAR(d, 'YYYY-MM-DD')",
-            "TO_CHAR(ts, 'HH24:MI:SS')",
-            "TO_CHAR(ts, 'YY')",
-            "LENGTH(uni)",
-            "SPLIT_PART(csv, ',', 2)",
-            "CHARINDEX('l', s)",
-            "CONTAINS(s, 'ell')",
-            "CONTAINS(s, 'zzz')",
-            "STARTSWITH(s, 'He')",
-            "STARTSWITH(s, 'lo')",
-            "ENDSWITH(s, 'lo')",
-            "ENDSWITH(s, 'He')",
-            "REGEXP_EXTRACT(s, 'l+')",
+            "MEDIAN(v) FILTER (WHERE g = 'b')",
+            "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
+            "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
+            "PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY v)",
+            "PERCENTILE_DISC(0.6) WITHIN GROUP (ORDER BY v)",
+            "PERCENTILE_DISC(0) WITHIN GROUP (ORDER BY v)",
+            "PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY v)",
+            "MEDIAN(v) FILTER (WHERE g = 'zzz')",
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')",
+            "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')",
+            "APPROX_PERCENTILE(v, 0.5) FILTER (WHERE g = 'zzz')",
             "REGEXP_COUNT(s, 'l')",
-            "ZEROIFNULL(nul)",
-            "ZEROIFNULL(i)",
-            "NULLIFZERO(z)",
-            "NULLIFZERO(i)",
+            "TRY_CAST('12' AS INT)",
             "TRY_CAST(s AS INT)",
             "MEDIAN(v)",
             "PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY v)",
             "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY v)",
             "PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY v)",
             "PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY v)",
-            "APPROX_COUNT_DISTINCT(v)",
             "APPROX_PERCENTILE(v, 0.5) BETWEEN 1 AND 4",
             "MEDIAN(v) FILTER (WHERE g = 'a')",
             "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
             "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'a')",
-            "SUM(YEAR(DATEADD(day, 1, DATE '2024-01-01'))) FILTER (WHERE g = 'a')",
-            "SUM(DATEDIFF(day, DATE '2024-01-01', DATE '2024-01-03'))",
-            "APPROX_COUNT_DISTINCT(v) FILTER (WHERE g = 'a')",
         ],
-        Engine::ClickHouse => &[
-            "CURRENT_TIME IS NOT NULL",
-            "CURRENT_TIME() IS NOT NULL",
-            "EXTRACT(MILLISECOND FROM ts)",
-            "DATE_PART('dayofweek', d)",
-            "DATE_PART('dayofyear', d)",
-            "DATE_PART('millisecond', ts)",
-            "TIME '10:30:00' IS NOT NULL",
-            "TO_DATE(datestr)",
-            "HOUR(TO_TIMESTAMP(tsstr))",
-            "TO_DATE(datestr, 'YYYY-MM-DD')",
-            "HOUR(TO_TIMESTAMP(tsstr, 'YYYY-MM-DD HH24:MI:SS'))",
-            "TO_CHAR(d, 'YYYY-MM-DD')",
-            "TO_CHAR(ts, 'HH24:MI:SS')",
-            "TO_CHAR(ts, 'YY')",
-            "LENGTH(uni)",
-            "SPLIT_PART(csv, ',', 2)",
-            "CHARINDEX('l', s)",
-            "CONTAINS(s, 'ell')",
-            "CONTAINS(s, 'zzz')",
-            "STARTSWITH(s, 'He')",
-            "STARTSWITH(s, 'lo')",
-            "REGEXP_LIKE(s, '^H.*o$')",
-            "REGEXP_LIKE(s, '^x')",
-            "REGEXP_COUNT(s, 'l')",
-            "LOG(j, 8)",
-            "ZEROIFNULL(nul)",
-            "ZEROIFNULL(i)",
-            "NULLIFZERO(z)",
-            "NULLIFZERO(i)",
-            "CAST(tsstr AS TIME) IS NOT NULL",
+        Engine::ClickHouse => &[],
+        Engine::Trino => &[
+            "MEDIAN(v) FILTER (WHERE g = 'b')",
+            "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
+            "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
+            "PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY v)",
+            "PERCENTILE_DISC(0.6) WITHIN GROUP (ORDER BY v)",
+            "PERCENTILE_DISC(0) WITHIN GROUP (ORDER BY v)",
+            "PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY v)",
+            "MEDIAN(v) FILTER (WHERE g = 'zzz')",
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')",
+            "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')",
             "MEDIAN(v)",
             "PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY v)",
             "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY v)",
             "PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY v)",
             "PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY v)",
-            "APPROX_COUNT_DISTINCT(v)",
-            "APPROX_PERCENTILE(v, 0.5) BETWEEN 1 AND 4",
             "MEDIAN(v) FILTER (WHERE g = 'a')",
             "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
             "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'a')",
-            "APPROX_COUNT_DISTINCT(v) FILTER (WHERE g = 'a')",
-            "CUME_DIST() OVER (ORDER BY k)",
         ],
-        // Not run yet: nothing is known about them.
-        Engine::Trino | Engine::StarRocks => &[],
+        Engine::StarRocks => &[
+            "NTH_VALUE(SUM(v), 2) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+        ],
     }
 }
 
@@ -351,6 +231,16 @@ fn probes() -> Vec<P> {
         row("DATEADD(day, 7, d)", "2024-03-22"), row("DATEADD(month, -1, d)", "2024-02-15"),
         row("DATEADD(year, 1, d)", "2025-03-15"),
         row("DATEADD(month, 1, DATE '2024-01-31')", "2024-02-29"),
+        row("DATEDIFF(quarter, d, DATE '2024-10-01')", "3"),
+        row("DATEDIFF(week, DATE '2024-03-17', DATE '2024-03-18')", "1"),
+        row("DATEDIFF(hour, TIMESTAMP '2024-03-15 13:59:00', TIMESTAMP '2024-03-15 14:00:00')", "1"),
+        row("DATEDIFF(minute, TIMESTAMP '2024-03-15 13:59:59', TIMESTAMP '2024-03-15 14:00:00')", "1"),
+        row("DATEDIFF(second, TIMESTAMP '2024-03-15 13:59:59', TIMESTAMP '2024-03-15 14:00:00')", "1"),
+        row("HOUR(DATEADD(hour, 2, ts))", "15"),
+        row("MINUTE(DATEADD(minute, 2, ts))", "47"),
+        row("SECOND(DATEADD(second, 2, ts))", "32"),
+        row("DATEADD(week, 1, d)", "2024-03-22"),
+        row("DATEADD(quarter, 1, d)", "2024-06-15"),
         row("DATEDIFF(day, d, DATE '2024-04-15')", "31"), row("DATEDIFF(month, d, DATE '2024-05-15')", "2"),
         row("DATEDIFF(year, d, DATE '2026-03-15')", "2"),
         row("DATEDIFF(month, DATE '2024-01-31', DATE '2024-02-01')", "1"),
@@ -406,9 +296,9 @@ fn probes() -> Vec<P> {
         row("CAST(f AS NUMERIC(10,2))", "2.5"), row("CAST(i AS FLOAT)", "7"), row("CAST(i AS DOUBLE)", "7"),
         row("CAST(i AS DOUBLE) / 2", "3.5"), row("CAST(z AS BOOLEAN)", "F"),
         row("CAST(datestr AS DATE)", "2024-01-15"), row("HOUR(CAST(tsstr AS TIMESTAMP))", "10"),
-        row("CAST(tsstr AS TIME) IS NOT NULL", "T"),
         row("TRY_CAST('12' AS INT)", "12"), row("TRY_CAST(s AS INT)", "NULL"),
         // Null-safe
+        row("nul IS NOT DISTINCT FROM i", "F"),
         row("nul IS NOT DISTINCT FROM nul", "T"), row("i IS DISTINCT FROM nul", "T"),
         row("i IS DISTINCT FROM 7", "F"), row("i IS NOT DISTINCT FROM 7", "T"),
         // Case-insensitive function names
@@ -420,6 +310,22 @@ fn probes() -> Vec<P> {
         agg("STDDEV(v)", "3.633180"), agg("STDDEV_POP(v)", "3.249615"), agg("STDDEV_SAMP(v)", "3.633180"),
         agg("VARIANCE(v)", "13.2"), agg("VAR_POP(v)", "10.56"), agg("VAR_SAMP(v)", "13.2"),
         agg("MEDIAN(v)", "2"),
+        // An even count interpolates, and a picked percentile takes the lower value.
+        agg("MEDIAN(v) FILTER (WHERE g = 'b')", "7"),
+        agg("PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')", "5.5"),
+        agg("PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')", "4"),
+        agg("PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY v)", "2"),
+        agg("PERCENTILE_DISC(0.6) WITHIN GROUP (ORDER BY v)", "2"),
+        agg("PERCENTILE_DISC(0) WITHIN GROUP (ORDER BY v)", "1"),
+        agg("PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY v)", "10"),
+        // Over no rows, NULL.
+        agg("MEDIAN(v) FILTER (WHERE g = 'zzz')", "NULL"),
+        agg("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')", "NULL"),
+        agg("PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')", "NULL"),
+        agg("APPROX_PERCENTILE(v, 0.5) FILTER (WHERE g = 'zzz')", "NULL"),
+        agg("APPROX_COUNT_DISTINCT(v) FILTER (WHERE g = 'zzz')", "0"),
+        agg("STDDEV(v) FILTER (WHERE g = 'zzz')", "NULL"),
+        agg("VAR_POP(v) FILTER (WHERE g = 'zzz')", "NULL"),
         agg("PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY v)", "4"),
         agg("PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY v)", "7.6"),
         agg("PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY v)", "4"),
@@ -544,6 +450,10 @@ fn probe_engine(e: Engine, db: &duckdb::Connection) -> (usize, Vec<String>) {
                 continue;
             }
         };
+        if c.sql.contains("__ossiec") || c.sql.contains("__OSSIEC") {
+            fails.push(format!("WRONG   {label}\n    internal name in {}", c.sql));
+            continue;
+        }
         let rows = match exec(e, db, &c.sql) {
             Ok(r) => r,
             Err(err) => {
@@ -583,9 +493,18 @@ fn seeded() -> duckdb::Connection {
 fn check_engine(e: Engine) {
     let db = seeded();
     if e != Engine::DuckDb {
-        run(e, &seed(e)).expect("seed (is `scripts/engines.sh up` running?)");
+        let sql = seed(e);
+        let sql = if e == Engine::Trino {
+            sql.trim_end().trim_end_matches(';').to_string()
+        } else {
+            sql
+        };
+        run(e, &sql).expect("seed (is `scripts/engines.sh up` running?)");
     }
     let (_, fails) = probe_engine(e, &db);
+    // A gap is a refusal or an engine error, never a wrong answer.
+    let wrong: Vec<&String> = fails.iter().filter(|f| f.starts_with("WRONG")).collect();
+    assert!(wrong.is_empty(), "{e:?}: wrong answers: {wrong:#?}");
     let label = |f: &String| f[8..].lines().next().unwrap().to_string();
     let known = gaps(e);
     let new: Vec<&String> = fails
@@ -627,6 +546,18 @@ fn every_construct_on_mysql() {
 #[ignore]
 fn every_construct_on_clickhouse() {
     check_engine(Engine::ClickHouse);
+}
+
+#[test]
+#[ignore]
+fn every_construct_on_trino() {
+    check_engine(Engine::Trino);
+}
+
+#[test]
+#[ignore]
+fn every_construct_on_starrocks() {
+    check_engine(Engine::StarRocks);
 }
 
 const HEAD: &str = "version: \"0.2.0.dev0\"\nname: p\n";
@@ -832,14 +763,14 @@ fn stddev_and_variance_are_the_sample_forms() {
 /// and a constant parameter is left alone.
 #[test]
 fn filter_becomes_case_on_the_input_only() {
-    use ossiec::DialectType::MySQL;
+    use ossiec::DialectType::Snowflake;
     let s = sql_for(
         &t(
             "",
             "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) FILTER (WHERE id > 1)",
         )
         .unwrap(),
-        MySQL,
+        Snowflake,
     );
     assert!(!s.contains("FILTER"), "{s}");
     assert!(
@@ -848,7 +779,7 @@ fn filter_becomes_case_on_the_input_only() {
     );
     let s = sql_for(
         &t("", "APPROX_PERCENTILE(amount, 0.5) FILTER (WHERE id > 1)").unwrap(),
-        MySQL,
+        Snowflake,
     );
     assert!(
         !s.contains("FILTER") && s.contains(", 0.5)") && !s.contains("THEN 0.5"),
@@ -1312,5 +1243,161 @@ fn stacked_percentiles_keep_their_type_on_postgres() {
         let rows =
             run(Engine::Postgres, &c.sql).unwrap_or_else(|e| panic!("{metric}: {e}\n{}", c.sql));
         assert!(same(&rows[0][3], want), "{metric}: {rows:?}");
+    }
+}
+
+fn sql_on(
+    g: &ossiec::SemanticGraph,
+    target: Option<ossiec::DialectType>,
+    prefer: Option<&str>,
+) -> Result<String, String> {
+    let opts = Options {
+        target,
+        prefer_dialect: prefer.map(str::to_string),
+        pretty: false,
+        ..Default::default()
+    };
+    let r = Request::from_json(r#"{"dimensions":["t.x"]}"#).unwrap();
+    ossiec::compile(g, &r, &opts)
+        .map(|c| c.sql)
+        .map_err(|e| e.to_string())
+}
+
+fn field(sql: &str) -> ossiec::SemanticGraph {
+    let f = format!(
+        "      - {{ name: x, expression: {{ sql: {} }} }}\n",
+        serde_json::to_string(sql).unwrap()
+    );
+    t(&f, "COUNT(*)").unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// A vendor's expression means what that vendor says, whichever engine runs it.
+#[test]
+fn a_vendor_expression_keeps_its_meaning() {
+    use ossiec::DialectType::MySQL;
+    let y = format!("{HEAD}datasets:\n  - name: t\n    source: tbl\n    primary_key: [id]\n    fields:\n      - {{ name: id, expression: {{ sql: id }} }}\n      - name: x\n        expression:\n          sql: LENGTH(a)\n          dialects:\n            - {{ dialect: MYSQL, expression: LENGTH(a) }}\n");
+    let g = ossiec::from_yaml(&y).map_err(|e| e.to_string()).unwrap();
+    // The portable form counts characters, the vendor's what MySQL's LENGTH counts.
+    assert!(sql_on(&g, Some(MySQL), None)
+        .unwrap()
+        .contains("CHAR_LENGTH("));
+    let s = sql_on(&g, Some(MySQL), Some("MYSQL")).unwrap();
+    assert!(s.contains("LENGTH(") && !s.contains("CHAR_LENGTH("), "{s}");
+}
+
+/// Without a target the statement stays in Ossie's own words, for a caller who
+/// translates downstream.
+#[test]
+fn no_target_leaves_ossies_functions_alone() {
+    let s = sql_on(&field("CONTAINS(a, 'x')"), None, None).unwrap();
+    assert!(s.contains("CONTAINS("), "{s}");
+}
+
+/// Where an engine can't give the same answer, the compile says so.
+#[test]
+fn an_engine_without_a_faithful_form_refuses() {
+    use ossiec::DialectType::{ClickHouse, DuckDB, MySQL, PostgreSQL, Trino};
+    for (sql, d) in [
+        ("TRY_CAST(a AS INT)", MySQL),
+        ("TRY_CAST(a AS INT)", PostgreSQL),
+        ("REGEXP_COUNT(a, 'x')", MySQL),
+    ] {
+        let e = sql_on(&field(sql), Some(d), None).unwrap_err();
+        assert!(
+            e.contains("no equivalent") && e.contains(&format!("{d:?}")),
+            "{sql} on {d:?}: {e}"
+        );
+    }
+    for (m, d) in [
+        ("MEDIAN(amount)", MySQL),
+        ("MEDIAN(amount)", Trino),
+        ("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)", Trino),
+        ("PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY amount)", MySQL),
+    ] {
+        let opts = Options {
+            target: Some(d),
+            ..Default::default()
+        };
+        let r = Request::from_json(r#"{"metrics":["t.m"]}"#).unwrap();
+        let e = ossiec::compile(&t("", m).unwrap(), &r, &opts)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("no equivalent"), "{m} on {d:?}: {e}");
+    }
+    // What can only be translated when it's a constant says that instead.
+    let e = sql_on(&field("TO_CHAR(a, b)"), Some(DuckDB), None).unwrap_err();
+    assert!(e.contains("constant format"), "{e}");
+    let opts = Options {
+        target: Some(ClickHouse),
+        ..Default::default()
+    };
+    let r = Request::from_json(r#"{"metrics":["t.m"]}"#).unwrap();
+    let m = t("", "PERCENTILE_CONT(id) WITHIN GROUP (ORDER BY amount)").unwrap();
+    let e = ossiec::compile(&m, &r, &opts).err().unwrap().to_string();
+    assert!(e.contains("constant percentile"), "{e}");
+}
+
+/// Each format token, on an engine that spells them differently. The longest token
+/// wins, so `MONTH` isn't `MON` and an `H`.
+#[test]
+fn format_tokens_are_translated_whole() {
+    use ossiec::DialectType::{DuckDB, MySQL};
+    let s = sql_on(
+        &field("TO_CHAR(a, 'YYYY YY MM MON MONTH DD DY DAY HH24 HH12 HH MI SS AM - x')"),
+        Some(DuckDB),
+        None,
+    )
+    .unwrap();
+    assert!(
+        s.contains("'%Y %y %m %b %B %d %a %A %H %I %I %M %S %p - x'"),
+        "{s}"
+    );
+    let s = sql_on(
+        &field("TO_CHAR(a, 'YYYY MONTH DAY HH24 MI SS PM')"),
+        Some(MySQL),
+        None,
+    )
+    .unwrap();
+    assert!(s.contains("'%Y %M %W %H %i %s %p'"), "{s}");
+}
+
+/// The table applies wherever an expression ends up: inside a metric, on a joined
+/// dataset, and in a Layer 2 query's filter.
+#[test]
+fn functions_are_implemented_wherever_they_appear() {
+    use ossiec::DialectType::MySQL;
+    let opts = Options {
+        target: Some(MySQL),
+        pretty: false,
+        ..Default::default()
+    };
+    let g = t(
+        "      - { name: title, expression: { sql: UPPER(raw) } }\n",
+        "SUM(LENGTH(title))",
+    )
+    .unwrap();
+    let r = Request::from_json(r#"{"metrics":["t.m"]}"#).unwrap();
+    let s = ossiec::compile(&g, &r, &opts).unwrap().sql;
+    assert!(s.contains("CHAR_LENGTH(UPPER("), "{s}");
+    let q = "SELECT id, AGG(m) FROM t WHERE LENGTH(title) > 1 GROUP BY id";
+    let s = ossiec::compile_sql(&g, q, &opts).unwrap().sql;
+    assert!(s.contains("WHERE (CHAR_LENGTH(UPPER("), "{s}");
+    let r = Request::from_json(r#"{"metrics":["t.m"],"filter":"LENGTH(t.title) > 1"}"#).unwrap();
+    let s = ossiec::compile(&g, &r, &opts).unwrap().sql;
+    assert!(s.contains("WHERE CHAR_LENGTH(UPPER("), "{s}");
+}
+
+/// `FILTER` stays with an aggregate that was rewritten, where the engine has it.
+#[test]
+fn a_rewritten_aggregate_keeps_its_filter() {
+    use ossiec::DialectType::PostgreSQL;
+    for m in [
+        "MEDIAN(amount) FILTER (WHERE id > 1)",
+        "APPROX_COUNT_DISTINCT(amount) FILTER (WHERE id > 1)",
+        "APPROX_PERCENTILE(amount, 0.5) FILTER (WHERE id > 1)",
+    ] {
+        let s = sql_for(&t("", m).unwrap(), PostgreSQL);
+        assert!(s.contains("FILTER(WHERE \"t\".id > 1)"), "{m}: {s}");
     }
 }

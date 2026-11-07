@@ -52,6 +52,17 @@ pub(super) fn adapt(ast: Expression, plan: &LogicalPlan) -> Result<Expression> {
                 f.this = cast(Expr(f.this), "DOUBLE").into_inner();
                 Expression::Avg(f)
             }
+            // LIKE is case-sensitive (expression language), and the default
+            // collation isn't. Evidence: `s LIKE 'he%'` in `expression_language.rs`.
+            Expression::Like(mut op) if !matches!(op.left, Expression::Collation(_)) => {
+                op.left = Expression::Collation(Box::new(CollationExpr {
+                    this: op.left,
+                    collation: "utf8mb4_bin".into(),
+                    quoted: false,
+                    double_quoted: false,
+                }));
+                Expression::Like(op)
+            }
             other => other,
         }))
     })

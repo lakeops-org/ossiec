@@ -365,7 +365,7 @@ The full rationale is in **[docs/DESIGN.md](docs/DESIGN.md)**.
 | `expression.sql` / `OSSIE_SQL_2026`, `ANSI_SQL`, vendor SQL dialects | ✅ |
 | Non-SQL dialects (`DAX`, `MDX`, `TABLEAU`, …) | Ignored (a field needs at least one SQL form) |
 | `FILTER (WHERE …)`, `COUNT(DISTINCT …)`, ratios, `CASE` | ✅ |
-| Scalar and aggregate functions in `expression_language.md` | Partial: engine by engine, see `gaps` in [`tests/expression_language.rs`](tests/expression_language.rs) |
+| Scalar and aggregate functions in `expression_language.md` | ✅ DuckDB and ClickHouse. Others refuse what they can't express: exact percentiles and `MEDIAN` on MySQL and Trino, `TRY_CAST` on MySQL and Postgres, `REGEXP_COUNT` on MySQL. See `gaps` in [`tests/expression_language.rs`](tests/expression_language.rs) |
 | Identifier rules (regular names upper-cased, quoted kept, so `"ID"` matches `id` and `"id"` doesn't; 128 characters at most) | ✅ Except Layer 2 measure names, which ignore quotes: `AGG("m")` matches `m` |
 | `source.column` in dataset-scoped metrics | ✅ |
 | Reserved `AGG`, and no subqueries, in portable expressions | ✅ Refused when the model loads |
@@ -458,7 +458,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 2 `HAVING` and `WITH`
 - [x] Layer 2 `ORDER BY` on an unselected `AGG()` or an expression over it (§7.5)
 - [x] Layer 1 rules: identifiers, `source.column`, reserved `AGG`, no subqueries
-- [ ] Layer 1 functions on every engine (the gaps in `tests/expression_language.rs`), and running them on Trino and StarRocks
+- [x] Layer 1 functions on six engines, each implemented or refused (`functions.rs`)
+- [ ] Exact percentiles on MySQL and Trino, which have no such function
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, `DISTINCT` and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
