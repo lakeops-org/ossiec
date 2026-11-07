@@ -1,7 +1,8 @@
 //! ClickHouse rules.
 
+use crate::sql::transform;
 use polyglot_sql::expressions::{WindowFrame, WindowFrameBound, WindowFrameKind};
-use polyglot_sql::{transform, DialectType, Expression};
+use polyglot_sql::{DialectType, Expression};
 
 use super::{internal, literal_backslashes_in_like};
 use crate::plan::LogicalPlan;

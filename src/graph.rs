@@ -10,12 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use polyglot_sql::expressions::{Column, Identifier};
 use polyglot_sql::{
     contains_aggregate, contains_window_function, get_aggregate_functions, get_columns,
-    is_aggregate, transform, DialectType, Expression,
+    is_aggregate, DialectType, Expression,
 };
 use serde::Serialize;
 
 use crate::model::{self, Model};
-use crate::sql::{self, Tpl};
+use crate::portable;
+use crate::sql::{self, transform, Tpl};
 use crate::wide_table::ErrorCode;
 use crate::{Error, Result};
 
@@ -230,12 +231,18 @@ pub(crate) fn true_division(ast: Expression) -> Expression {
 
 fn variants(e: &model::Expression, what: &str) -> std::result::Result<Vec<Variant>, String> {
     let mut out = vec![];
+    let portable = |text: &str, shown: &str| -> std::result::Result<Expression, String> {
+        let ast = sql::parse(&portable::spell_types(text), DialectType::Generic)
+            .map_err(|err| format!("{what}: cannot parse {shown}`{text}`: {err}"))?;
+        if let Some(why) = portable::refusal(&ast) {
+            return Err(format!("{what}: {why}"));
+        }
+        Ok(true_division(portable::normalize(ast)))
+    };
     if let Some(s) = &e.sql {
-        let ast = sql::parse(s, DialectType::Generic)
-            .map_err(|err| format!("{what}: cannot parse `{s}`: {err}"))?;
         out.push(Variant {
             flavor: Flavor::Portable,
-            ast: true_division(ast),
+            ast: portable(s, "")?,
         });
     }
     for d in &e.dialects {
@@ -249,6 +256,13 @@ fn variants(e: &model::Expression, what: &str) -> std::result::Result<Vec<Varian
                 None => continue,
             },
         };
+        if matches!(flavor, Flavor::Portable) {
+            out.push(Variant {
+                flavor,
+                ast: portable(&d.expression, &format!("{name} "))?,
+            });
+            continue;
+        }
         let ast = sql::parse(&d.expression, read)
             .map_err(|err| format!("{what}: cannot parse {name} `{}`: {err}", d.expression))?;
         // Vendor expressions keep their engine's own semantics.
@@ -273,32 +287,64 @@ fn variants(e: &model::Expression, what: &str) -> std::result::Result<Vec<Varian
     Ok(out)
 }
 
-/// ANSI identifier matching: a quoted name matches exactly, a bare one case-insensitively.
+/// A normalized identifier (expression language, "Comparison Table"): a regular
+/// one upper-cased, a quoted one as written. So `"ID"` matches `id`, and `"id"`
+/// doesn't.
+fn normalized(name: &str, quoted: bool) -> String {
+    if quoted {
+        name.to_string()
+    } else {
+        name.to_uppercase()
+    }
+}
+
+/// A name as the model declares it: `"Name"` in its quotes is a quoted identifier.
+fn declared(name: &str) -> String {
+    match name
+        .strip_prefix('"')
+        .and_then(|n| n.strip_suffix('"'))
+        .filter(|n| !n.is_empty())
+    {
+        Some(n) => n.replace("\"\"", "\""),
+        None => normalized(name, false),
+    }
+}
+
+/// An identifier that resolves to the name as the model declares it.
+fn declared_identifier(name: &str) -> Identifier {
+    if name.starts_with('"') {
+        Identifier::quoted(declared(name))
+    } else {
+        Identifier::new(name)
+    }
+}
+
+/// Match `wanted` against declared names by their normalized forms.
 pub(crate) fn lookup<'a>(
     names: impl IntoIterator<Item = &'a str>,
     wanted: &str,
     quoted: bool,
 ) -> std::result::Result<Option<usize>, String> {
+    // An unquoted `wanted` may be a name from the model, in its own quotes.
+    let wanted = if quoted {
+        wanted.to_string()
+    } else {
+        declared(wanted)
+    };
     let names: Vec<&str> = names.into_iter().collect();
-    if quoted {
-        return Ok(names.iter().position(|n| *n == wanted));
-    }
     let hits: Vec<usize> = (0..names.len())
-        .filter(|&i| names[i].eq_ignore_ascii_case(wanted))
+        .filter(|&i| declared(names[i]) == wanted)
         .collect();
     match hits.as_slice() {
         [] => Ok(None),
         [one] => Ok(Some(*one)),
-        many => match many.iter().find(|&&i| names[i] == wanted) {
-            Some(&i) => Ok(Some(i)),
-            None => Err(format!(
-                "`{wanted}` is ambiguous: it matches {}",
-                many.iter()
-                    .map(|&i| names[i])
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        },
+        many => Err(format!(
+            "`{wanted}` is ambiguous: it matches {}",
+            many.iter()
+                .map(|&i| names[i])
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -311,7 +357,7 @@ fn qualify(ast: Expression, dataset: &str, alias: &str) -> Expression {
                     .as_ref()
                     .is_none_or(|t| t.name.eq_ignore_ascii_case(dataset))
                 {
-                    c.table = Some(Identifier::quoted(alias));
+                    c.table = Some(crate::sql::quoted(alias));
                 }
                 Expression::Column(c)
             }
@@ -330,14 +376,14 @@ fn source_expr(src: &str, alias: &str) -> std::result::Result<Expression, String
             None => t,
         };
         let q = sql::parse(inner, DialectType::Generic)?;
-        return Ok(sql::derived(q, Identifier::quoted(alias)));
+        return Ok(sql::derived(q, crate::sql::quoted(alias)));
     }
     if t.is_empty() || t.contains(char::is_whitespace) {
         return Err(format!("`{src}` is neither a table reference nor a query"));
     }
     let mut e = polyglot_sql::builder::table(t).into_inner();
     if let Expression::Table(tr) = &mut e {
-        tr.alias = Some(Identifier::quoted(alias));
+        tr.alias = Some(crate::sql::quoted(alias));
     }
     Ok(e)
 }
@@ -351,10 +397,76 @@ fn temporal(datatype: Option<&str>) -> bool {
 fn dup_names<'a>(names: impl IntoIterator<Item = &'a str>, what: &str, errs: &mut Vec<String>) {
     let mut seen = BTreeSet::new();
     for n in names {
-        if !seen.insert(n.to_ascii_lowercase()) {
+        if !seen.insert(declared(n)) {
             errs.push(format!("duplicate {what} `{n}`"));
         }
     }
+}
+
+/// The limit on an identifier's length (expression language, "Namespacing").
+const MAX_IDENTIFIER: usize = 128;
+
+fn check_length(name: &str, what: &str, errs: &mut Vec<String>) {
+    if declared(name).chars().count() > MAX_IDENTIFIER {
+        errs.push(format!(
+            "{what} `{name}` is longer than {MAX_IDENTIFIER} characters"
+        ));
+    }
+}
+
+/// The name of a hidden field that reads one source column.
+const SOURCE_COLUMN: &str = "__source_";
+
+/// Whether a field is one of those, which nothing but the metric can name.
+fn is_hidden(field: &str) -> bool {
+    field.starts_with(SOURCE_COLUMN)
+}
+
+/// `source.column` in a dataset-scoped metric reads a column the dataset may not
+/// declare. Each becomes a hidden field, so the rest of the compiler only sees
+/// fields. When the dataset declares a field named `source`, the name is that
+/// field and the reference is left to fail as an unknown dataset (Name Resolution).
+fn source_columns(ast: Expression, d: &RefCell<&mut DatasetInfo>) -> Expression {
+    let declares_source = lookup(
+        d.borrow().fields.iter().map(|f| f.name.as_str()),
+        "source",
+        false,
+    )
+    .is_ok_and(|hit| hit.is_some());
+    if declares_source {
+        return ast;
+    }
+    transform(ast, &|e| {
+        let Expression::Column(c) = e else {
+            return Ok(Some(e));
+        };
+        let is_source = c
+            .table
+            .as_ref()
+            .is_some_and(|t| normalized(&t.name, t.quoted) == "SOURCE");
+        if !is_source {
+            return Ok(Some(Expression::Column(c)));
+        }
+        let mut d = d.borrow_mut();
+        let mut column = c.clone();
+        column.table = None;
+        let ast = Expression::Column(column);
+        let name = format!("{SOURCE_COLUMN}{}", d.fields.len());
+        d.fields.push(FieldInfo {
+            name: name.clone(),
+            variants: vec![Variant {
+                flavor: Flavor::Portable,
+                ast,
+            }],
+            datatype: None,
+            is_time: false,
+        });
+        let mut field = c;
+        field.table = None;
+        field.name = Identifier::new(name);
+        Ok(Some(Expression::Column(field)))
+    })
+    .expect("naming source columns cannot fail")
 }
 
 /// Validate `model` and bind it into a [`SemanticGraph`].
@@ -371,7 +483,15 @@ pub fn bind(model: Model) -> Result<SemanticGraph> {
         "dataset",
         &mut errs,
     );
+    check_length(&model.name, "model", &mut errs);
     for d in &model.datasets {
+        check_length(&d.name, "dataset", &mut errs);
+        for n in d.fields.iter().map(|f| &f.name) {
+            check_length(n, "field", &mut errs);
+        }
+        for n in d.metrics.iter().map(|m| &m.name) {
+            check_length(n, "metric", &mut errs);
+        }
         dup_names(
             d.fields
                 .iter()
@@ -459,6 +579,7 @@ pub fn bind(model: Model) -> Result<SemanticGraph> {
         &mut errs,
     );
     for r in &model.relationships {
+        check_length(&r.name, "relationship", &mut errs);
         let what = format!("relationship `{}`", r.name);
         let (Some(from), Some(to)) = (ds_index(&r.from), ds_index(&r.to)) else {
             errs.push(format!(
@@ -525,13 +646,25 @@ pub fn bind(model: Model) -> Result<SemanticGraph> {
             Some(i) => format!("{}.{}", model.datasets[i].name, m.name),
             None => m.name.clone(),
         };
+        if owner.is_none() {
+            check_length(&m.name, "metric", &mut errs);
+        }
         match variants(&m.expression, &format!("metric `{name}`")) {
-            Ok(vs) => metrics.push(MetricInfo {
-                name,
-                owner,
-                variants: vs,
-                unsupported: None,
-            }),
+            Ok(mut vs) => {
+                if let Some(o) = owner {
+                    let d = RefCell::new(&mut datasets[o]);
+                    for v in &mut vs {
+                        let ast = std::mem::replace(&mut v.ast, sql::col("x"));
+                        v.ast = source_columns(ast, &d);
+                    }
+                }
+                metrics.push(MetricInfo {
+                    name,
+                    owner,
+                    variants: vs,
+                    unsupported: None,
+                })
+            }
             Err(e) => errs.push(e),
         }
     }
@@ -594,6 +727,7 @@ fn aggregate_filter(e: &Expression) -> Option<&Expression> {
         | Expression::AnyValue(f) => f.filter.as_ref(),
         Expression::Count(c) => c.filter.as_ref(),
         Expression::AggregateFunction(a) => a.filter.as_ref(),
+        Expression::Filter(f) => Some(&*f.expression),
         _ => None,
     }
 }
@@ -665,14 +799,29 @@ fn clear_aggregate_filter(e: Expression) -> Expression {
             a.filter = None;
             Expression::AggregateFunction(a)
         }
+        Expression::Filter(f) => *f.this,
         other => other,
     }
 }
 
 /// Lower `agg(x) FILTER (WHERE p)` to `agg(CASE WHEN p THEN x END)`.
 /// The expression language allows this rewrite (`expression_language.md`, FILTER section).
-/// Called at compile time only for targets that lack native aggregate FILTER.
-pub(crate) fn lower_filters(e: Expression) -> Result<Expression> {
+/// Called for targets that lack native aggregate FILTER, and on every target for
+/// the statistical aggregates: polyglot's transpile drops their FILTER (`VAR_POP`
+/// on DuckDB, Postgres and BigQuery). Evidence: `VAR_POP(v) FILTER (...)` in
+/// `expression_language.rs`.
+pub(crate) fn lower_filters(e: Expression, only_statistics: bool) -> Result<Expression> {
+    fn is_statistical(e: &Expression) -> bool {
+        matches!(
+            e,
+            Expression::Stddev(_)
+                | Expression::StddevPop(_)
+                | Expression::StddevSamp(_)
+                | Expression::Variance(_)
+                | Expression::VarPop(_)
+                | Expression::VarSamp(_)
+        )
+    }
     fn case_when(p: Expression, v: Expression) -> Expression {
         let mut t = Tpl::new();
         let (p, v) = (t.e(p), t.e(v));
@@ -698,15 +847,42 @@ pub(crate) fn lower_filters(e: Expression) -> Result<Expression> {
                 }
                 Expression::AggregateFunction(mut a) => {
                     if let Some(p) = a.filter.take() {
-                        a.args = a.args.into_iter().map(|x| case_when(p.clone(), x)).collect();
+                        // A constant is a parameter (`APPROX_PERCENTILE(x, 0.5)`), not an input.
+                        a.args = a.args.into_iter().map(|x| match x {
+                            Expression::Literal(_) => x,
+                            x => case_when(p.clone(), x),
+                        }).collect();
                     }
                     Expression::AggregateFunction(a)
+                }
+                Expression::Filter(f) => {
+                    let p = *f.expression;
+                    match *f.this {
+                        Expression::WithinGroup(mut w) => {
+                            for o in &mut w.order_by {
+                                let v = std::mem::replace(&mut o.this, sql::col("x"));
+                                o.this = case_when(p.clone(), v);
+                            }
+                            Expression::WithinGroup(w)
+                        }
+                        Expression::ListAgg(mut l) => {
+                            l.this = case_when(p, l.this);
+                            Expression::ListAgg(l)
+                        }
+                        other => Expression::Filter(Box::new(polyglot_sql::expressions::Filter {
+                            this: Box::new(other),
+                            expression: Box::new(p),
+                        })),
+                    }
                 }
                 other => other,
             }
         };
     }
     transform(e, &|e| {
+        if only_statistics && !is_statistical(&e) {
+            return Ok(Some(e));
+        }
         Ok(Some(lower!(
             e,
             Sum,
@@ -728,25 +904,42 @@ pub(crate) fn lower_filters(e: Expression) -> Result<Expression> {
     .map_err(|e| Error::Internal(e.to_string()))
 }
 
+/// The SQL type of the one field an aggregate reads, when the model declares it.
+fn declared_type(datatypes: &BTreeSet<Option<String>>) -> Option<&'static str> {
+    let mut it = datatypes.iter();
+    match (it.next(), it.next()) {
+        (Some(Some(d)), None) => match d.to_ascii_lowercase().as_str() {
+            "integer" | "decimal" | "float" => Some("NUMERIC"),
+            "string" => Some("TEXT"),
+            "date" => Some("DATE"),
+            "datetime" | "datetimetz" => Some("TIMESTAMP"),
+            "boolean" => Some("BOOLEAN"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Type family of an aggregate's result: numeric for counting and arithmetic
 /// aggregates; for MIN/MAX/ANY_VALUE, the type of the one field they read.
 fn null_type(e: &Expression, datatypes: &BTreeSet<Option<String>>) -> Option<&'static str> {
     match e {
         Expression::Min(_) | Expression::Max(_) | Expression::AnyValue(_) => {
-            let mut it = datatypes.iter();
-            match (it.next(), it.next()) {
-                (Some(Some(d)), None) => match d.to_ascii_lowercase().as_str() {
-                    "integer" | "decimal" | "float" => Some("NUMERIC"),
-                    "string" => Some("TEXT"),
-                    "date" => Some("DATE"),
-                    "datetime" | "datetimetz" => Some("TIMESTAMP"),
-                    "boolean" => Some("BOOLEAN"),
-                    _ => None,
-                },
-                _ => None,
-            }
+            declared_type(datatypes)
         }
         Expression::AggregateFunction(_) => None,
+        // `PERCENTILE_DISC` returns a value of what it sorts, like `MIN`.
+        // `PERCENTILE_CONT` interpolates, so it's numeric.
+        Expression::WithinGroup(w) => match &w.this {
+            Expression::AggregateFunction(a) if a.name.eq_ignore_ascii_case("PERCENTILE_DISC") => {
+                declared_type(datatypes)
+            }
+            Expression::AggregateFunction(a) if a.name.eq_ignore_ascii_case("PERCENTILE_CONT") => {
+                Some("NUMERIC")
+            }
+            _ => None,
+        },
+        Expression::Filter(f) => null_type(&f.this, datatypes),
         _ => Some("NUMERIC"),
     }
 }
@@ -775,6 +968,45 @@ const HEAD: &str = "__ossiec_head";
 
 fn is_term_placeholder(c: &Column) -> bool {
     c.table.is_none() && c.name.name.starts_with(TERM)
+}
+
+/// `PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY x) FILTER (WHERE q)` as one aggregate
+/// over `p, x` with a filter, the way §5.2's checks read every other aggregate.
+fn flat_aggregates(ast: Expression) -> Expression {
+    transform(ast, &|e| {
+        Ok(Some(match e {
+            Expression::WithinGroup(w) => match w.this {
+                Expression::AggregateFunction(mut a) => {
+                    a.args.extend(w.order_by.into_iter().map(|o| o.this));
+                    Expression::AggregateFunction(a)
+                }
+                this => Expression::WithinGroup(Box::new(polyglot_sql::expressions::WithinGroup {
+                    this,
+                    order_by: w.order_by,
+                })),
+            },
+            Expression::Filter(f) => match *f.this {
+                Expression::AggregateFunction(mut a) => {
+                    a.filter = Some(*f.expression);
+                    Expression::AggregateFunction(a)
+                }
+                this => Expression::Filter(Box::new(polyglot_sql::expressions::Filter {
+                    this: Box::new(this),
+                    expression: f.expression,
+                })),
+            },
+            other => other,
+        }))
+    })
+    .expect("flattening aggregates cannot fail")
+}
+
+/// Which term a placeholder stands for.
+fn term_index(e: &Expression) -> Option<usize> {
+    match e {
+        Expression::Column(c) if is_term_placeholder(c) => c.name.name[TERM.len()..].parse().ok(),
+        _ => None,
+    }
 }
 
 fn is_placeholder(c: &Column) -> bool {
@@ -855,8 +1087,8 @@ impl SemanticGraph {
     pub(crate) fn source_as(&self, ds: usize, alias: &str) -> Expression {
         let mut e = self.datasets[ds].source.clone();
         match &mut e {
-            Expression::Table(t) => t.alias = Some(Identifier::quoted(alias)),
-            Expression::Subquery(s) => s.alias = Some(Identifier::quoted(alias)),
+            Expression::Table(t) => t.alias = Some(crate::sql::quoted(alias)),
+            Expression::Subquery(s) => s.alias = Some(crate::sql::quoted(alias)),
             _ => {}
         }
         e
@@ -899,7 +1131,7 @@ impl SemanticGraph {
         let c = match role {
             Some(r) => {
                 let mut c = c.clone();
-                c.table = Some(Identifier::quoted(&self.datasets[self.rels[r].to].name));
+                c.table = Some(declared_identifier(&self.datasets[self.rels[r].to].name));
                 c
             }
             None => c.clone(),
@@ -910,6 +1142,12 @@ impl SemanticGraph {
                 Error::InvalidModel(v) => Error::Request(v.join("; ")),
                 other => other,
             })?;
+        if is_hidden(&self.datasets[ds].fields[f].name) {
+            return Err(Error::Request(format!(
+                "`{}` is not a field of `{}`",
+                c.name.name, self.datasets[ds].name
+            )));
+        }
         Ok((ds, f, role))
     }
 
@@ -1118,6 +1356,7 @@ impl SemanticGraph {
                 fields
                     .iter()
                     .map(|f| f.name.as_str())
+                    .filter(|n| !is_hidden(n))
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
@@ -1138,7 +1377,7 @@ impl SemanticGraph {
             return Ok(vec![]);
         }
         let name = &info.name;
-        let ast = ctx.pick(&info.variants).ast.clone();
+        let ast = flat_aggregates(ctx.pick(&info.variants).ast.clone());
         self.column_datasets(&ast, None, ctx).map_err(|e| match e {
             Error::InvalidModel(v) => {
                 Error::InvalidModel(vec![format!("metric `{name}`: {}", v.join("; "))])
@@ -1246,10 +1485,32 @@ impl SemanticGraph {
         let lifted = RefCell::new(Vec::new());
         let lift = |e: Expression| {
             transform(e, &|e| {
+                let mut l = lifted.borrow_mut();
+                // `PERCENTILE_CONT(p) WITHIN GROUP (...)`, and a FILTER on one, wrap
+                // an aggregate already lifted: the wrapper belongs in its term.
+                let wrapped = match &e {
+                    Expression::WithinGroup(w) => term_index(&w.this),
+                    Expression::Filter(f) => term_index(&f.this),
+                    _ => None,
+                };
+                if let Some(i) = wrapped {
+                    let inner = std::mem::replace(&mut l[i], sql::col("x"));
+                    l[i] = match e {
+                        Expression::WithinGroup(mut w) => {
+                            w.this = inner;
+                            Expression::WithinGroup(w)
+                        }
+                        Expression::Filter(mut f) => {
+                            f.this = Box::new(inner);
+                            Expression::Filter(f)
+                        }
+                        other => other,
+                    };
+                    return Ok(Some(sql::col(&format!("{TERM}{i}"))));
+                }
                 if !is_aggregate(&e) {
                     return Ok(Some(e));
                 }
-                let mut l = lifted.borrow_mut();
                 l.push(e);
                 Ok(Some(sql::col(&format!("{TERM}{}", l.len() - 1))))
             })
@@ -1259,11 +1520,13 @@ impl SemanticGraph {
         if lifted.borrow().is_empty() && windows.borrow().is_empty() {
             return Err(bad("a metric must aggregate (SUM, COUNT, AVG, ...)"));
         }
-        if get_columns(&outer)
-            .iter()
-            .any(|c| matches!(c, Expression::Column(c) if !is_placeholder(c)))
+        let has_windows = !windows.borrow().is_empty();
+        if !has_windows
+            && get_columns(&outer)
+                .iter()
+                .any(|c| matches!(c, Expression::Column(c) if !is_placeholder(c)))
         {
-            return Err(bad("references a field outside an aggregate (only window PARTITION BY / ORDER BY may name fields directly)"));
+            return Err(bad("references a field outside an aggregate"));
         }
 
         // Inside a window, aggregates become terms and the remaining fields
@@ -1280,6 +1543,13 @@ impl SemanticGraph {
                     return Ok(Some(Expression::Column(c)));
                 }
                 match self.resolve_column(&c, info.owner, &mut ctx_cell.borrow_mut()) {
+                    Ok((ds, f)) if is_hidden(&self.datasets[ds].fields[f].name) => {
+                        failure.borrow_mut().get_or_insert(Error::Unsupported(format!(
+                            "metric `{}`: a window reads the grouped result, which has no source columns; declare a field for the column it reads",
+                            info.name
+                        )));
+                        Ok(Some(Expression::Column(c)))
+                    }
                     Ok(df) => {
                         let mut d = dims.borrow_mut();
                         let i = d.iter().position(|x| *x == df).unwrap_or_else(|| {
@@ -1335,6 +1605,9 @@ impl SemanticGraph {
         }
         let windowed = !resolved_windows.is_empty();
         if windowed {
+            // Beside a window, a field is a column of the grouped result, like the
+            // ones the window itself reads: `amount / SUM(amount) OVER ()`.
+            outer = as_dims(outer)?;
             outer = transform(outer, &|e| {
                 Ok(Some(match e {
                     Expression::Column(c) if c.table.is_none() && c.name.name.starts_with(WIN) => {
@@ -1349,9 +1622,12 @@ impl SemanticGraph {
             .map_err(internal)?;
         }
         let dims = dims.into_inner();
-        let lifted = lifted.into_inner();
-        if lifted.is_empty() {
-            return Err(bad("a metric must aggregate (SUM, COUNT, AVG, ...)"));
+        let mut lifted = lifted.into_inner();
+        // `ROW_NUMBER() OVER (...)` reads no aggregate. A term no expression uses
+        // still gives the metric its home dataset, whose rows it runs over.
+        let no_terms = lifted.is_empty();
+        if no_terms {
+            lifted.push(sql::parse("COUNT(*)", DialectType::Generic).map_err(Error::Internal)?);
         }
 
         let mut terms = vec![];
@@ -1371,7 +1647,6 @@ impl SemanticGraph {
                     other => other,
                 })?;
             let datasets = RefCell::new(BTreeSet::new());
-            let datatypes = RefCell::new(BTreeSet::new());
             let failure = RefCell::new(None);
             let ast = transform(raw.clone(), &|e| {
                 let Expression::Column(c) = e else {
@@ -1381,9 +1656,6 @@ impl SemanticGraph {
                 Ok(Some(match self.resolve_column(&c, info.owner, &mut ctx) {
                     Ok((ds, f)) => {
                         datasets.borrow_mut().insert(ds);
-                        datatypes
-                            .borrow_mut()
-                            .insert(self.datasets[ds].fields[f].datatype.clone());
                         self.field_sql(ds, f, &mut ctx)
                     }
                     Err(err) => {
@@ -1398,16 +1670,29 @@ impl SemanticGraph {
             }
             let mut datasets = datasets.into_inner();
             if datasets.is_empty() {
-                match info.owner {
+                match info.owner.or_else(|| dims.first().filter(|_| no_terms).map(|d| d.0)) {
                     Some(o) => {
                         datasets.insert(o);
                     }
+                    None if no_terms => return Err(bad("a window that reads no field has no dataset to run over; make it a dataset-scoped metric")),
                     None => return Err(bad("an aggregate without field references (like COUNT(*)) must be a dataset-scoped metric, or use COUNT(dataset.key)")),
                 }
             }
             let key = polyglot_sql::generate(&ast, DialectType::Generic)
                 .map_err(|e| Error::Internal(e.to_string()))?;
-            let datatypes = datatypes.into_inner();
+            // The type of what the aggregate reads, not of what its FILTER reads.
+            let body = clear_aggregate_filter(raw.clone());
+            let datatypes: BTreeSet<Option<String>> = get_columns(&body)
+                .iter()
+                .filter_map(|c| match c {
+                    Expression::Column(c) => {
+                        let mut ctx = ctx_cell.borrow_mut();
+                        self.resolve_column(c, info.owner, &mut ctx).ok()
+                    }
+                    _ => None,
+                })
+                .map(|(ds, f)| self.datasets[ds].fields[f].datatype.clone())
+                .collect();
             terms.push(Term {
                 null_type: null_type(&raw, &datatypes),
                 dup_insensitive: dup_insensitive(&raw),

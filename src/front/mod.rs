@@ -56,14 +56,14 @@ use polyglot_sql::expressions::{
 };
 use polyglot_sql::{
     contains_aggregate, contains_window_function, get_columns, is_query, is_subquery, parse_one,
-    transform, transform_all, DialectType, Expression, ExpressionWalk,
+    transform_all, DialectType, Expression, ExpressionWalk,
 };
 
 use crate::graph::{self, SemanticGraph};
 use crate::plan::{
     self, Direction, Filter, JoinKind, JoinStep, LogicalPlan, Nulls, Op, OrderBy, Request, Strategy,
 };
-use crate::sql;
+use crate::sql::{self, transform};
 use crate::{Compiled, Error, Options, Result};
 
 mod catalog;
@@ -926,7 +926,7 @@ fn grain_dataset(graph: &SemanticGraph, scope: &QueryScope) -> Result<usize> {
 
 /// `dataset.field` → `field`.
 fn bare_field(dim: &str) -> &str {
-    dim.split_once('.').map_or(dim, |(_, f)| f)
+    plan::unquoted(dim.split_once('.').map_or(dim, |(_, f)| f))
 }
 
 /// A bare column that names a dataset-scoped measure, not a field: the dataset
@@ -1903,17 +1903,20 @@ fn field_pair_eq(a: &(FieldRef, FieldRef), b: &(FieldRef, FieldRef)) -> bool {
 fn resolve_field_ref(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Result<FieldRef> {
     let ds = resolve_column_dataset(graph, scope, col)?;
     let field = &col.name.name;
-    let f = graph.datasets[ds]
-        .fields
-        .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(field))
-        .ok_or_else(|| {
-            Error::Request(format!(
-                "unknown field `{field}` on dataset `{}`",
-                graph.datasets[ds].name
-            ))
-        })?;
-    Ok((ds, graph.datasets[ds].fields[f].name.clone()))
+    let fields = &graph.datasets[ds].fields;
+    let f = graph::lookup(
+        fields.iter().map(|f| f.name.as_str()),
+        field,
+        col.name.quoted,
+    )
+    .map_err(Error::Request)?
+    .ok_or_else(|| {
+        Error::Request(format!(
+            "unknown field `{field}` on dataset `{}`",
+            graph.datasets[ds].name
+        ))
+    })?;
+    Ok((ds, fields[f].name.clone()))
 }
 
 fn resolve_column_dataset(
@@ -1923,7 +1926,7 @@ fn resolve_column_dataset(
 ) -> Result<usize> {
     if let Some(t) = &col.table {
         for b in &scope.bindings {
-            let ds_name = &graph.datasets[b.dataset].name;
+            let ds_name = plan::unquoted(&graph.datasets[b.dataset].name);
             if t.name.eq_ignore_ascii_case(&b.alias) || t.name.eq_ignore_ascii_case(ds_name) {
                 return Ok(b.dataset);
             }
@@ -1967,10 +1970,13 @@ fn resolve_column_dataset(
         .bindings
         .iter()
         .filter(|b| {
-            graph.datasets[b.dataset]
-                .fields
-                .iter()
-                .any(|f| f.name.eq_ignore_ascii_case(field))
+            let fields = &graph.datasets[b.dataset].fields;
+            graph::lookup(
+                fields.iter().map(|f| f.name.as_str()),
+                field,
+                col.name.quoted,
+            )
+            .is_ok_and(|hit| hit.is_some())
         })
         .map(|b| b.dataset)
         .collect();
@@ -2013,21 +2019,23 @@ fn resolve_table(graph: &SemanticGraph, t: &TableRef) -> Result<(usize, Option<S
         )));
     }
     let name = &t.name.name;
-    let ds = graph
-        .datasets
-        .iter()
-        .position(|d| d.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| {
-            Error::Request(format!(
-                "unknown Layer 2 relation `{name}`; datasets: {}",
-                graph
-                    .datasets
-                    .iter()
-                    .map(|d| d.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })?;
+    let ds = graph::lookup(
+        graph.datasets.iter().map(|d| d.name.as_str()),
+        name,
+        t.name.quoted,
+    )
+    .map_err(Error::Request)?
+    .ok_or_else(|| {
+        Error::Request(format!(
+            "unknown Layer 2 relation `{name}`; datasets: {}",
+            graph
+                .datasets
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
     Ok((ds, t.alias.as_ref().map(|a| a.name.clone())))
 }
 
@@ -2173,15 +2181,8 @@ fn resolve_measure(graph: &SemanticGraph, scope: &QueryScope, arg: &Expression) 
 }
 
 fn resolve_dim(graph: &SemanticGraph, scope: &QueryScope, col: &Column) -> Result<String> {
-    let dataset = resolve_column_dataset(graph, scope, col)?;
+    let (dataset, field_name) = resolve_field_ref(graph, scope, col)?;
     let ds_name = &graph.datasets[dataset].name;
-    let field = &col.name.name;
-    let f = graph.datasets[dataset]
-        .fields
-        .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(field))
-        .ok_or_else(|| Error::Request(format!("unknown field `{field}` on dataset `{ds_name}`")))?;
-    let field_name = &graph.datasets[dataset].fields[f].name;
     if let Some(role) = column_role(graph, col, dataset)? {
         return Ok(format!("{}.{}", graph.rels[role].name, field_name));
     }

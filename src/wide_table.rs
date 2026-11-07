@@ -346,7 +346,7 @@ pub(crate) fn check(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<(
         .iter()
         .map(|d| match d.alias {
             Some(alias) => alias.to_string(),
-            None => g.datasets[d.field.0].fields[d.field.1].name.clone(),
+            None => plan::unquoted(&g.datasets[d.field.0].fields[d.field.1].name).to_string(),
         })
         .chain(
             metric_indexes

@@ -1,7 +1,8 @@
 //! BigQuery rules.
 
+use crate::sql::transform;
 use polyglot_sql::expressions::Literal;
-use polyglot_sql::{transform, Expression};
+use polyglot_sql::Expression;
 
 use super::internal;
 use crate::plan::LogicalPlan;

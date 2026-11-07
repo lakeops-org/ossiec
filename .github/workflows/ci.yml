@@ -41,6 +41,7 @@ jobs:
       # StarRocks all-in-one occasionally needs a cold restart on GitHub runners.
       - run: scripts/engines.sh up || { scripts/engines.sh down; scripts/engines.sh up; }
       - run: cargo test --test engines -- --ignored
+      - run: cargo test --test expression_language -- --ignored
       - run: cargo test --test tpcds -- --ignored --skip trino_sf1_performance
       - if: always()
         run: scripts/engines.sh down
