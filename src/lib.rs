@@ -29,6 +29,7 @@
 
 mod dialect;
 mod front;
+mod functions;
 mod graph;
 mod lower;
 pub mod model;
@@ -230,9 +231,14 @@ pub(crate) fn lower_stage(
     // Ossie requires FILTER in expressions; engines MAY rewrite to CASE. Keep
     // native FILTER when the target supports it; otherwise lower for portability.
     ast = graph::lower_filters(ast, dialect::supports_aggregate_filter(opts.target))?;
-    match opts.target {
-        Some(target) => dialect::adapt(ast, target, plan),
-        None => Ok(ast),
+    let Some(target) = opts.target else {
+        return Ok(ast);
+    };
+    let ast = dialect::adapt(ast, target, plan)?;
+    // Ossie's functions, unless the statement is written in a vendor's dialect.
+    match ctx.source_dialect()?.1 {
+        polyglot_sql::DialectType::Generic => functions::lower(ast, target),
+        _ => Ok(ast),
     }
 }
 
