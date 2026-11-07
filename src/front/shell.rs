@@ -88,9 +88,9 @@ struct Selected {
 impl Compiler<'_> {
     /// An outer query over derived tables only (Appendix A.3).
     pub(super) fn shell(&mut self, sel: &Select, depth: usize, outer: &[String]) -> Result<Node> {
-        if sel.distinct || sel.qualify.is_some() {
+        if sel.distinct_on.is_some() || sel.qualify.is_some() {
             return Err(unsupported(
-                "Layer 2 DISTINCT / QUALIFY are not implemented yet",
+                "Layer 2 DISTINCT ON / QUALIFY are not implemented yet",
             ));
         }
         let from = sel.from.as_ref().expect("classified as a shell");
@@ -183,7 +183,9 @@ impl Compiler<'_> {
             None => None,
             Some(gb) => {
                 if gb.all.is_some() {
-                    return Err(unsupported("GROUP BY ALL is not supported in Layer 2"));
+                    return Err(unsupported(
+                        "Layer 2 GROUP BY takes ALL on its own, and not DISTINCT",
+                    ));
                 }
                 let mut set = BTreeSet::new();
                 for e in &gb.expressions {
@@ -222,7 +224,9 @@ impl Compiler<'_> {
                 Ok(format!("{e} AS {a}"))
             })
             .collect::<Result<_>>()?;
-        let mut text = format!("SELECT {}", cols.join(", "));
+        // Unlike an `AGG` stage, this query's rows can repeat.
+        let distinct = if sel.distinct { "DISTINCT " } else { "" };
+        let mut text = format!("SELECT {distinct}{}", cols.join(", "));
         for (k, rel) in rels.iter().enumerate() {
             let Relation::Derived {
                 alias, placeholder, ..

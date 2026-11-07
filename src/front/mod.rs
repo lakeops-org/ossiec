@@ -388,15 +388,51 @@ pub(super) fn pragma_include_unmatched(sql: &str) -> bool {
     })
 }
 
+/// `GROUP BY ALL` (§7.4) as the list it stands for: every selected column that isn't
+/// an aggregate. A bare measure stays in the list, and is refused as `GROUP BY m` is.
+pub(super) fn expand_group_by_all(sel: &mut Select) -> Result<()> {
+    let is_all = sel
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| gb.all == Some(true) && gb.expressions.is_empty());
+    if !is_all {
+        return Ok(());
+    }
+    let mut columns = vec![];
+    for item in &sel.expressions {
+        let (inner, _) = strip_alias(item);
+        if matches!(inner, Expression::Star(_)) {
+            return Err(unsupported(
+                "Layer 2 GROUP BY ALL needs its columns named, not `*`",
+            ));
+        }
+        let is_measure_definition =
+            as_column(inner).is_some_and(|c| to_measure::marker_index(c).is_some());
+        let aggregated = contains_aggregate(inner) || inner.contains(is_measure_agg_expr);
+        if !is_measure_definition && !aggregated {
+            columns.push(inner.clone());
+        }
+    }
+    match (&mut sel.group_by, columns.is_empty()) {
+        (group_by, true) => *group_by = None,
+        (Some(gb), false) => {
+            gb.all = None;
+            gb.expressions = columns;
+        }
+        (None, false) => unreachable!("checked above"),
+    }
+    Ok(())
+}
+
 /// Clause checks and the `FROM` / `JOIN` list of one `AGG` stage.
 pub(super) fn parse_stage_prep(
     graph: &SemanticGraph,
     sel: &Select,
     cfg: &StageCfg<'_>,
 ) -> Result<ParsedFrom> {
-    if sel.distinct || sel.qualify.is_some() {
+    if sel.distinct_on.is_some() || sel.qualify.is_some() {
         return Err(unsupported(
-            "Layer 2 DISTINCT / QUALIFY are not implemented yet",
+            "Layer 2 DISTINCT ON / QUALIFY are not implemented yet",
         ));
     }
     parse_from_clause(graph, sel.from.as_ref(), &sel.joins, cfg.outer)
@@ -589,7 +625,9 @@ pub(super) fn parse_stage_from(
         None => {}
         Some(gb) => {
             if gb.all.is_some() {
-                return Err(unsupported("GROUP BY ALL is not supported in Layer 2"));
+                return Err(unsupported(
+                    "Layer 2 GROUP BY takes ALL on its own, and not DISTINCT",
+                ));
             }
             let mut gb_dims = Vec::new();
             for e in &gb.expressions {
@@ -708,6 +746,22 @@ pub(super) fn parse_stage_from(
                 direction,
                 nulls,
             });
+        }
+    }
+    // §7.8: `DISTINCT` compares whole rows, and an unevaluated measure has no value.
+    // Otherwise it changes nothing: `GROUP BY` must name exactly the selected
+    // dimensions, so a stage's rows are already distinct.
+    if sel.distinct {
+        if let Some(m) = unevaluated.first() {
+            return Err(Error::Request(format!(
+                "Layer 2 DISTINCT can't compare unevaluated measure `{}`; evaluate it with AGG() or leave it out",
+                m.name
+            )));
+        }
+        if !order_exprs.is_empty() {
+            return Err(Error::Request(
+                "Layer 2 DISTINCT can only sort by columns it selects".into(),
+            ));
         }
     }
     if !order_exprs.is_empty() {

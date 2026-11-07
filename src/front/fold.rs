@@ -262,9 +262,9 @@ impl Compiler<'_> {
         derived_mode: bool,
         outer: &[String],
     ) -> Result<Node> {
-        if sel.distinct || sel.qualify.is_some() || sel.offset.is_some() {
+        if sel.distinct_on.is_some() || sel.qualify.is_some() || sel.offset.is_some() {
             return Err(unsupported(
-                "Layer 2 DISTINCT / QUALIFY / OFFSET are not implemented yet",
+                "Layer 2 DISTINCT ON / QUALIFY / OFFSET are not implemented yet",
             ));
         }
         let from = sel.from.as_ref().expect("classified as a fold");
