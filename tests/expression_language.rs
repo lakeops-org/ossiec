@@ -601,6 +601,10 @@ fn seeded() -> duckdb::Connection {
     db
 }
 
+/// The one wrong answer `gaps` allows: `UPPER` on a StarRocks column only changes
+/// ASCII letters, and StarRocks has no Unicode form.
+const KNOWN_WRONG: (Engine, &str) = (Engine::StarRocks, "UPPER(uni) = 'HÉLLO'");
+
 fn check_engine(e: Engine) {
     let db = seeded();
     if e != Engine::DuckDb {
@@ -613,13 +617,14 @@ fn check_engine(e: Engine) {
         run(e, &sql).expect("seed (is `scripts/engines.sh up` running?)");
     }
     let (_, fails) = probe_engine(e, &db);
-    // A gap is a refusal or an engine error, never a wrong answer.
+    let label = |f: &String| f[8..].lines().next().unwrap().to_string();
+    // A gap is a refusal or an engine error, never a wrong answer, apart from
+    // `KNOWN_WRONG`: that probe, on that engine only.
     let wrong: Vec<&String> = fails
         .iter()
-        .filter(|f| f.starts_with("WRONG") && !f.contains("UPPER(uni)"))
+        .filter(|f| f.starts_with("WRONG") && KNOWN_WRONG != (e, label(f).as_str()))
         .collect();
     assert!(wrong.is_empty(), "{e:?}: wrong answers: {wrong:#?}");
-    let label = |f: &String| f[8..].lines().next().unwrap().to_string();
     let known = gaps(e);
     let new: Vec<&String> = fails
         .iter()
