@@ -88,6 +88,10 @@ pub(crate) fn adapt_shell(ast: Expression, target: DialectType) -> Result<Expres
 
 /// Hook 2: finish rendered SQL for `target`. Runs after rendering.
 pub(crate) fn finish(sql: String, target: DialectType, pretty: bool) -> Result<String> {
+    // MySQL's generator upper-cases function names, which it reads either way.
+    let sql = sql
+        .replace("__ossiec_exact_", "")
+        .replace("__OSSIEC_EXACT_", "");
     match target {
         DialectType::ClickHouse => clickhouse::finish(sql, pretty),
         _ => Ok(sql),

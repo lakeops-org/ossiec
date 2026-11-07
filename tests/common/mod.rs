@@ -1143,7 +1143,15 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
         Engine::MySql => (
             "ossiec-mysql",
             vec![
-                "mysql", "-uroot", "-possiec", "-D", "ossiec", "-N", "-B", "-r",
+                "mysql",
+                "-uroot",
+                "-possiec",
+                "-D",
+                "ossiec",
+                "-N",
+                "-B",
+                "-r",
+                "--default-character-set=utf8mb4",
             ],
             Some(sql.to_string()),
         ),

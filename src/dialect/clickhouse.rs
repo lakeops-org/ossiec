@@ -77,24 +77,14 @@ pub(super) fn adapt(ast: Expression, _plan: &LogicalPlan) -> Result<Expression> 
 /// Typed `CAST(NULL AS T)` → `Nullable(T)` is left to polyglot (≥0.13.5)
 /// ([polyglot#514](https://github.com/tobilg/polyglot/issues/514)).
 pub(super) fn finish(sql: String, pretty: bool) -> Result<String> {
-    let ch = DialectType::ClickHouse;
-    let settings = match sql::parse(
-        "SELECT 1 SETTINGS join_use_nulls = 1, aggregate_functions_null_for_empty = 1",
-        ch,
-    ) {
-        Ok(Expression::Select(s)) => s.settings,
-        _ => return Err(Error::Internal("settings template".into())),
-    };
-    let mut ast = sql::parse(&sql, ch)
+    // Attached to the text: read and written back, `startsWith` and `match` would
+    // come out as `STARTS_WITH` and `MATCH`, and ClickHouse's names are case-sensitive.
+    let ast = sql::parse(&sql, DialectType::ClickHouse)
         .map_err(|e| Error::Internal(format!("re-reading ClickHouse SQL: {e}")))?;
-    if let Expression::Select(s) = &mut ast {
-        s.settings = settings;
+    if !matches!(ast, Expression::Select(_)) {
+        return Ok(sql);
     }
-    let d = polyglot_sql::dialects::Dialect::get(ch);
-    let out = if pretty {
-        d.generate_pretty(&ast)
-    } else {
-        d.generate(&ast)
-    };
-    out.map_err(internal)
+    const SETTINGS: &str = "SETTINGS join_use_nulls = 1, aggregate_functions_null_for_empty = 1";
+    let gap = if pretty { "\n" } else { " " };
+    Ok(format!("{sql}{gap}{SETTINGS}"))
 }
