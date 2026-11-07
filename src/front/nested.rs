@@ -258,7 +258,12 @@ fn classify(sel: &Select) -> Result<Kind> {
                     || sel
                         .having
                         .as_ref()
-                        .is_some_and(|h| h.this.contains(super::is_measure_agg_expr))) =>
+                        .is_some_and(|h| h.this.contains(super::is_measure_agg_expr))
+                    || sel.order_by.iter().any(|o| {
+                        o.expressions
+                            .iter()
+                            .any(|k| k.this.contains(super::is_measure_agg_expr))
+                    })) =>
         {
             Ok(Kind::Fold)
         }
@@ -385,7 +390,11 @@ impl Compiler<'_> {
                 parsed.request.ensure_datasets.push(spec.attach_ds);
             }
         }
-        if depth == 0 && parsed.derived.is_empty() && parsed.having.is_none() {
+        if depth == 0
+            && parsed.derived.is_empty()
+            && parsed.having.is_none()
+            && parsed.order_exprs.is_empty()
+        {
             self.flat_request = Some(parsed.request.clone());
         }
         let graph = &self.graph;
@@ -496,12 +505,12 @@ impl Compiler<'_> {
             }
         }
         protect_inflating_joins(graph, &mut logical, &mut self.ctx)?;
-        super::apply_having(&mut logical, parsed.having.as_ref())?;
+        super::apply_group_exprs(&mut logical, parsed.having.as_ref(), &parsed.order_exprs)?;
         apply_select_formulas(
             graph,
             &mut logical,
             &parsed.measure_outputs,
-            parsed.having.is_some(),
+            parsed.having.is_some() || !parsed.order_exprs.is_empty(),
         )?;
         rename_consumer_outputs(&mut logical, &parsed.measure_outputs, &parsed.dim_labels);
 

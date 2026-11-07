@@ -796,6 +796,29 @@ macro_rules! shop_joins {
 
 pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
     Layer2NestedCase {
+        // §7.5: a Top-N by a measure nothing selects, stacked with a de-duplicated part.
+        name: "top_n_by_an_unselected_measure",
+        sql: shop_joins!(
+            "SELECT c.region, AGG(o.order_count) AS n ",
+            " GROUP BY c.region ORDER BY AGG(p.stock_units) * -1 NULLS LAST, c.region LIMIT 2"
+        ),
+        reference: "WITH n AS (
+              SELECT c.region, COUNT(*) AS n
+              FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region
+            ), st AS (
+              SELECT region, SUM(stock) AS v FROM (
+                SELECT DISTINCT c.region, p.product_id, p.stock
+                FROM orders o
+                LEFT JOIN {customers} c ON o.customer_id = c.customer_id
+                LEFT JOIN products p ON o.product_id = p.product_id
+                WHERE p.product_id IS NOT NULL
+              ) GROUP BY region
+            )
+            SELECT n.region, n.n FROM n LEFT JOIN st ON n.region IS NOT DISTINCT FROM st.region
+            ORDER BY st.v * -1 NULLS LAST, n.region NULLS FIRST LIMIT 2",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.5: over the finished groups, on a selected measure.
         name: "having_on_a_selected_measure",
         sql: "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status HAVING AGG(order_count) > 1",
