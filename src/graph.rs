@@ -904,25 +904,42 @@ pub(crate) fn lower_filters(e: Expression, only_statistics: bool) -> Result<Expr
     .map_err(|e| Error::Internal(e.to_string()))
 }
 
+/// The SQL type of the one field an aggregate reads, when the model declares it.
+fn declared_type(datatypes: &BTreeSet<Option<String>>) -> Option<&'static str> {
+    let mut it = datatypes.iter();
+    match (it.next(), it.next()) {
+        (Some(Some(d)), None) => match d.to_ascii_lowercase().as_str() {
+            "integer" | "decimal" | "float" => Some("NUMERIC"),
+            "string" => Some("TEXT"),
+            "date" => Some("DATE"),
+            "datetime" | "datetimetz" => Some("TIMESTAMP"),
+            "boolean" => Some("BOOLEAN"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Type family of an aggregate's result: numeric for counting and arithmetic
 /// aggregates; for MIN/MAX/ANY_VALUE, the type of the one field they read.
 fn null_type(e: &Expression, datatypes: &BTreeSet<Option<String>>) -> Option<&'static str> {
     match e {
         Expression::Min(_) | Expression::Max(_) | Expression::AnyValue(_) => {
-            let mut it = datatypes.iter();
-            match (it.next(), it.next()) {
-                (Some(Some(d)), None) => match d.to_ascii_lowercase().as_str() {
-                    "integer" | "decimal" | "float" => Some("NUMERIC"),
-                    "string" => Some("TEXT"),
-                    "date" => Some("DATE"),
-                    "datetime" | "datetimetz" => Some("TIMESTAMP"),
-                    "boolean" => Some("BOOLEAN"),
-                    _ => None,
-                },
-                _ => None,
-            }
+            declared_type(datatypes)
         }
         Expression::AggregateFunction(_) => None,
+        // `PERCENTILE_DISC` returns a value of what it sorts, like `MIN`.
+        // `PERCENTILE_CONT` interpolates, so it's numeric.
+        Expression::WithinGroup(w) => match &w.this {
+            Expression::AggregateFunction(a) if a.name.eq_ignore_ascii_case("PERCENTILE_DISC") => {
+                declared_type(datatypes)
+            }
+            Expression::AggregateFunction(a) if a.name.eq_ignore_ascii_case("PERCENTILE_CONT") => {
+                Some("NUMERIC")
+            }
+            _ => None,
+        },
+        Expression::Filter(f) => null_type(&f.this, datatypes),
         _ => Some("NUMERIC"),
     }
 }
@@ -1630,7 +1647,6 @@ impl SemanticGraph {
                     other => other,
                 })?;
             let datasets = RefCell::new(BTreeSet::new());
-            let datatypes = RefCell::new(BTreeSet::new());
             let failure = RefCell::new(None);
             let ast = transform(raw.clone(), &|e| {
                 let Expression::Column(c) = e else {
@@ -1640,9 +1656,6 @@ impl SemanticGraph {
                 Ok(Some(match self.resolve_column(&c, info.owner, &mut ctx) {
                     Ok((ds, f)) => {
                         datasets.borrow_mut().insert(ds);
-                        datatypes
-                            .borrow_mut()
-                            .insert(self.datasets[ds].fields[f].datatype.clone());
                         self.field_sql(ds, f, &mut ctx)
                     }
                     Err(err) => {
@@ -1667,7 +1680,19 @@ impl SemanticGraph {
             }
             let key = polyglot_sql::generate(&ast, DialectType::Generic)
                 .map_err(|e| Error::Internal(e.to_string()))?;
-            let datatypes = datatypes.into_inner();
+            // The type of what the aggregate reads, not of what its FILTER reads.
+            let body = clear_aggregate_filter(raw.clone());
+            let datatypes: BTreeSet<Option<String>> = get_columns(&body)
+                .iter()
+                .filter_map(|c| match c {
+                    Expression::Column(c) => {
+                        let mut ctx = ctx_cell.borrow_mut();
+                        self.resolve_column(c, info.owner, &mut ctx).ok()
+                    }
+                    _ => None,
+                })
+                .map(|(ds, f)| self.datasets[ds].fields[f].datatype.clone())
+                .collect();
             terms.push(Term {
                 null_type: null_type(&raw, &datatypes),
                 dup_insensitive: dup_insensitive(&raw),

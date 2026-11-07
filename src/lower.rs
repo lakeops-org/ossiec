@@ -456,15 +456,17 @@ fn unmatched_rows(
     ctx: &mut Ctx,
 ) -> Result<Expression> {
     // The grain and everything the leg reaches through it.
-    let mut subtree: BTreeSet<String> = BTreeSet::from([g.datasets[grain].name.clone()]);
+    // Aliases as columns carry them, without the quotes of a quoted dataset's name.
+    let key = |a: &str| crate::plan::unquoted(a).to_string();
+    let mut subtree: BTreeSet<String> = BTreeSet::from([key(&g.datasets[grain].name)]);
     let mut steps = vec![];
     for s in &leg.joins {
-        if subtree.contains(&s.from_alias) {
-            subtree.insert(s.to_alias.clone());
+        if subtree.contains(&key(&s.from_alias)) {
+            subtree.insert(key(&s.to_alias));
             steps.push(s);
         }
     }
-    let rename = |a: &str| format!("{a}__unmatched");
+    let rename = |a: &str| format!("{}__unmatched", crate::plan::unquoted(a));
     // Re-point columns at the unmatched aliases; columns of the fact side are NULL.
     let retarget = |e: &Expression| -> Expression {
         transform(e.clone(), &|e| {
@@ -515,7 +517,7 @@ fn unmatched_rows(
     let derived: Vec<DerivedJoin> = leg
         .derived
         .iter()
-        .filter(|d| subtree.contains(&d.from_alias))
+        .filter(|d| subtree.contains(&key(&d.from_alias)))
         .cloned()
         .collect();
     let from = tree_sql(

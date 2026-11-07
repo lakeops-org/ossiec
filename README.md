@@ -366,7 +366,7 @@ The full rationale is in **[docs/DESIGN.md](docs/DESIGN.md)**.
 | Non-SQL dialects (`DAX`, `MDX`, `TABLEAU`, …) | Ignored (a field needs at least one SQL form) |
 | `FILTER (WHERE …)`, `COUNT(DISTINCT …)`, ratios, `CASE` | ✅ |
 | Scalar and aggregate functions in `expression_language.md` | Partial: engine by engine, see `gaps` in [`tests/expression_language.rs`](tests/expression_language.rs) |
-| Identifier rules (regular names upper-cased, quoted kept, so `"ID"` matches `id` and `"id"` doesn't; 128 characters at most) | ✅ |
+| Identifier rules (regular names upper-cased, quoted kept, so `"ID"` matches `id` and `"id"` doesn't; 128 characters at most) | ✅ Except Layer 2 measure names, which ignore quotes: `AGG("m")` matches `m` |
 | `source.column` in dataset-scoped metrics | ✅ |
 | Reserved `AGG`, and no subqueries, in portable expressions | ✅ Refused when the model loads |
 | Window functions in metrics (`OVER`, `RANK`, `LAG`, running totals) | ✅ Dataset-scoped directly, model-scoped with `deferredMetrics` |

@@ -1216,3 +1216,101 @@ fn both_layers_match_field_names_alike() {
     let q = "SELECT \"K\", AGG(a.m) FROM a JOIN b ON a.k = b.id GROUP BY \"K\"";
     ossiec::compile_sql(&g, q, &duck_opts()).unwrap();
 }
+
+/// A dataset declared in quotes answers exactly like one that isn't, through the
+/// paths that build aliases from its name.
+#[test]
+fn a_quoted_dataset_answers_like_a_regular_one() {
+    let model = |name: &str, spare: bool| {
+        let extra = if spare {
+            format!("  - {{ name: spare, from: orders, to: {name}, from_columns: [spare_id], to_columns: [id] }}\n")
+        } else {
+            String::new()
+        };
+        format!("{HEAD}datasets:\n  - name: {name}\n    source: products\n    primary_key: [id]\n    fields:\n      - {{ name: id, expression: {{ sql: id }} }}\n      - {{ name: stock, expression: {{ sql: stock }} }}\n    metrics:\n      - {{ name: units, expression: {{ sql: SUM(stock) }} }}\n  - name: orders\n    source: orders\n    primary_key: [id]\n    fields:\n      - {{ name: id, expression: {{ sql: id }} }}\n      - {{ name: product_id, expression: {{ sql: product_id }} }}\n      - {{ name: spare_id, expression: {{ sql: spare_id }} }}\n      - {{ name: region, expression: {{ sql: region }} }}\n    metrics:\n      - {{ name: n, expression: {{ sql: COUNT(*) }} }}\nrelationships:\n  - {{ name: bought, from: orders, to: {name}, from_columns: [product_id], to_columns: [id] }}\n{extra}")
+    };
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE products (id INT, stock INT);
+         INSERT INTO products VALUES (1, 10), (2, 20), (3, 7);
+         CREATE TABLE orders (id INT, product_id INT, spare_id INT, region TEXT);
+         INSERT INTO orders VALUES (1, 1, 2, 'EU'), (2, 1, 2, 'EU'), (3, 2, 1, 'US');",
+    )
+    .unwrap();
+    let load = |name: &str, spare: bool| {
+        ossiec::from_yaml(&model(name, spare))
+            .map_err(|e| e.to_string())
+            .unwrap()
+    };
+    let (regular, quoted) = (load("p", false), load("'\"P\"'", false));
+    let rows = |sql: &str| {
+        let mut r = duckdb_rows(&db, sql);
+        r.sort();
+        r
+    };
+    // Unmatched rows: product 3 has no order, and still counts.
+    let unmatched = Options {
+        include_unmatched: true,
+        ..duck_opts()
+    };
+    let q = |p: &str| {
+        format!("SELECT o.region, AGG(x.units) FROM orders o LEFT JOIN {p} x ON o.product_id = x.id GROUP BY o.region")
+    };
+    let want = rows(
+        &ossiec::compile_sql(&regular, &q("p"), &unmatched)
+            .unwrap()
+            .sql,
+    );
+    assert!(
+        want.iter().any(|r| r[0] == "NULL" && r[1] == "7.000000"),
+        "{want:?}"
+    );
+    let c = ossiec::compile_sql(&quoted, &q("\"P\""), &unmatched).unwrap();
+    assert_eq!(rows(&c.sql), want, "{}", c.sql);
+    // Roles: one dataset under two relationships at once.
+    let (regular, quoted) = (load("p", true), load("'\"P\"'", true));
+    let req = r#"{"metrics":["orders.n"],"dimensions":[{"field":"bought.stock","alias":"b"},{"field":"spare.stock","alias":"s"}]}"#;
+    let r = Request::from_json(req).unwrap();
+    let want = rows(&ossiec::compile(&regular, &r, &duck_opts()).unwrap().sql);
+    assert_eq!(want.len(), 2, "{want:?}");
+    let c = ossiec::compile(&quoted, &r, &duck_opts()).unwrap();
+    assert_eq!(rows(&c.sql), want, "{}", c.sql);
+}
+
+/// Stacked parts leave a measure's column NULL, typed to combine with its real
+/// values: `PERCENTILE_DISC` returns what it sorts, not a number.
+#[test]
+#[ignore]
+fn stacked_percentiles_keep_their_type_on_postgres() {
+    let y = format!("{HEAD}datasets:\n  - name: d\n    source: pct_d\n    primary_key: [id]\n    fields:\n      - {{ name: id, expression: {{ sql: id }} }}\n      - {{ name: nm, expression: {{ sql: nm }} }}\n  - name: x\n    source: pct_x\n    primary_key: [id]\n    fields:\n      - {{ name: id, expression: {{ sql: id }} }}\n      - {{ name: dk, expression: {{ sql: dk }} }}\n      - {{ name: amt, expression: {{ sql: amt }} }}\n    metrics:\n      - {{ name: tot, expression: {{ sql: SUM(amt) }} }}\n  - name: z\n    source: pct_x\n    primary_key: [id]\n    fields:\n      - {{ name: id, expression: {{ sql: id }} }}\n      - {{ name: dk, expression: {{ sql: dk }} }}\n      - {{ name: amt, expression: {{ sql: amt }} }}\n    metrics:\n      - {{ name: tot2, expression: {{ sql: SUM(amt) }} }}\n  - name: y\n    source: pct_y\n    primary_key: [id]\n    fields:\n      - {{ name: id, expression: {{ sql: id }} }}\n      - {{ name: dk, expression: {{ sql: dk }} }}\n      - {{ name: at, datatype: date, expression: {{ sql: at }} }}\n      - {{ name: lbl, datatype: string, expression: {{ sql: lbl }} }}\n      - {{ name: n, datatype: integer, expression: {{ sql: id }} }}\n    metrics:\n      - {{ name: on_date, expression: {{ sql: 'PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY at)' }} }}\n      - {{ name: on_text, expression: {{ sql: 'PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY lbl)' }} }}\n      - {{ name: filtered, expression: {{ sql: 'PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY at) FILTER (WHERE id > 0)' }} }}\n      - {{ name: earliest, expression: {{ sql: 'MIN(at) FILTER (WHERE id > 0)' }} }}\n      - {{ name: cont, expression: {{ sql: 'PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY n)' }} }}\nrelationships:\n  - {{ name: xd, from: x, to: d, from_columns: [dk], to_columns: [id] }}\n  - {{ name: zd, from: z, to: d, from_columns: [dk], to_columns: [id] }}\n  - {{ name: yd, from: y, to: d, from_columns: [dk], to_columns: [id] }}\n");
+    run(
+        Engine::Postgres,
+        "DROP TABLE IF EXISTS pct_d, pct_x, pct_y;
+         CREATE TABLE pct_d (id INT, nm TEXT); INSERT INTO pct_d VALUES (1, 'n');
+         CREATE TABLE pct_x (id INT, dk INT, amt INT); INSERT INTO pct_x VALUES (1, 1, 9);
+         CREATE TABLE pct_y (id INT, dk INT, at DATE, lbl TEXT);
+         INSERT INTO pct_y VALUES (1, 1, DATE '2024-01-01', 'z');",
+    )
+    .expect("seed (is `scripts/engines.sh up` running?)");
+    let g = ossiec::from_yaml(&y).map_err(|e| e.to_string()).unwrap();
+    let opts = Options {
+        target: Some(Engine::Postgres.dialect()),
+        pretty: false,
+        ..Default::default()
+    };
+    for (metric, want) in [
+        ("y.on_date", "2024-01-01"),
+        ("y.on_text", "z"),
+        ("y.filtered", "2024-01-01"),
+        ("y.earliest", "2024-01-01"),
+        ("y.cont", "1"),
+    ] {
+        // Two parts before the percentile's, each with its column NULL.
+        let req = format!(r#"{{"metrics":["x.tot","z.tot2","{metric}"],"dimensions":["d.nm"]}}"#);
+        let r = Request::from_json(&req).unwrap();
+        let c = ossiec::compile(&g, &r, &opts).unwrap();
+        let rows =
+            run(Engine::Postgres, &c.sql).unwrap_or_else(|e| panic!("{metric}: {e}\n{}", c.sql));
+        assert!(same(&rows[0][3], want), "{metric}: {rows:?}");
+    }
+}

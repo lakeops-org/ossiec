@@ -465,7 +465,11 @@ pub(crate) struct LogicalPlan {
 pub(crate) fn alias(g: &SemanticGraph, (ds, role): Node) -> String {
     match role {
         None => g.datasets[ds].name.clone(),
-        Some(r) => format!("{}__{}", g.datasets[ds].name, g.rels[r].name),
+        Some(r) => format!(
+            "{}__{}",
+            unquoted(&g.datasets[ds].name),
+            unquoted(&g.rels[r].name)
+        ),
     }
 }
 
