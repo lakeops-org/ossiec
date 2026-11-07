@@ -2,9 +2,9 @@
 //! refuses, and what it spells differently from polyglot's AST.
 
 use polyglot_sql::expressions::Var;
-use polyglot_sql::{is_query, is_subquery, Expression, ExpressionWalk};
+use polyglot_sql::{is_query, is_subquery, DialectType, Expression, ExpressionWalk};
 
-use crate::sql::transform;
+use crate::sql::{self, transform};
 
 /// A standard name for a type SQL has no word for. `TIMESTAMP_NTZ` is a wall-clock
 /// timestamp, which is what `TIMESTAMP` means in standard SQL. polyglot can't parse
@@ -39,6 +39,29 @@ pub(crate) fn spell_types(text: &str) -> String {
         rest = &rest[c.len_utf8()..];
     }
     out
+}
+
+/// Read an expression. polyglot reads text as a statement first, so an expression that
+/// starts like one, as in `REPLACE(a, 'x', 'y') = 'z'`, only parses in a select list.
+pub(crate) fn parse(text: &str) -> Result<Expression, String> {
+    let error = match sql::parse(text, DialectType::Generic) {
+        Ok(ast) => return Ok(ast),
+        Err(error) => error,
+    };
+    match sql::parse(&format!("SELECT {text}"), DialectType::Generic) {
+        Ok(Expression::Select(s)) if s.expressions.len() == 1 && s.from.is_none() => {
+            let simple = s.where_clause.is_none()
+                && s.group_by.is_none()
+                && s.having.is_none()
+                && s.order_by.is_none()
+                && s.limit.is_none();
+            match s.expressions.into_iter().next() {
+                Some(e) if simple && !matches!(e, Expression::Alias(_)) => Ok(e),
+                _ => Err(error),
+            }
+        }
+        _ => Err(error),
+    }
 }
 
 /// What the language doesn't allow in an expression, if `ast` has any of it.

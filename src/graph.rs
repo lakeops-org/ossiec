@@ -232,7 +232,7 @@ pub(crate) fn true_division(ast: Expression) -> Expression {
 fn variants(e: &model::Expression, what: &str) -> std::result::Result<Vec<Variant>, String> {
     let mut out = vec![];
     let portable = |text: &str, shown: &str| -> std::result::Result<Expression, String> {
-        let ast = sql::parse(&portable::spell_types(text), DialectType::Generic)
+        let ast = portable::parse(&portable::spell_types(text))
             .map_err(|err| format!("{what}: cannot parse {shown}`{text}`: {err}"))?;
         if let Some(why) = portable::refusal(&ast) {
             return Err(format!("{what}: {why}"));

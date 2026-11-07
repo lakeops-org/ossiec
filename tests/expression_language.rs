@@ -11,8 +11,9 @@ mod common;
 use common::{duckdb_rows, norm_text, run, Engine};
 use ossiec::{Options, Request};
 
-/// What each engine can't do. Each is a clear refusal or an engine's error: the test
-/// fails on a wrong answer, and when an entry starts to work.
+/// What each engine can't do. Each is a clear refusal or an engine's error, apart from
+/// the one marked: the test fails on any other wrong answer, and when an entry starts
+/// to work.
 fn gaps(e: Engine) -> &'static [&'static str] {
     match e {
         Engine::DuckDb => &[],
@@ -21,6 +22,7 @@ fn gaps(e: Engine) -> &'static [&'static str] {
             "TRY_CAST(s AS INT)",
         ],
         Engine::MySql => &[
+            "2 * MEDIAN(v)",
             "MEDIAN(v) FILTER (WHERE g = 'b')",
             "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
             "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
@@ -47,6 +49,7 @@ fn gaps(e: Engine) -> &'static [&'static str] {
         ],
         Engine::ClickHouse => &[],
         Engine::Trino => &[
+            "2 * MEDIAN(v)",
             "MEDIAN(v) FILTER (WHERE g = 'b')",
             "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
             "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
@@ -67,6 +70,9 @@ fn gaps(e: Engine) -> &'static [&'static str] {
             "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'a')",
         ],
         Engine::StarRocks => &[
+            // A known limit, and the one wrong answer on this list: `UPPER` on a column
+            // only changes ASCII letters on StarRocks, which has no Unicode form.
+            "UPPER(uni) = 'HÉLLO'",
             "NTH_VALUE(SUM(v), 2) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
         ],
     }
@@ -301,6 +307,109 @@ fn probes() -> Vec<P> {
         row("nul IS NOT DISTINCT FROM i", "F"),
         row("nul IS NOT DISTINCT FROM nul", "T"), row("i IS DISTINCT FROM nul", "T"),
         row("i IS DISTINCT FROM 7", "F"), row("i IS NOT DISTINCT FROM 7", "T"),
+        // Boundaries: what a single fixed date can't tell apart.
+        row("EXTRACT(DAYOFWEEK FROM DATE '2024-03-17')", "0"),
+        row("EXTRACT(DAYOFWEEK FROM DATE '2024-03-16')", "6"),
+        row("EXTRACT(DAYOFWEEK FROM DATE '2024-03-18')", "1"),
+        row("DATE_PART('dayofweek', DATE '2024-03-17')", "0"),
+        row("EXTRACT(WEEK FROM DATE '2024-12-30')", "1"),
+        row("EXTRACT(WEEK FROM DATE '2021-01-03')", "53"),
+        row("EXTRACT(WEEK FROM DATE '2024-01-01')", "1"),
+        row("DATE_PART('week', DATE '2024-12-30')", "1"),
+        row("EXTRACT(DAYOFYEAR FROM DATE '2024-12-31')", "366"),
+        row("EXTRACT(DAYOFYEAR FROM DATE '2023-12-31')", "365"),
+        row("DAYOFYEAR(DATE '2024-01-01')", "1"),
+        row("QUARTER(DATE '2024-10-01')", "4"),
+        row("QUARTER(DATE '2024-03-31')", "1"),
+        row("HOUR(TIMESTAMP '2024-03-15 00:00:00')", "0"),
+        row("HOUR(TIMESTAMP '2024-03-15 23:59:59')", "23"),
+        row("DATE_TRUNC('week', DATE '2024-03-17')", "2024-03-11"),
+        row("DATE_TRUNC('week', DATE '2024-03-18')", "2024-03-18"),
+        row("DATE_TRUNC('quarter', DATE '2024-11-15')", "2024-10-01"),
+        row("DATE_TRUNC('month', DATE '2024-02-29')", "2024-02-01"),
+        row("DATEDIFF(day, DATE '2024-01-17', DATE '2024-01-15')", "-2"),
+        row("DATEDIFF(month, DATE '2024-03-01', DATE '2024-01-31')", "-2"),
+        row("DATEDIFF(year, DATE '2025-01-01', DATE '2024-12-31')", "-1"),
+        row("DATEDIFF(quarter, DATE '2025-01-01', DATE '2024-12-31')", "-1"),
+        row("DATEDIFF(week, DATE '2024-03-18', DATE '2024-03-17')", "-1"),
+        row("DATEDIFF(week, DATE '2024-03-11', DATE '2024-03-17')", "0"),
+        row("DATEDIFF(week, DATE '2024-12-30', DATE '2025-01-06')", "1"),
+        row("DATEDIFF(day, TIMESTAMP '2024-03-15 23:59:59', TIMESTAMP '2024-03-16 00:00:00')", "1"),
+        row("DATEDIFF(hour, TIMESTAMP '2024-03-15 14:00:00', TIMESTAMP '2024-03-15 13:59:00')", "-1"),
+        row("DATEDIFF(second, TIMESTAMP '2024-03-15 14:00:00', TIMESTAMP '2024-03-15 13:59:59')", "-1"),
+        row("DATEADD(day, -1, DATE '2024-03-01')", "2024-02-29"),
+        row("DATEADD(year, 1, DATE '2024-02-29')", "2025-02-28"),
+        row("DATEADD(month, -1, DATE '2024-03-31')", "2024-02-29"),
+        row("DATEADD(quarter, -1, DATE '2024-03-31')", "2023-12-31"),
+        row("DATEADD(week, -1, DATE '2024-03-07')", "2024-02-29"),
+        row("HOUR(DATEADD(hour, -14, ts))", "23"),
+        row("TO_CHAR(ts, 'HH12 PM')", "01 PM"),
+        row("TO_CHAR(TIMESTAMP '2024-03-15 00:05:09', 'HH24:MI:SS')", "00:05:09"),
+        row("TO_CHAR(TIMESTAMP '2024-03-15 09:05:09', 'HH12 AM')", "09 AM"),
+        // Not found, empty and NULL.
+        row("POSITION('z' IN s)", "0"),
+        row("CHARINDEX('z', s)", "0"),
+        row("SPLIT_PART(csv, ',', 9) = ''", "T"),
+        row("SPLIT_PART(csv, ',', 3)", "c"),
+        row("SPLIT_PART(csv, 'x', 1)", "a,b,c"),
+        row("STARTSWITH(s, '')", "T"),
+        row("ENDSWITH(s, '')", "T"),
+        row("CONTAINS(s, '')", "T"),
+        row("STARTSWITH(uni, 'hé')", "T"),
+        row("ENDSWITH(uni, 'llo')", "T"),
+        row("CHARINDEX('l', uni)", "3"),
+        row("POSITION('l' IN uni)", "3"),
+        row("LEFT(uni, 2) = 'hé'", "T"),
+        row("RIGHT(uni, 4) = 'éllo'", "T"),
+        row("SUBSTRING(uni, 2, 2) = 'él'", "T"),
+        row("UPPER(uni) = 'HÉLLO'", "T"),
+        row("LOWER(UPPER(uni)) = 'héllo'", "T"),
+        row("LENGTH(UPPER(uni))", "5"),
+        row("REPLACE(uni, 'é', 'e') = 'hello'", "T"),
+        row("SPLIT_PART(CAST(nul AS VARCHAR), ',', 1) IS NULL", "T"),
+        row("CONCAT(s, '-', s, '-', CAST(nul AS VARCHAR)) IS NULL", "T"),
+        row("s || CAST(nul AS VARCHAR) IS NULL", "T"),
+        row("LENGTH(CAST(nul AS VARCHAR)) IS NULL", "T"),
+        row("CONTAINS(CAST(nul AS VARCHAR), 'x') IS NULL", "T"),
+        row("STARTSWITH(CAST(nul AS VARCHAR), 'x') IS NULL", "T"),
+        row("CONCAT(s, CAST(nul AS VARCHAR)) IS NULL", "T"),
+        row("SUBSTRING(s, 4, 99)", "lo"),
+        row("ZEROIFNULL(z)", "0"),
+        row("NVL2(z, 1, 2)", "1"),
+        // A rewritten call stays one operand.
+        row("2 * EXTRACT(DAYOFWEEK FROM d)", "10"),
+        row("10 - EXTRACT(DAYOFWEEK FROM d)", "5"),
+        row("2 * DATEDIFF(month, DATE '2024-01-31', DATE '2024-03-01')", "4"),
+        row("100 - DATEDIFF(year, DATE '2024-12-31', DATE '2026-01-01')", "98"),
+        row("100 - DATEDIFF(quarter, DATE '2024-01-01', DATE '2024-07-01')", "98"),
+        row("100 - DATEDIFF(day, DATE '2024-01-01', DATE '2024-01-03')", "98"),
+        row("100 - DATEDIFF(week, DATE '2024-01-01', DATE '2024-01-15')", "98"),
+        row("2 * EXTRACT(MILLISECOND FROM ts)", "60000"),
+        row("NOT CONTAINS(s, 'zzz')", "T"),
+        row("NOT STARTSWITH(s, 'zzz')", "T"),
+        row("NOT ENDSWITH(s, 'zzz')", "T"),
+        row("CONTAINS(s, 'ell') = TRUE", "T"),
+        row("STARTSWITH(s, 'He') AND ENDSWITH(s, 'lo')", "T"),
+        row("CONCAT(s, '!') = 'Hello!'", "T"),
+        row("YEAR(DATEADD(year, 1, d)) + 1", "2026"),
+        row("LENGTH(CONCAT(s, '!')) * 2", "12"),
+        row("2 * LENGTH(s)", "10"),
+        row("ZEROIFNULL(nul) + 1", "1"),
+        row("2 * NULLIFZERO(i)", "14"),
+        row("2 * CHARINDEX('l', s)", "6"),
+        row("IFF(i > j, 1, 2) * 2", "2"),
+        row("CASE WHEN CONTAINS(s, 'ell') THEN 1 ELSE 0 END", "1"),
+        // Expressions polyglot reads as statements unless they're in a select list.
+        row("((i = 7)) AND j = 2", "T"),
+        // Signs.
+        row("MOD(neg, j)", "-1"),
+        row("SIGN(z)", "0"),
+        row("FLOOR(0 - f)", "-3"),
+        row("CEIL(0 - f)", "-2"),
+        row("TRUNC(0 - pi, 2)", "-3.14"),
+        row("ROUND(0 - pi, 2)", "-3.14"),
+        row("ROUND(pi, 0)", "3"),
+        row("TRUNC(pi, 0)", "3"),
         // Case-insensitive function names
         row("upper(s)", "HELLO"), row("Upper(s)", "HELLO"),
         // Aggregates
@@ -309,6 +418,8 @@ fn probes() -> Vec<P> {
         agg("sum(v)", "19"), agg("Sum(v)", "19"),
         agg("STDDEV(v)", "3.633180"), agg("STDDEV_POP(v)", "3.249615"), agg("STDDEV_SAMP(v)", "3.633180"),
         agg("VARIANCE(v)", "13.2"), agg("VAR_POP(v)", "10.56"), agg("VAR_SAMP(v)", "13.2"),
+        agg("2 * MEDIAN(v)", "4"),
+        agg("10 - COUNT(*)", "4"),
         agg("MEDIAN(v)", "2"),
         // An even count interpolates, and a picked percentile takes the lower value.
         agg("MEDIAN(v) FILTER (WHERE g = 'b')", "7"),
@@ -503,7 +614,10 @@ fn check_engine(e: Engine) {
     }
     let (_, fails) = probe_engine(e, &db);
     // A gap is a refusal or an engine error, never a wrong answer.
-    let wrong: Vec<&String> = fails.iter().filter(|f| f.starts_with("WRONG")).collect();
+    let wrong: Vec<&String> = fails
+        .iter()
+        .filter(|f| f.starts_with("WRONG") && !f.contains("UPPER(uni)"))
+        .collect();
     assert!(wrong.is_empty(), "{e:?}: wrong answers: {wrong:#?}");
     let label = |f: &String| f[8..].lines().next().unwrap().to_string();
     let known = gaps(e);
@@ -1399,5 +1513,40 @@ fn a_rewritten_aggregate_keeps_its_filter() {
     ] {
         let s = sql_for(&t("", m).unwrap(), PostgreSQL);
         assert!(s.contains("FILTER(WHERE \"t\".id > 1)"), "{m}: {s}");
+    }
+}
+
+/// A form the table doesn't handle keeps every argument, rather than silently losing
+/// one or failing inside the compiler.
+#[test]
+fn other_argument_counts_pass_through() {
+    use ossiec::DialectType::{ClickHouse, DuckDB, PostgreSQL};
+    for (sql, d, kept) in [
+        ("REGEXP_REPLACE(a, 'x', 'y', 'i')", DuckDB, "'i'"),
+        ("REGEXP_REPLACE(a, 'x', 'y', 'i')", PostgreSQL, "'i'"),
+        ("REGEXP_EXTRACT(a, 'x', 1)", DuckDB, ", 1)"),
+        ("CHARINDEX('l', a, 3)", DuckDB, "3"),
+        ("ZEROIFNULL(a, 1)", DuckDB, ", 1)"),
+    ] {
+        let s = sql_on(&field(sql), Some(d), None).unwrap();
+        assert!(s.contains(kept), "{sql} on {d:?}: {s}");
+    }
+    // Too few arguments are the engine's to refuse, not an internal error.
+    for sql in ["CHARINDEX('l')", "SPLIT_PART(a, ',')", "REGEXP_LIKE(a)"] {
+        let r = sql_on(&field(sql), Some(DuckDB), None);
+        assert!(!r.is_err_and(|e| e.contains("internal")), "{sql}");
+    }
+    let r = Request::from_json(r#"{"metrics":["t.m"]}"#).unwrap();
+    for d in [ClickHouse, DuckDB] {
+        let opts = Options {
+            target: Some(d),
+            ..Default::default()
+        };
+        let g = t("", "APPROX_PERCENTILE(amount)").unwrap();
+        let out = ossiec::compile(&g, &r, &opts);
+        assert!(
+            !out.is_err_and(|e| e.to_string().contains("internal")),
+            "{d:?}"
+        );
     }
 }

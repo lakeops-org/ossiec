@@ -365,7 +365,7 @@ The full rationale is in **[docs/DESIGN.md](docs/DESIGN.md)**.
 | `expression.sql` / `OSSIE_SQL_2026`, `ANSI_SQL`, vendor SQL dialects | ✅ |
 | Non-SQL dialects (`DAX`, `MDX`, `TABLEAU`, …) | Ignored (a field needs at least one SQL form) |
 | `FILTER (WHERE …)`, `COUNT(DISTINCT …)`, ratios, `CASE` | ✅ |
-| Scalar and aggregate functions in `expression_language.md` | ✅ DuckDB and ClickHouse. Others refuse what they can't express: exact percentiles and `MEDIAN` on MySQL and Trino, `TRY_CAST` on MySQL and Postgres, `REGEXP_COUNT` on MySQL. See `gaps` in [`tests/expression_language.rs`](tests/expression_language.rs) |
+| Scalar and aggregate functions in `expression_language.md` | ✅ DuckDB and ClickHouse. Other engines refuse what they can't express, and [`gaps`](tests/expression_language.rs) is the full list: `MEDIAN`, exact percentiles on MySQL and Trino, `APPROX_PERCENTILE` and `REGEXP_COUNT` on MySQL, `TRY_CAST` on MySQL and Postgres. `NTH_VALUE` fails with an engine error on StarRocks, whose `UPPER` also only changes ASCII letters in a column |
 | Identifier rules (regular names upper-cased, quoted kept, so `"ID"` matches `id` and `"id"` doesn't; 128 characters at most) | ✅ Except Layer 2 measure names, which ignore quotes: `AGG("m")` matches `m` |
 | `source.column` in dataset-scoped metrics | ✅ |
 | Reserved `AGG`, and no subqueries, in portable expressions | ✅ Refused when the model loads |

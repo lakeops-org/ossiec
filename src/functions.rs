@@ -100,6 +100,16 @@ fn ossie_call(e: &Expression) -> Option<Call> {
         Expression::Second(f) => extract("SECOND", &f.this),
         Expression::Extract(f) => extract(&field_name(&f.field)?, &f.this),
         Expression::Length(f) => call("LENGTH", vec![f.this.clone()]),
+        Expression::Upper(f) => call("UPPER", vec![f.this.clone()]),
+        Expression::Lower(f) => call("LOWER", vec![f.this.clone()]),
+        Expression::StrPosition(f) if f.position.is_none() && f.occurrence.is_none() => call(
+            "POSITION",
+            vec![(**f.substr.as_ref()?).clone(), (*f.this).clone()],
+        ),
+        Expression::Substring(f) => call(
+            "SUBSTRING",
+            vec![f.this.clone(), f.start.clone(), f.length.clone()?],
+        ),
         Expression::Contains(f) => call("CONTAINS", vec![f.this.clone(), f.expression.clone()]),
         Expression::StartsWith(f) => call("STARTSWITH", vec![f.this.clone(), f.expression.clone()]),
         Expression::EndsWith(f) => call("ENDSWITH", vec![f.this.clone(), f.expression.clone()]),
@@ -139,7 +149,9 @@ fn ossie_call(e: &Expression) -> Option<Call> {
             args: vec![f.this.clone()],
             filter: f.filter.clone(),
         }),
-        Expression::AggregateFunction(f) if f.name.eq_ignore_ascii_case("APPROX_PERCENTILE") => {
+        Expression::AggregateFunction(f)
+            if f.name.eq_ignore_ascii_case("APPROX_PERCENTILE") && f.args.len() == 2 =>
+        {
             Some(Call {
                 key: "APPROX_PERCENTILE".into(),
                 args: f.args.clone(),
@@ -188,11 +200,16 @@ fn ossie_call(e: &Expression) -> Option<Call> {
                 ("ROUND" | "TRUNC" | "TRUNCATE", 2) => {
                     call(name.replace("TRUNCATE", "TRUNC"), args.clone())
                 }
-                (
-                    "ZEROIFNULL" | "NULLIFZERO" | "CHARINDEX" | "SPLIT_PART" | "REGEXP_LIKE"
-                    | "REGEXP_EXTRACT" | "REGEXP_REPLACE" | "REGEXP_COUNT",
-                    _,
-                ) => call(name, args.clone()),
+                // Only the forms a rule handles. Any other form isn't Ossie's, so it
+                // keeps its arguments and passes through.
+                ("CONCAT", n) if n >= 2 => call(name, args.clone()),
+                ("ZEROIFNULL" | "NULLIFZERO", 1)
+                | (
+                    "LEFT" | "RIGHT" | "CHARINDEX" | "REGEXP_LIKE" | "REGEXP_EXTRACT"
+                    | "REGEXP_COUNT",
+                    2,
+                )
+                | ("SPLIT_PART" | "REGEXP_REPLACE", 3) => call(name, args.clone()),
                 _ => None,
             }
         }
@@ -244,12 +261,17 @@ fn standard(key: &str) -> Option<&'static str> {
     })
 }
 
+/// `a || b || ...`, for a `CONCAT` of any length.
+const CONCAT_BY_OPERATOR: &str = "__concat_by_operator";
+
 /// Where an engine needs its own form.
 fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
     use DialectType::{ClickHouse, DuckDB, MySQL, PostgreSQL, StarRocks, Trino};
     Some(match (target, key) {
         // DuckDB
         (DuckDB, "CURRENT_TIMESTAMP") => Sql("CURRENT_TIMESTAMP"),
+        // NULL makes the result NULL, as on the other engines here. These two would skip it.
+        (DuckDB | PostgreSQL, "CONCAT") => Sql(CONCAT_BY_OPERATOR),
         (DuckDB, "REGEXP_EXTRACT") => Sql("REGEXP_EXTRACT({0}, {1}, 0)"),
         (DuckDB, "REGEXP_REPLACE") => Sql("REGEXP_REPLACE({0}, {1}, {2}, 'g')"),
         (DuckDB, "REGEXP_COUNT") => Sql("LEN(REGEXP_EXTRACT_ALL({0}, {1}))"),
@@ -301,7 +323,7 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
         (MySQL | StarRocks, "STARTSWITH") => Sql("LEFT({0}, __ossiec_exact_CHAR_LENGTH({1})) = {1}"),
         (MySQL | StarRocks, "ENDSWITH") => Sql("RIGHT({0}, __ossiec_exact_CHAR_LENGTH({1})) = {1}"),
         (MySQL, "TRY_CAST") => Refuse,
-        (MySQL, "SPLIT_PART") => Sql("SUBSTRING_INDEX(SUBSTRING_INDEX({0}, {1}, {2}), {1}, -1)"),
+        (MySQL, "SPLIT_PART") => Sql("CASE WHEN {0} IS NULL THEN NULL WHEN {2} <= (__ossiec_exact_CHAR_LENGTH({0}) - __ossiec_exact_CHAR_LENGTH(REPLACE({0}, {1}, ''))) / __ossiec_exact_CHAR_LENGTH({1}) + 1 THEN SUBSTRING_INDEX(SUBSTRING_INDEX({0}, {1}, {2}), {1}, -1) ELSE '' END"),
         (MySQL, "REGEXP_EXTRACT") => Sql("REGEXP_SUBSTR({0}, {1})"),
         (MySQL, "REGEXP_COUNT") => Refuse,
         (MySQL, "MEDIAN" | "PERCENTILE_CONT" | "PERCENTILE_DISC" | "APPROX_PERCENTILE") => Refuse,
@@ -326,9 +348,9 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
         (MySQL | StarRocks, "DATEADD:HOUR") => Sql("{1} + INTERVAL {0} HOUR"),
         (MySQL | StarRocks, "DATEADD:MINUTE") => Sql("{1} + INTERVAL {0} MINUTE"),
         (MySQL | StarRocks, "DATEADD:SECOND") => Sql("{1} + INTERVAL {0} SECOND"),
-        (MySQL | StarRocks, "DATEDIFF:YEAR") => Sql("YEAR({1}) - YEAR({0})"),
-        (MySQL | StarRocks, "DATEDIFF:QUARTER") => Sql("4 * (YEAR({1}) - YEAR({0})) + QUARTER({1}) - QUARTER({0})"),
-        (MySQL | StarRocks, "DATEDIFF:MONTH") => Sql("12 * (YEAR({1}) - YEAR({0})) + MONTH({1}) - MONTH({0})"),
+        (MySQL | StarRocks, "DATEDIFF:YEAR") => Sql("CAST(YEAR({1}) AS BIGINT) - CAST(YEAR({0}) AS BIGINT)"),
+        (MySQL | StarRocks, "DATEDIFF:QUARTER") => Sql("4 * (CAST(YEAR({1}) AS BIGINT) - CAST(YEAR({0}) AS BIGINT)) + CAST(QUARTER({1}) AS BIGINT) - CAST(QUARTER({0}) AS BIGINT)"),
+        (MySQL | StarRocks, "DATEDIFF:MONTH") => Sql("12 * (CAST(YEAR({1}) AS BIGINT) - CAST(YEAR({0}) AS BIGINT)) + CAST(MONTH({1}) AS BIGINT) - CAST(MONTH({0}) AS BIGINT)"),
         (MySQL | StarRocks, "DATEDIFF:WEEK") => Sql("FLOOR((TO_DAYS({1}) - WEEKDAY({1}) - TO_DAYS({0}) + WEEKDAY({0})) / 7)"),
         (MySQL | StarRocks, "DATEDIFF:DAY") => Sql("TO_DAYS({1}) - TO_DAYS({0})"),
         (MySQL | StarRocks, "DATEDIFF:HOUR") => Sql("TIMESTAMPDIFF(HOUR, DATE_FORMAT({0}, '%Y-%m-%d %H:00:00'), DATE_FORMAT({1}, '%Y-%m-%d %H:00:00'))"),
@@ -339,6 +361,7 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
         (MySQL | StarRocks, "TO_TIMESTAMP:2") => Sql("CAST(STR_TO_DATE({0}, {1}) AS DATETIME)"),
 
         // StarRocks. `||` is logical OR, as on MySQL by default.
+        (StarRocks, "SPLIT_PART") => Sql("CASE WHEN {0} IS NULL THEN NULL ELSE __ossiec_exact_SPLIT_PART({0}, {1}, {2}) END"),
         (StarRocks, "CONCAT_OP") => Sql("CONCAT({0}, {1})"),
         (StarRocks, "TRUNC") => Sql("__ossiec_exact_TRUNCATE({0}, {1})"),
         (StarRocks, "REGEXP_EXTRACT") => Sql("REGEXP_EXTRACT({0}, {1}, 0)"),
@@ -358,9 +381,13 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
         // the boundaries crossed. Its `FLOAT` is `REAL`, and the language's is 64-bit.
         (Trino, "MEDIAN" | "PERCENTILE_CONT" | "PERCENTILE_DISC") => Refuse,
         (Trino, "APPROX_PERCENTILE") => Sql("__ossiec_exact_APPROX_PERCENTILE({0}, {1})"),
+        // Sunday is 7 on Trino, and 0 on every other engine here.
+        (Trino, "EXTRACT:DAYOFWEEK") => Sql("EXTRACT(DOW FROM {0}) % 7"),
         (Trino, "EXTRACT:MILLISECOND") => Sql("SECOND({0}) * 1000 + MILLISECOND({0})"),
         (Trino, "REGEXP_EXTRACT") => Sql("__ossiec_exact_REGEXP_EXTRACT({0}, {1})"),
         (Trino, "TRUNC") => Sql("TRUNCATE(CAST({0} AS DECIMAL(38, 10)), {1})"),
+        // Past the last part it returns NULL, and the other engines here an empty string.
+        (Trino, "SPLIT_PART") => Sql("CASE WHEN {0} IS NULL THEN NULL ELSE COALESCE(__ossiec_exact_SPLIT_PART({0}, {1}, {2}), '') END"),
         (Trino, "CAST_FLOAT") => Sql("CAST({0} AS DOUBLE)"),
         (Trino, "DATEDIFF:YEAR") => Sql("__ossiec_exact_DATE_DIFF('YEAR', DATE_TRUNC('YEAR', {0}), DATE_TRUNC('YEAR', {1}))"),
         (Trino, "DATEDIFF:QUARTER") => Sql("__ossiec_exact_DATE_DIFF('QUARTER', DATE_TRUNC('QUARTER', {0}), DATE_TRUNC('QUARTER', {1}))"),
@@ -374,13 +401,20 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
         (Trino, "TO_DATE:2") => Sql("CAST(__ossiec_exact_DATE_PARSE({0}, {1}) AS DATE)"),
         (Trino, "TO_TIMESTAMP:2") => Sql("__ossiec_exact_DATE_PARSE({0}, {1})"),
 
-        // ClickHouse: function names are case-sensitive.
+        // ClickHouse: function names are case-sensitive, and the plain string functions
+        // count and change bytes, so non-ASCII text needs the UTF-8 ones.
+        (ClickHouse, "UPPER") => Sql("upperUTF8({0})"),
+        (ClickHouse, "LOWER") => Sql("lowerUTF8({0})"),
+        (ClickHouse, "LEFT") => Sql("leftUTF8({0}, {1})"),
+        (ClickHouse, "RIGHT") => Sql("rightUTF8({0}, {1})"),
+        (ClickHouse, "SUBSTRING") => Sql("substringUTF8({0}, {1}, {2})"),
+        (ClickHouse, "POSITION") => Sql("positionUTF8({1}, {0})"),
         (ClickHouse, "LENGTH") => Sql("lengthUTF8({0})"),
         (ClickHouse, "STARTSWITH") => Sql("startsWith({0}, {1})"),
         (ClickHouse, "ENDSWITH") => Sql("endsWith({0}, {1})"),
         (ClickHouse, "CHARINDEX") => Sql("positionUTF8({1}, {0})"),
         (ClickHouse, "CONTAINS") => Sql("positionUTF8({0}, {1}) > 0"),
-        (ClickHouse, "SPLIT_PART") => Sql("arrayElement(splitByString({1}, {0}), {2})"),
+        (ClickHouse, "SPLIT_PART") => Sql("CASE WHEN {0} IS NULL THEN NULL ELSE arrayElement(splitByString({1}, {0}), {2}) END"),
         (ClickHouse, "REGEXP_COUNT") => Sql("countMatches({0}, {1})"),
         (ClickHouse, "CURRENT_TIME") => Sql("toTime(now())"),
         (ClickHouse, "TIME_LITERAL") => Sql("CAST({0} AS TIME)"),
@@ -510,6 +544,14 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
             }
             None => sql.to_string(),
         };
+        let sql = if sql == CONCAT_BY_OPERATOR {
+            (0..c.args.len())
+                .map(|i| format!("{{{i}}}"))
+                .collect::<Vec<_>>()
+                .join(" || ")
+        } else {
+            sql
+        };
         let mut t = Tpl::new();
         let mut text = sql;
         for (i, arg) in c.args.iter().enumerate() {
@@ -519,10 +561,13 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
                 text = text.replacen(&slot, &ph, 1);
             }
         }
-        t.push(&text);
-        let built = t
-            .build()
-            .map_err(|err| polyglot_sql::Error::internal(err.to_string()))?;
+        // In parentheses, so it stays one operand wherever the call sat:
+        // `2 * EXTRACT(DOW ...)` must not become `2 * DAYOFWEEK(d) - 1`.
+        t.push(&format!("({text})"));
+        let built = without_needless_parens(
+            t.build()
+                .map_err(|err| polyglot_sql::Error::internal(err.to_string()))?,
+        );
         Ok(Some(match c.filter {
             None => built,
             Some(p) => with_filter(built, p),
@@ -553,6 +598,33 @@ fn quantile_on_clickhouse(sql: &str, args: &[Expression]) -> Option<String> {
     Some(format!(
         "CASE WHEN COUNT({x}) = 0 THEN NULL ELSE arrayReduce('{function}({p})', groupArray({x})) END"
     ))
+}
+
+/// A call or a `CASE` is already one operand.
+fn without_needless_parens(e: Expression) -> Expression {
+    match e {
+        Expression::Paren(p)
+            if !matches!(
+                p.this,
+                Expression::Add(_)
+                    | Expression::Sub(_)
+                    | Expression::Mul(_)
+                    | Expression::Div(_)
+                    | Expression::Mod(_)
+                    | Expression::Eq(_)
+                    | Expression::Neq(_)
+                    | Expression::Gt(_)
+                    | Expression::Gte(_)
+                    | Expression::Lt(_)
+                    | Expression::Lte(_)
+                    | Expression::Concat(_)
+                    | Expression::IntDiv(_)
+            ) =>
+        {
+            p.this
+        }
+        other => other,
+    }
 }
 
 /// `FILTER` on a rewritten aggregate: on the node where it can be read back.
