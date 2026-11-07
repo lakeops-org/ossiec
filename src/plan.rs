@@ -14,7 +14,8 @@
 
 use std::collections::BTreeSet;
 
-use polyglot_sql::{transform, Expression};
+use crate::sql::transform;
+use polyglot_sql::Expression;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -201,7 +202,15 @@ fn metrics_to_json<S: serde::Serializer>(
 
 /// The final part of a reference.
 pub(crate) fn final_part(name: &str) -> &str {
-    name.rsplit('.').next().unwrap_or(name)
+    unquoted(name.rsplit('.').next().unwrap_or(name))
+}
+
+/// A name without the quotes the model or a request wrote it in.
+pub(crate) fn unquoted(name: &str) -> &str {
+    name.strip_prefix('"')
+        .and_then(|n| n.strip_suffix('"'))
+        .filter(|n| !n.is_empty())
+        .unwrap_or(name)
 }
 
 impl Request {

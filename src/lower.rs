@@ -14,8 +14,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::sql::transform;
 use polyglot_sql::expressions::Identifier;
-use polyglot_sql::{get_columns, transform, DialectType, Expression};
+use polyglot_sql::{get_columns, DialectType, Expression};
 
 use crate::graph::{Ctx, SemanticGraph, TERM};
 use crate::plan::{
@@ -470,7 +471,7 @@ fn unmatched_rows(
             Ok(Some(match e {
                 Expression::Column(mut c) => match c.table.as_ref().map(|t| t.name.clone()) {
                     Some(t) if subtree.contains(&t) => {
-                        c.table = Some(Identifier::quoted(rename(&t)));
+                        c.table = Some(crate::sql::quoted(&rename(&t)));
                         Expression::Column(c)
                     }
                     Some(_) => Expression::Null(polyglot_sql::expressions::Null),

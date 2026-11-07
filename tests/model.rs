@@ -143,14 +143,31 @@ fn validation_rules() {
 }
 
 #[test]
-fn bare_identifiers_match_case_insensitively_quoted_ones_exactly() {
-    let yaml = format!(
-        "{HEAD}datasets:\n  - {{name: Orders, source: t, fields: [{{name: Amount, expression: {{sql: amt}}}}]}}\nmetrics:\n  - {{name: m, expression: {{sql: SUM(orders.AMOUNT)}}}}\n  - {{name: q, expression: {{sql: 'SUM(\"Orders\".\"Amount\")'}}}}\n"
-    );
-    ossiec::from_yaml(&yaml).unwrap();
-    let bad = yaml.replace("\"Amount\")", "\"amount\")");
-    assert_ne!(bad, yaml);
-    assert!(invalid(&bad).contains("not a field"));
+fn identifiers_match_by_their_normalized_forms() {
+    // Expression language, "Comparison Table": a regular name is upper-cased and a
+    // quoted one kept, so `"AMOUNT"` matches `Amount` and `"Amount"` doesn't.
+    let model = |r: &str| {
+        format!(
+            "{HEAD}datasets:\n  - {{name: Orders, source: t, fields: [{{name: Amount, expression: {{sql: amt}}}}, {{name: '\"Exact\"', expression: {{sql: e}}}}]}}\nmetrics:\n  - {{name: m, expression: {{sql: 'SUM({r})'}}}}\n"
+        )
+    };
+    for ok in [
+        "orders.AMOUNT",
+        "ORDERS.amount",
+        "\"ORDERS\".\"AMOUNT\"",
+        "orders.\"Exact\"",
+    ] {
+        ossiec::from_yaml(&model(ok)).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for bad in [
+        "orders.\"Amount\"",
+        "orders.\"amount\"",
+        "orders.Exact",
+        "orders.\"EXACT\"",
+    ] {
+        assert!(invalid(&model(bad)).contains("not a field"), "{bad}");
+    }
+    assert!(invalid(&model("\"Orders\".amount")).contains("unknown dataset"));
 }
 
 /// The Ossie compliance fixtures (M0-M3), executed: every metric compiled for

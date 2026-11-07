@@ -113,7 +113,7 @@ fn literal_backslashes_in_like(ast: Expression) -> Result<Expression> {
             }
         }
     };
-    polyglot_sql::transform(ast, &|e| {
+    crate::sql::transform(ast, &|e| {
         Ok(Some(match e {
             Expression::Like(mut op) => {
                 double(&mut op);

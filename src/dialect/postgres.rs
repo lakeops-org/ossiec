@@ -1,8 +1,9 @@
 //! Postgres rules.
 
+use crate::sql::transform;
 use polyglot_sql::builder::{cast, Expr};
 use polyglot_sql::expressions::CollationExpr;
-use polyglot_sql::{transform, Expression};
+use polyglot_sql::Expression;
 
 use super::{internal, literal_backslashes_in_like};
 use crate::plan::LogicalPlan;

@@ -9,11 +9,30 @@
 use polyglot_sql::dialects::{Dialect, TranspileOptions};
 use polyglot_sql::expressions::Identifier;
 use polyglot_sql::generator::NormalizeFunctions;
-use polyglot_sql::{parse_one, transform, DialectType, Expression};
+use polyglot_sql::{parse_one, DialectType, Expression};
 
 use crate::{Error, Result};
 
 const PH: &str = "__ossiec_";
+
+/// A quoted identifier for a name that may be written in its own quotes in the
+/// model. polyglot can't read back the tripled quotes it would otherwise generate.
+pub(crate) fn quoted(name: &str) -> Identifier {
+    Identifier::quoted(crate::plan::unquoted(name))
+}
+
+/// Rewrite every node, children first. polyglot's own `transform` is selective:
+/// it skips the arguments of many typed functions (`YEAR(d)`, `CONTAINS(s, x)`,
+/// `FIRST_VALUE(SUM(v))`), so a field or aggregate inside one would go unseen.
+/// `None` replaces the node with NULL.
+pub(crate) fn transform<F>(e: Expression, f: &F) -> polyglot_sql::Result<Expression>
+where
+    F: Fn(Expression) -> polyglot_sql::Result<Option<Expression>>,
+{
+    polyglot_sql::transform_all(e, &|e| {
+        Ok(f(e)?.unwrap_or(Expression::Null(polyglot_sql::expressions::Null)))
+    })
+}
 
 /// A SQL template with expression and output-alias placeholders.
 #[derive(Default)]
@@ -54,7 +73,7 @@ impl Tpl {
                 Expression::Column(mut c) if c.table.is_none() => match slot(&c.name.name) {
                     Some(Slot::Arg(i)) => args[i].clone(),
                     Some(Slot::Alias(i)) => {
-                        c.name = Identifier::quoted(&aliases[i]);
+                        c.name = quoted(&aliases[i]);
                         Expression::Column(c)
                     }
                     None => Expression::Column(c),
@@ -65,7 +84,7 @@ impl Tpl {
                 },
                 Expression::Alias(mut a) => {
                     if let Some(Slot::Alias(i)) = slot(&a.alias.name) {
-                        a.alias = Identifier::quoted(&aliases[i]);
+                        a.alias = quoted(&aliases[i]);
                     }
                     Expression::Alias(a)
                 }
@@ -123,7 +142,7 @@ pub(crate) fn derived(query: Expression, alias: Identifier) -> Expression {
 pub(crate) fn quoted_col(name: &str) -> Expression {
     let mut e = col("x");
     if let Expression::Column(c) = &mut e {
-        c.name = Identifier::quoted(name);
+        c.name = quoted(name);
     }
     e
 }
@@ -158,7 +177,7 @@ pub(crate) fn render(
 pub(crate) fn qualified_quoted_col(table: &str, name: &str) -> Expression {
     let mut e = quoted_col(name);
     if let Expression::Column(c) = &mut e {
-        c.table = Some(Identifier::quoted(table));
+        c.table = Some(quoted(table));
     }
     e
 }
@@ -181,10 +200,7 @@ pub(crate) fn substitute_relation(
     transform(ast, &|e| {
         Ok(Some(match e {
             Expression::Table(t) if t.schema.is_none() && t.name.name == placeholder => {
-                let alias = t
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| Identifier::quoted(placeholder));
+                let alias = t.alias.clone().unwrap_or_else(|| quoted(placeholder));
                 derived(inner.clone(), alias)
             }
             other => other,
