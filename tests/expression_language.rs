@@ -719,6 +719,23 @@ fn refuses_what_the_language_leaves_out() {
         let e = t("", metric).map(|_| ()).expect_err(metric);
         assert!(e.contains(why), "{metric}: {e}");
     }
+    // Read as a select list to parse `REPLACE(...) = x`, text must still be one
+    // expression: nothing after it may be dropped.
+    for field in [
+        "id WHERE id > 1",
+        "id AS other",
+        "id ORDER BY id",
+        "id GROUP BY id",
+        "id LIMIT 1",
+        "id, amt",
+        "REPLACE(id, 'a', 'b') = 'c' WHERE TRUE",
+    ] {
+        let f = format!(
+            "      - {{ name: x, expression: {{ sql: {} }} }}\n",
+            serde_json::to_string(field).unwrap()
+        );
+        assert!(t(&f, "SUM(amount)").is_err(), "{field}");
+    }
     for field in [
         "AGG(id)",
         "(SELECT 1)",

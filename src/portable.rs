@@ -66,6 +66,9 @@ pub(crate) fn parse(text: &str) -> Result<Expression, String> {
 
 /// What the language doesn't allow in an expression, if `ast` has any of it.
 pub(crate) fn refusal(ast: &Expression) -> Option<&'static str> {
+    if matches!(ast, Expression::Alias(_)) {
+        return Some("an expression can't rename itself; its field or metric's name is its name");
+    }
     if ast.contains(|e| is_query(e) || is_subquery(e)) {
         return Some("subqueries aren't part of the expression language");
     }
