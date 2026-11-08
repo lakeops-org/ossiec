@@ -21,8 +21,12 @@
 //! result is an ordinary `AGG` stage ([`Compiler::agg_stage`]). An inner `GROUP BY`
 //! is dropped (it only fixes a grain; the measure is re-evaluated at the outer one).
 //!
-//! Inners that would change which rows feed the measure (`HAVING`, `DISTINCT`,
-//! `ORDER BY` / `LIMIT`, `WITH`, a derived `FROM`) are refused. The derived-table
+//! Inners that would change which rows feed the measure (`DISTINCT`, `ORDER BY` /
+//! `LIMIT`, `WITH`, a derived `FROM`) are refused. An inner that aggregates
+//! (`GROUP BY`, `HAVING`, or an aggregate in its select list) can't carry a
+//! measure out (§7.2), so an outer `AGG()` of one of its columns is refused in
+//! `FoldMap::agg_arg`; its `HAVING` is never copied into the folded query. The
+//! derived-table
 //! join form (`FROM orders o JOIN (...) t ON ...`) does not fold; see
 //! [`super::nested`].
 
