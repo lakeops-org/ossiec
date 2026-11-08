@@ -108,7 +108,13 @@ $ echo "SELECT c.region, AGG(o.order_count), AGG(p.stock_units)
     | ossiec compile-sql shop.yaml - --dialect postgres
 ```
 
-`AGG(p.stock_units)` sums each product's stock once per region, however many orders repeat it. More in [Layer 2: SQL with AGG()](layer2.md).
+`AGG(p.stock_units)` sums each product's stock once per region, however many orders repeat it. ossiec also prints a warning:
+
+```text
+warning: FAN_TRAP_RISK: `SUM("products".stock)` is computed over `products` rows de-duplicated by primary key; a `products` row that belongs to several groups counts in each, so groups do not add up to a grand total
+```
+
+A product bought in two regions counts in both, which is right per region, but the regions don't add up to the total stock. More in [Layer 2: SQL with AGG()](layer2.md).
 
 ## From Rust
 

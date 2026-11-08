@@ -15,6 +15,14 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 - **Measure names in quotes**: `AGG("m")` matches `m`, ignoring the quotes
 - **Persisting a view** judges its joins by how they're written, so `orders RIGHT JOIN customers` is refused though it means the same as `customers LEFT JOIN orders`, which persists
 
+## Known bugs
+
+Found while reviewing this site; each is a wrong message or name, not a wrong answer:
+
+- **`SELECT *`** is refused with a misleading message about `AGG` arithmetic instead of saying `*` isn't supported.
+- **A scalar subquery in the select list** is refused with a message about plain aggregates instead of saying subqueries aren't supported.
+- **An unaliased `AGG()` of a view's measure** (`SELECT region, AGG(sales_per_ticket) FROM region_metrics`) is named `__l2_1` instead of `sales_per_ticket`. Give it an `AS` until this is fixed.
+
 ## Layer 1
 
 - **Exact percentiles on MySQL and Trino**, which have no such function: `MEDIAN`, `PERCENTILE_CONT`, `PERCENTILE_DISC`

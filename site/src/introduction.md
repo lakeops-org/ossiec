@@ -32,15 +32,15 @@ It runs, it looks right, and it's wrong. Stock lives on `products`, but the join
 
 ossiec computes every measure over its own rows, never over rows a join repeated. That guarantee comes from the Ossie spec itself (Layer 2's G2), and ossiec holds it on every engine it targets.
 
-## Three ways to ask
+## The three layers
 
-Ossie defines three layers for querying a model ([`spec_layers.md`](https://github.com/apache/ossie/blob/main/core-spec/spec_layers.md)); ossiec implements all three. A fourth, ontology documents, is out of scope and rejected with a clear error.
+Ossie organizes its spec in layers ([`spec_layers.md`](https://github.com/apache/ossie/blob/main/core-spec/spec_layers.md)): Layer 1 defines the model, and Layers 2 and 3 are two ways to query it. ossiec implements all three. A Layer 3 request means the same as an equivalent Layer 2 query, so Layer 2's no-duplication guarantee carries through. Layer 4, ontologies, is out of scope; ossiec rejects those documents with a clear error.
 
 | Layer | You write | ossiec returns | Spec |
 |---|---|---|---|
 | **3 · Semantic requests** | Metrics, dimensions and filters, as JSON. ossiec picks the joins. | One SQL statement, or the spec's error code when no answer is safe | [`wide_table_semantics.md`](https://github.com/apache/ossie/blob/main/core-spec/wide_table_semantics.md) |
 | **2 · SQL with `AGG()`** | Your own SQL, with `AGG(measure)` where you read a measure. You choose the joins. | That query, with every measure computed over its own rows | [`relational_semantics.md`](https://github.com/apache/ossie/blob/main/core-spec/relational_semantics.md) |
-| **1 · Expressions** | The SQL inside a model's fields and metrics | Each function rewritten for the target engine, or refused if the engine can't express it faithfully | [`expression_language.md`](https://github.com/apache/ossie/blob/main/core-spec/expression_language.md) |
+| **1 · Model definition** | The model: datasets, fields, relationships and metrics, and the SQL expressions inside them | A validated model, with each function rewritten for the target engine, or refused if the engine can't express it faithfully | [`spec.md`](https://github.com/apache/ossie/blob/main/core-spec/spec.md), [`expression_language.md`](https://github.com/apache/ossie/blob/main/core-spec/expression_language.md) |
 
 ## At a glance
 

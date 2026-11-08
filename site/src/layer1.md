@@ -1,4 +1,21 @@
-# Layer 1: the expression language
+# Layer 1: model definition
+
+Ossie's Layer 1 defines what a model *is*: the model format ([`spec.md`](https://github.com/apache/ossie/blob/main/core-spec/spec.md)) and the expression language its fields and metrics are written in ([`expression_language.md`](https://github.com/apache/ossie/blob/main/core-spec/expression_language.md)). Its guarantee is that an expression in a model evaluates identically on any conforming engine.
+
+## The model format
+
+`ossiec validate` and `ossiec::from_yaml` load a model and check it against the spec, reporting every problem together rather than stopping at the first:
+
+- **Datasets** with a table or a query as `source`, `primary_key` and `unique_keys`, and fields over source columns with `datatype` and `dimension.is_time` (with the spec's defaults).
+- **Relationships** from the many side to the one side, with composite keys.
+- **Metrics**, dataset-scoped (unqualified names) and model-scoped (`dataset.field`), including window functions.
+- **`ai_context`, `description` and `custom_extensions`**, kept and returned by `describe`.
+- **Expression dialects**: `sql` / `OSSIE_SQL_2026`, `ANSI_SQL` and vendor SQL dialects. Non-SQL dialects (`DAX`, `MDX`, `TABLEAU`, …) are ignored, so a field needs at least one SQL form.
+- **Rejected with a clear error**: pre-0.2 `semantic_model:` documents and ontology (Layer 4) documents.
+
+A metric the spec rejects doesn't stop the model loading. Only a request that names it is refused, and `describe` marks it as not queryable. One leniency: a bare name in a model-scoped metric (`SUM(amount)` instead of `SUM(orders.amount)`) is accepted with a warning when exactly one dataset has that field.
+
+## The expression language
 
 The SQL inside a model's fields and metrics is Ossie's portable expression language ([`expression_language.md`](https://github.com/apache/ossie/blob/main/core-spec/expression_language.md)): operators, functions and aggregates with a meaning the spec fixes, independent of any engine.
 

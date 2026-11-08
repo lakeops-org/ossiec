@@ -7,8 +7,9 @@
 - [Getting started](getting-started.md)
 - [Layer 3: semantic requests](layer3.md)
 - [Layer 2: SQL with AGG()](layer2.md)
-- [Layer 1: the expression language](layer1.md)
+- [Layer 1: model definition](layer1.md)
 - [Embedding ossiec](embedding.md)
+- [Reference: CLI and API](reference.md)
 
 # What's supported
 

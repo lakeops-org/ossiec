@@ -6,7 +6,7 @@ What ossiec implements of Apache Ossie `0.2.0.dev0`, document by document and se
 
 Each supported row is backed by tests that execute the SQL and compare it with a reference. The function table and the Layer 2 test list are generated from those tests, so they can't drift: [Functions by engine](generated/functions.md), [Layer 2 test evidence](generated/layer2-tests.md).
 
-## The model ([`spec.md`](https://github.com/apache/ossie/blob/main/core-spec/spec.md))
+## Layer 1: the model ([`spec.md`](https://github.com/apache/ossie/blob/main/core-spec/spec.md))
 
 | Feature | Status | Notes |
 |---|---|---|
@@ -47,7 +47,7 @@ The complete, generated list is [Functions by engine](generated/functions.md).
 | §5.2 Derived measures | ✅ | `(AGG(a) / AGG(b)) TO MEASURE AS m` |
 | §5.3 Evaluation controls | 🟡 | Windows through model metrics; no other controls (out of the spec's scope) |
 | §6 `AGG()` | ✅ | `MEASURE()` accepted as a synonym |
-| §7.1 Unaggregated `SELECT` | ✅ | Measures pass through derived tables; a top-level unevaluated measure is refused (the spec leaves it open, §13.1) |
+| §7.1 Unaggregated `SELECT` | 🟡 | Measures pass through derived tables, renamed or not; a top-level unevaluated measure is refused (the spec leaves it open, §13.1). `SELECT *` is refused |
 | §7.2 Aggregated `SELECT` | 🟡 | `AGG()` arithmetic and plain aggregates beside it. Arithmetic on a plain aggregate is refused |
 | §7.3 `WHERE` | 🟡 | Any row predicate. Subqueries, and a filter on one of several independent facts, are refused |
 | §7.4 `GROUP BY` | 🟡 | `GROUP BY` and `GROUP BY ALL`. `ROLLUP`, `CUBE` and `GROUPING SETS` are refused |

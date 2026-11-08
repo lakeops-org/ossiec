@@ -57,13 +57,14 @@ GROUP BY o.status;
 **Pass-through (§7.7).** The measure stays a measure through the subqueries; the outer `AGG` evaluates it:
 
 ```sql
-SELECT region, AGG(order_count)
-FROM (SELECT region, order_count
-      FROM (SELECT region, order_count FROM orders WHERE status <> 'cancelled') a) b
-GROUP BY region;
+SELECT status, AGG(order_count)
+FROM (SELECT status, order_count
+      FROM (SELECT status, order_count FROM orders WHERE customer_id IS NOT NULL) a
+      WHERE status <> 'cancelled') b
+GROUP BY status;
 ```
 
-**A cross-fact ratio on a conformed dimension (A.7).** Defined once as a view, read like any measure:
+**A cross-fact ratio on a conformed dimension (A.7).** Defined once as a view, read like any measure. This and the next example use a model with independent `orders` and `tickets` facts sharing `customers` ([`two_facts_layer2.yaml`](https://github.com/lakeops-org/ossiec/blob/main/tests/fixtures/two_facts_layer2.yaml)):
 
 ```sql
 CREATE VIEW region_metrics AS
@@ -73,7 +74,7 @@ FROM customers c
 LEFT JOIN orders o ON o.customer_id = c.id
 LEFT JOIN tickets t ON t.customer_id = c.id;
 
-SELECT region, AGG(sales_per_ticket) FROM region_metrics GROUP BY region;
+SELECT region, AGG(sales_per_ticket) AS sales_per_ticket FROM region_metrics GROUP BY region;
 ```
 
 Every region appears, including one whose customers bought nothing. `ossiec persist-view` (or `persist_layer2_view`) can write `sales_per_ticket` into the model as a metric.
@@ -108,6 +109,7 @@ A customer without orders is one joined row, so `COUNT(*)` counts it, while `ord
 
 ossiec refuses these with a clear message rather than answer differently from the spec. Each is on the [roadmap](roadmap.md).
 
+- `SELECT *`
 - Set operators (`UNION`, `INTERSECT`, `EXCEPT`), `ROLLUP`, `CUBE` and `GROUPING SETS`
 - Subqueries in `WHERE`, `HAVING` and `ORDER BY`
 - `ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins
