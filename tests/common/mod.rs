@@ -1176,6 +1176,19 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.2: plain aggregates count the joined rows, NULL-extended ones included;
+        // the measure counts orders.
+        name: "plain_aggregates_beside_a_measure",
+        sql: "SELECT c.region, COUNT(*) AS rows_, MAX(o.order_date) AS last, \
+              AGG(o.order_count) AS n \
+              FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
+        reference: "SELECT c.region, COUNT(*) AS rows_, MAX(o.order_date) AS last, \
+                    COUNT(o.order_id) AS n \
+                    FROM {customers} c LEFT JOIN orders o ON o.customer_id = c.customer_id \
+                    GROUP BY c.region",
+        script: false,
+    },
+    Layer2NestedCase {
         name: "right_join_to_the_one_side",
         sql: "SELECT p.category, AGG(o.order_count) AS n \
               FROM orders o RIGHT JOIN products p ON o.product_id = p.id GROUP BY p.category",

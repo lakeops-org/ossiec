@@ -48,7 +48,11 @@ pub(crate) fn protect_inflating_joins(
             )));
         }
         for term in &mut logical.terms {
-            if term.leg != leg_i || term.strategy != Strategy::Inline || term.term.dup_insensitive {
+            if term.leg != leg_i
+                || term.strategy != Strategy::Inline
+                || term.term.dup_insensitive
+                || term.term.raw
+            {
                 continue;
             }
             ctx.warn(format!(
@@ -108,7 +112,7 @@ fn fact_row_present(
 fn filter_inline_terms(logical: &mut LogicalPlan, leg_i: usize, present: &Expression) -> bool {
     let mut filtered = vec![];
     for (i, term) in logical.terms.iter().enumerate() {
-        if term.leg != leg_i || term.strategy != Strategy::Inline {
+        if term.leg != leg_i || term.strategy != Strategy::Inline || term.term.raw {
             continue;
         }
         match crate::sql::with_aggregate_filter(term.term.ast.clone(), present.clone()) {

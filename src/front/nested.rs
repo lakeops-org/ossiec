@@ -351,7 +351,7 @@ impl Compiler<'_> {
         self.base_seq = base_seq;
         for ep in std::mem::take(&mut parsed.ephemeral) {
             self.graph
-                .install_ephemeral_metric(&ep.name, ep.owner, ep.body)?;
+                .install_ephemeral_metric(&ep.name, ep.owner, ep.body, ep.raw)?;
         }
         if depth == 0 && self.include_unmatched {
             // The outermost AGG stage (a flat query, or the outer stage of a
@@ -511,6 +511,20 @@ impl Compiler<'_> {
             &parsed.consumer_joins,
             self.include_unmatched,
         )?;
+        if logical.terms.iter().any(|t| t.term.raw) {
+            // A plain aggregate reads the query's joined rows. Independent facts
+            // are planned as separate trees, none of which is those rows.
+            if logical.legs.len() > 1 {
+                return Err(unsupported(
+                    "Layer 2 plain aggregates (SUM, COUNT, ...) beside measures from independent facts are not implemented yet",
+                ));
+            }
+            if logical.include_unmatched {
+                return Err(unsupported(
+                    "Layer 2 plain aggregates (SUM, COUNT, ...) with includeUnmatched are not implemented yet",
+                ));
+            }
+        }
         protect_inflating_joins(graph, &mut logical, &mut self.ctx)?;
         super::apply_group_exprs(&mut logical, parsed.having.as_ref(), &parsed.order_exprs)?;
         apply_select_formulas(

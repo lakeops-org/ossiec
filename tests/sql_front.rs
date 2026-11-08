@@ -1511,6 +1511,229 @@ const SALES_PER_TICKET: &str = "SELECT c.region, \
     LEFT JOIN orders o ON o.customer_id = c.id \
     LEFT JOIN tickets t ON t.customer_id = c.id";
 
+/// §7.2: an ordinary aggregate over fields beside measures. It is plain SQL over
+/// the query's joined rows: repeats and NULL-extended rows count, while each
+/// measure still counts its own source rows once.
+#[test]
+fn s72_plain_aggregates_beside_measures() {
+    let g = graph();
+    let db = duckdb();
+    for (q, reference) in [
+        (
+            "SELECT status, MAX(order_date) AS last, AGG(order_count) AS n \
+             FROM orders GROUP BY status",
+            "SELECT status, MAX(order_date), COUNT(*) FROM orders GROUP BY status",
+        ),
+        (
+            "SELECT status, MAX(order_date) FROM orders GROUP BY status",
+            "SELECT status, MAX(order_date) FROM orders GROUP BY status",
+        ),
+        (
+            // Every order, one row each: COUNT(*) and the measure agree.
+            "SELECT c.region, COUNT(*) AS rows_, AGG(o.order_count) AS n \
+             FROM orders o LEFT JOIN customers c ON o.customer_id = c.id GROUP BY c.region",
+            "SELECT c.region, COUNT(*), COUNT(*) FROM orders o \
+             LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region",
+        ),
+        (
+            // A customer without orders is one NULL-extended row: COUNT(*) counts
+            // it, COUNT(o.id) and the measure don't.
+            "SELECT c.region, COUNT(*) AS rows_, COUNT(o.id) AS ids, AGG(o.order_count) AS n \
+             FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
+            "SELECT c.region, COUNT(*), COUNT(o.order_id), COUNT(o.order_id) \
+             FROM {customers} c LEFT JOIN orders o ON o.customer_id = c.customer_id \
+             GROUP BY c.region",
+        ),
+        (
+            // FULL: the measure is de-duplicated by primary key; COUNT(*) still
+            // counts every joined row.
+            "SELECT c.region, COUNT(*) AS rows_, AGG(o.order_count) AS n \
+             FROM customers c FULL JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
+            "SELECT c.region, COUNT(*), COUNT(o.order_id) \
+             FROM {customers} c FULL JOIN orders o ON o.customer_id = c.customer_id \
+             GROUP BY c.region",
+        ),
+        (
+            // A product's stock repeats once per order in plain SQL; the measure
+            // counts each product once (G2).
+            "SELECT o.status, SUM(p.stock) AS repeated, AGG(p.stock_units) AS once \
+             FROM orders o JOIN products p ON o.product_id = p.id GROUP BY o.status",
+            "SELECT o.status, SUM(p.stock), \
+                    (SELECT SUM(stock) FROM products x WHERE x.product_id IN \
+                       (SELECT product_id FROM orders y WHERE y.status = o.status)) \
+             FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY o.status",
+        ),
+    ] {
+        let c = ossiec::compile_layer2(&g, q, &duck()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(&db, reference)),
+            "{q}\n{}",
+            c.sql
+        );
+    }
+}
+
+/// A fan-out: COUNT(*) counts the joined lines, the measure counts orders once.
+#[test]
+fn s72_plain_count_over_a_fanout_counts_lines() {
+    let g = ossiec::from_yaml(FANOUT).unwrap();
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE orders (order_id INTEGER);
+         INSERT INTO orders VALUES (1), (2), (3);
+         CREATE TABLE order_items (line_id INTEGER, order_id INTEGER);
+         INSERT INTO order_items VALUES (1, 1), (2, 1), (3, 2), (4, 9);",
+    )
+    .unwrap();
+    let q = "SELECT COUNT(*) AS lines, AGG(o.order_count) AS orders_ FROM orders o \
+             JOIN order_items i ON i.order_id = o.id";
+    let c = ossiec::compile_layer2(&g, q, &duck()).unwrap();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        vec![vec!["3.000000".to_string(), "2.000000".to_string()]],
+        "{}",
+        c.sql
+    );
+}
+
+/// A plain aggregate in a derived table, read by an outer query.
+#[test]
+fn s72_plain_aggregate_in_a_derived_table() {
+    let db = duckdb();
+    let c = ossiec::compile_layer2(
+        &graph(),
+        "SELECT AVG(n), MAX(last) FROM \
+         (SELECT status, COUNT(*) AS n, MAX(order_date) AS last FROM orders GROUP BY status) t",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(
+            &db,
+            "SELECT AVG(n), MAX(last) FROM \
+             (SELECT status, COUNT(*) AS n, MAX(order_date) AS last FROM orders GROUP BY status) t"
+        ),
+        "{}",
+        c.sql
+    );
+}
+
+#[test]
+fn s72_plain_aggregate_refusals() {
+    let two = two_facts_graph();
+    for (g, q, why) in [
+        (
+            graph(),
+            "SELECT status, MAX(order_id) + 1, AGG(order_count) FROM orders GROUP BY status",
+            "one SUM|COUNT|AVG|MIN|MAX",
+        ),
+        (
+            graph(),
+            "SELECT status, AGG(order_count) / COUNT(*) FROM orders GROUP BY status",
+            "not supported",
+        ),
+        (
+            two.clone(),
+            "SELECT c.region, COUNT(*), AGG(o.order_amt), AGG(t.ticket_count) FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.region",
+            "independent facts",
+        ),
+    ] {
+        let e = ossiec::compile_layer2(&g, q, &duck()).expect_err(q);
+        assert!(
+            matches!(e, Error::Unsupported(ref m) if m.contains(why)),
+            "{q}: {e}"
+        );
+    }
+    let e = ossiec::compile_layer2(
+        &graph(),
+        "-- ossiec: includeUnmatched
+         SELECT p.category, COUNT(*), AGG(o.order_count) FROM orders o \
+         LEFT JOIN products p ON o.product_id = p.id GROUP BY p.category",
+        &duck(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("includeUnmatched")),
+        "{e}"
+    );
+    let e = ossiec::layer2_to_request(
+        &graph(),
+        "SELECT status, MAX(order_date), AGG(order_count) FROM orders GROUP BY status",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("compile_sql")),
+        "{e}"
+    );
+}
+
+/// §7.7: a measure passes unchanged through any number of plain projections and
+/// filters. Each level's WHERE applies; the outer AGG evaluates it at the top.
+#[test]
+fn s77_measure_passes_through_nested_derived_tables() {
+    let g = graph();
+    let db = duckdb();
+    for (q, reference) in [
+        (
+            "SELECT status, AGG(order_count) FROM \
+             (SELECT status, order_count FROM (SELECT status, order_count FROM orders) a) b \
+             GROUP BY status",
+            "SELECT status, COUNT(*) FROM orders GROUP BY status",
+        ),
+        (
+            "SELECT b.state, AGG(b.n) FROM \
+             (SELECT a.st AS state, a.n FROM \
+                (SELECT status AS st, order_count AS n FROM orders \
+                 WHERE customer_id IS NOT NULL) a \
+              WHERE a.st <> 'cancelled') b \
+             WHERE b.state <> 'pending' GROUP BY b.state",
+            "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL \
+             AND status <> 'cancelled' AND status <> 'pending' GROUP BY status",
+        ),
+        (
+            "SELECT status, AGG(order_count) FROM \
+             (SELECT status, order_count FROM \
+               (SELECT status, order_count FROM \
+                 (SELECT status, order_count FROM orders WHERE status <> 'pending') a) b) c \
+             GROUP BY status",
+            "SELECT status, COUNT(*) FROM orders WHERE status <> 'pending' GROUP BY status",
+        ),
+        (
+            "SELECT status, AGG(m) FROM \
+             (SELECT status, m FROM \
+               (SELECT status, COUNT(*) TO MEASURE AS m FROM orders) a) b \
+             GROUP BY status",
+            "SELECT status, COUNT(*) FROM orders GROUP BY status",
+        ),
+    ] {
+        let c = ossiec::compile_layer2(&g, q, &duck()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(&db, reference)),
+            "{q}\n{}",
+            c.sql
+        );
+    }
+}
+
+/// The innermost query groups, and folding would drop its GROUP BY: refused.
+#[test]
+fn s77_nested_fold_refuses_an_aggregating_innermost() {
+    let q = "SELECT status, AGG(order_count) FROM \
+             (SELECT status, order_count FROM \
+               (SELECT status, MAX(order_date) AS d FROM orders GROUP BY status) a) b \
+             GROUP BY status";
+    let e = ossiec::compile_layer2(&graph(), q, &duck()).unwrap_err();
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("aggregates")),
+        "{e}"
+    );
+}
+
 #[test]
 fn s77_from_only_folds_filter_and_projection() {
     // The spec's §7.7 shape. On shop the model-scoped `total_revenue` is not a
@@ -3476,12 +3699,12 @@ fn with_names_derived_tables() {
          SELECT x.status, AGG(x.order_count) FROM b x GROUP BY x.status",
         "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status",
     );
-    // Two levels of pass-through aren't folded yet, with or without WITH.
-    refuses(
+    // Two levels of pass-through, one CTE reading the other (§7.7).
+    answers(
         "WITH a AS (SELECT status, customer_id, order_count FROM orders), \
               b AS (SELECT status, order_count FROM a WHERE customer_id IS NOT NULL) \
          SELECT status, AGG(order_count) FROM b GROUP BY status",
-        "a derived table as its FROM",
+        "SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status",
     );
     // Over a plain aggregate outer query (A.3), inside a derived table, used twice.
     answers(

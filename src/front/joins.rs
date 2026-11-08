@@ -77,7 +77,10 @@ pub(super) fn apply_consumer_joins(
             .iter()
             .enumerate()
             .filter(|(_, term)| {
-                term.leg == leg_i && term.strategy == Strategy::Inline && !term.term.dup_insensitive
+                term.leg == leg_i
+                    && term.strategy == Strategy::Inline
+                    && !term.term.dup_insensitive
+                    && !term.term.raw
             })
             .map(|(i, _)| i)
             .collect();
