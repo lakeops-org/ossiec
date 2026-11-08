@@ -74,7 +74,7 @@ FROM customers c
 LEFT JOIN orders o ON o.customer_id = c.id
 LEFT JOIN tickets t ON t.customer_id = c.id;
 
-SELECT region, AGG(sales_per_ticket) AS sales_per_ticket FROM region_metrics GROUP BY region;
+SELECT region, AGG(sales_per_ticket) FROM region_metrics GROUP BY region;
 ```
 
 Every region appears, including one whose customers bought nothing. `ossiec persist-view` (or `persist_layer2_view`) can write `sales_per_ticket` into the model as a metric.
@@ -111,7 +111,7 @@ ossiec refuses these with a clear message rather than answer differently from th
 
 - `SELECT *`
 - Set operators (`UNION`, `INTERSECT`, `EXCEPT`), `ROLLUP`, `CUBE` and `GROUPING SETS`
-- Subqueries in `WHERE`, `HAVING` and `ORDER BY`
+- Subqueries in the select list, `WHERE`, `HAVING` and `ORDER BY`
 - `ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins
 - Arithmetic on plain aggregates, and plain aggregates in `HAVING`
 - A `WHERE` on one of several independent facts' columns

@@ -6,7 +6,8 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 
 - **Set operators** (`UNION`, `INTERSECT`, `EXCEPT`), even over fields only (§7.8)
 - **`ROLLUP`, `CUBE`, `GROUPING SETS`** (§7.4)
-- **Subqueries in `WHERE`, `HAVING` and `ORDER BY`**, including scalar subqueries that read `AGG()` (§7.3, §7.7)
+- **`SELECT *`** (§7.1)
+- **Subqueries in the select list, `WHERE`, `HAVING` and `ORDER BY`**, including scalar subqueries that read `AGG()` (§7.3, §7.7)
 - **Arithmetic on plain aggregates**, alone or with `AGG()`, and plain aggregates in `HAVING` (§7.2, §7.5)
 - **`WHERE` on one of several independent facts' columns** (§7.3)
 - **A fan-out written from the many side**: `order_items i LEFT JOIN orders o` reading `AGG(o.order_count)`. The same join written `orders o RIGHT JOIN order_items i` works.
@@ -14,14 +15,6 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 - **Comma `FROM`** *(answers differently, not refused)*: SQL reads it as a cross join; ossiec reads it as independent facts sharing their dimensions
 - **Measure names in quotes**: `AGG("m")` matches `m`, ignoring the quotes
 - **Persisting a view** judges its joins by how they're written, so `orders RIGHT JOIN customers` is refused though it means the same as `customers LEFT JOIN orders`, which persists
-
-## Known bugs
-
-Found while reviewing this site; each is a wrong message or name, not a wrong answer:
-
-- **`SELECT *`** is refused with a misleading message about `AGG` arithmetic instead of saying `*` isn't supported.
-- **A scalar subquery in the select list** is refused with a message about plain aggregates instead of saying subqueries aren't supported.
-- **An unaliased `AGG()` of a view's measure** (`SELECT region, AGG(sales_per_ticket) FROM region_metrics`) is named `__l2_1` instead of `sales_per_ticket`. Give it an `AS` until this is fixed.
 
 ## Layer 1
 

@@ -2,13 +2,13 @@
 
 # Layer 2 test evidence
 
-All 139 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 141 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
 Model-qualified relations, measure names, aliases and output labels, and what is not a Layer 2 query.
 
-[`tests/sql_front/basics.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/basics.rs) · 13 tests
+[`tests/sql_front/basics.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/basics.rs) · 14 tests
 
 | Test | What it shows |
 |---|---|
@@ -25,6 +25,7 @@ Model-qualified relations, measure names, aliases and output labels, and what is
 | `group_by_without_agg_equals_dimension_listing` |  |
 | `nested_queries_are_not_layer3_requests` |  |
 | `columns_are_named_as_in_standard_sql` | §3.1: columns behave as in standard SQL, named by their final part, and a relation's column names are unique. |
+| `select_star_and_select_list_subqueries_are_refused_by_name` | `SELECT *` and a select-list subquery are refused by name, not as `AGG` arithmetic or a plain aggregate, which is what they would otherwise be read as. |
 
 ## Joins (§7.6, A.5, A.6)
 
@@ -189,7 +190,7 @@ Role-playing dimensions (`relationship.field`), and the one-side rows no fact re
 
 `CREATE VIEW` measure relations in a session catalog.
 
-[`tests/sql_front/views.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/views.rs) · 11 tests
+[`tests/sql_front/views.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/views.rs) · 12 tests
 
 | Test | What it shows |
 |---|---|
@@ -204,6 +205,7 @@ Role-playing dimensions (`relationship.field`), and the one-side rows no fact re
 | `a7_appendix_conformed_dimension_bridge` | Appendix A.7: conformed-dimension bridge as a session `CREATE VIEW`. |
 | `a_view_defining_a_measure_cannot_have_having` | A view can't define a measure and also aggregate with HAVING (§7.2), so there's no such view to persist. |
 | `appendix_a7_ungrouped_view_answers` | Appendix A.7, as the spec writes it: the view has no `GROUP BY`, and gives the answer of the same measure in a plain query. |
+| `unaliased_agg_of_a_view_measure_takes_its_name` | §3.1: an unaliased `AGG(m)` is named by its final part, `m`, also when `m` is a view's ratio, read from the view or joined in. |
 
 ## Persisting A.7 views
 

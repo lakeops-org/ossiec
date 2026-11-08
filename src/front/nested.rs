@@ -243,6 +243,26 @@ enum Kind {
     Shell,
 }
 
+/// Select items no stage reads yet, refused by name before a stage would read
+/// them as something else (`*` as multiplication, a subquery's `MAX` as a plain
+/// aggregate) and refuse them with a misleading reason.
+fn refuse_unsupported_items(sel: &Select) -> Result<()> {
+    for item in &sel.expressions {
+        let (inner, _) = super::strip_alias(item);
+        if matches!(inner, Expression::Star(_)) {
+            return Err(unsupported(
+                "Layer 2 `SELECT *` is not supported yet: name the columns (§7.1)",
+            ));
+        }
+        if inner.contains(|e| matches!(e, Expression::Subquery(_) | Expression::Select(_))) {
+            return Err(unsupported(
+                "Layer 2 subqueries in the select list are not supported yet (§7.7)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn classify(sel: &Select) -> Result<Kind> {
     let Some(from) = &sel.from else {
         return Ok(Kind::Agg);
@@ -290,6 +310,7 @@ impl Compiler<'_> {
                 "Layer 2 derived tables nest at most {MAX_DEPTH} levels deep"
             )));
         }
+        refuse_unsupported_items(sel)?;
         match classify(sel)? {
             Kind::Agg => self.agg_stage(sel, depth, derived_mode, outer),
             Kind::Fold => self.fold(sel, depth, derived_mode, outer),

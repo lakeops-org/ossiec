@@ -41,7 +41,7 @@ use super::nested::{Compiler, Node};
 use super::to_measure::marker_index;
 use super::{
     as_column, as_derived, bare_measure, classify_to_measure, is_agg_name, parse_from_clause,
-    strip_alias, unsupported, unwrap_paren,
+    strip_alias, take_agg, unsupported, unwrap_paren,
 };
 use crate::{Error, Result};
 
@@ -244,13 +244,24 @@ impl FoldMap {
             // `expr` already rewrote inside the Alias node.
             return rewritten;
         }
-        let Some(c) = as_column(inner) else {
-            return rewritten;
+        // A bare column keeps its name. So does `AGG(t.m)`: it is named `m` even
+        // when the fold replaces it by the formula `m` stood for.
+        let (label, unchanged) = match (as_column(inner), agg_arg(inner)) {
+            (Some(c), _) => {
+                let label = &c.name.name;
+                let same = as_column(&rewritten)
+                    .is_some_and(|r| r.table.is_none() && r.name.name.eq_ignore_ascii_case(label));
+                (label, same)
+            }
+            (None, Some(c)) => {
+                let label = &c.name.name;
+                let same =
+                    agg_arg(&rewritten).is_some_and(|r| r.name.name.eq_ignore_ascii_case(label));
+                (label, same)
+            }
+            (None, None) => return rewritten,
         };
-        let label = &c.name.name;
-        if as_column(&rewritten)
-            .is_some_and(|r| r.table.is_none() && r.name.name.eq_ignore_ascii_case(label))
-        {
+        if unchanged {
             return rewritten;
         }
         Expression::Alias(Box::new(Alias::new(
@@ -258,6 +269,11 @@ impl FoldMap {
             Identifier::new(label.clone()),
         )))
     }
+}
+
+/// The column `AGG(<column>)` reads, if the expression is exactly that.
+fn agg_arg(e: &Expression) -> Option<&Column> {
+    take_agg(unwrap_paren(e)).ok().flatten().and_then(as_column)
 }
 
 enum Agg {
