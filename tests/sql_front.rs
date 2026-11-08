@@ -774,8 +774,13 @@ fn a2_unevaluated_measure_passes_through_inner_select() {
 fn layer2_nested_cases_match_their_references_on_duckdb() {
     // The engine tier's shop cases, checked here without Docker.
     let db = duckdb();
-    let g = graph();
-    for case in LAYER2_NESTED_CASES {
+    let two_facts = ossiec::from_yaml(common::TWO_FACT_SHOP).unwrap();
+    let cases = LAYER2_NESTED_CASES.iter().map(|c| (graph(), c)).chain(
+        common::LAYER2_TWO_FACT_CASES
+            .iter()
+            .map(|c| (two_facts.clone(), c)),
+    );
+    for (g, case) in cases {
         let c = if case.script {
             ossiec::compile_layer2_script(&g, case.sql, &duck())
         } else {
@@ -848,11 +853,103 @@ fn a2_refuses_set_operator_inside_derived_table() {
     }
 }
 
+/// `COUNT(*)` on two facts is the same SQL over different rows: two terms, not
+/// one. Shared, every region's ticket count came out as its order count.
 #[test]
-fn a2_derived_join_restricts_only_the_fact_that_hosts_it() {
-    // Top two customers by order amount are 1 and 2 (both EU; US customer 3 is
-    // out). The join attaches to `orders` only, so ticket counts stay complete
-    // and neither measure is repeated by the other fact's rows.
+fn count_star_on_two_facts_stays_two_terms() {
+    let model = TWO_FACTS.replace(
+        "      - { name: order_amt, expression: { sql: SUM(amount) } }",
+        "      - { name: order_amt, expression: { sql: SUM(amount) } }\n      \
+         - { name: order_count, expression: { sql: COUNT(*) } }",
+    );
+    let g = ossiec::from_yaml(&model).unwrap();
+    let q = "SELECT c.region, AGG(o.order_count), AGG(t.ticket_count) FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.region";
+    let c = ossiec::compile_layer2(&g, q, &two_facts_opts()).unwrap();
+    let db = two_facts_db();
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT c.region, \
+                    (SELECT COUNT(*) FROM orders o JOIN customers x ON o.customer_id = x.id \
+                     WHERE x.region IS NOT DISTINCT FROM c.region), \
+                    (SELECT COUNT(*) FROM tickets t JOIN customers x ON t.customer_id = x.id \
+                     WHERE x.region IS NOT DISTINCT FROM c.region) \
+             FROM (SELECT DISTINCT region FROM customers) c"
+        )),
+        "{}",
+        c.sql
+    );
+}
+
+/// The query is one relation (§7.6, §10.2), however its facts are planned: a
+/// join that drops customers drops them for every measure. Each case is checked
+/// against the relation itself, each measure over the rows it derives into
+/// (orders by customer and amount, unique in this data; tickets by id).
+#[test]
+fn joins_on_one_fact_narrow_the_other() {
+    let g = two_facts_graph();
+    let db = two_facts_db();
+    for joins in [
+        // APAC has a ticket but no orders: not in either inner join.
+        "customers c JOIN orders o ON o.customer_id = c.id \
+         JOIN tickets t ON t.customer_id = c.id",
+        "customers c JOIN orders o ON o.customer_id = c.id \
+         LEFT JOIN tickets t ON t.customer_id = c.id",
+        // From the fact: only customers with orders, and orders with no customer.
+        "orders o LEFT JOIN customers c ON o.customer_id = c.id \
+         LEFT JOIN tickets t ON t.customer_id = c.id",
+        "customers c LEFT JOIN orders o ON o.customer_id = c.id \
+         JOIN tickets t ON t.customer_id = c.id",
+        // Nothing dropped: every customer stays.
+        "customers c LEFT JOIN orders o ON o.customer_id = c.id \
+         LEFT JOIN tickets t ON t.customer_id = c.id",
+    ] {
+        let q = format!(
+            "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) FROM {joins} GROUP BY c.region"
+        );
+        let c = ossiec::compile_layer2(&g, &q, &two_facts_opts())
+            .unwrap_or_else(|e| panic!("{joins}: {e}"));
+        let want = format!(
+            "WITH r AS (SELECT c.region, o.customer_id AS ocid, o.amount, t.id AS tid FROM {joins})
+             SELECT r.region,
+                    (SELECT SUM(amount) FROM (SELECT DISTINCT ocid, amount FROM r x
+                     WHERE x.region IS NOT DISTINCT FROM r.region AND x.amount IS NOT NULL)),
+                    COUNT(DISTINCT tid)
+             FROM r GROUP BY r.region"
+        );
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(&db, &want)),
+            "{joins}\n{}",
+            c.sql
+        );
+    }
+}
+
+/// Narrowing across facts isn't implemented for `includeUnmatched`, whose
+/// unmatched rows would need it too: refused rather than answered wrongly.
+#[test]
+fn narrowing_across_facts_refuses_include_unmatched() {
+    let q = "-- ossiec: includeUnmatched
+        SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) FROM customers c \
+        JOIN orders o ON o.customer_id = c.id JOIN tickets t ON t.customer_id = c.id \
+        GROUP BY c.region";
+    let e = ossiec::compile_layer2(&two_facts_graph(), q, &two_facts_opts()).unwrap_err();
+    assert!(
+        matches!(e, Error::Unsupported(ref m) if m.contains("includeUnmatched")),
+        "{e}"
+    );
+}
+
+/// The query is one relation (§7.6, §10.2): the inner join to `d` keeps only
+/// the top two customers' rows (1 and 2, both EU), for every measure. Tickets of
+/// US and APAC customers aren't in it. Each measure still counts its own rows
+/// once: the tree fans orders through tickets, but neither is inflated (G2).
+#[test]
+fn a2_derived_join_narrows_every_fact() {
     let g = two_facts_graph();
     let sql = "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) \
                FROM customers c \
@@ -863,57 +960,34 @@ fn a2_derived_join_restricts_only_the_fact_that_hosts_it() {
                  ON o.customer_id = d.customer_id \
                GROUP BY c.region";
     let c = ossiec::compile_layer2(&g, sql, &two_facts_opts()).unwrap();
+    assert!(c.sql.contains("EXISTS"), "{}", c.sql);
     let db = two_facts_db();
     let got = sorted(duckdb_rows(&db, &c.sql));
+    // Each measure over the rows it derives into: orders by (customer, amount),
+    // which is unique in this data, and tickets by id.
     let want = sorted(duckdb_rows(
         &db,
-        "SELECT region, MAX(order_amt), COALESCE(MAX(ticket_count), 0) FROM (
-            SELECT c.region AS region, SUM(o.amount) AS order_amt, NULL::BIGINT AS ticket_count
-            FROM orders o
-            LEFT JOIN customers c ON o.customer_id = c.id
-            JOIN (SELECT customer_id FROM orders GROUP BY customer_id
-                  ORDER BY SUM(amount) DESC, customer_id LIMIT 2) d
-              ON o.customer_id = d.customer_id
-            GROUP BY c.region
-            UNION ALL
-            SELECT c.region, NULL, COUNT(t.customer_id)
-            FROM customers c
-            LEFT JOIN tickets t ON t.customer_id = c.id
-            GROUP BY c.region
-         ) GROUP BY region",
+        "WITH d AS (SELECT customer_id FROM orders GROUP BY customer_id
+                    ORDER BY SUM(amount) DESC, customer_id LIMIT 2),
+              r AS (SELECT c.region, o.customer_id AS ocid, o.amount, t.id AS tid
+                    FROM customers c
+                    LEFT JOIN orders o ON o.customer_id = c.id
+                    LEFT JOIN tickets t ON t.customer_id = c.id
+                    JOIN d ON o.customer_id = d.customer_id)
+         SELECT r.region,
+                (SELECT SUM(amount) FROM (SELECT DISTINCT ocid, amount FROM r x
+                                          WHERE x.region IS NOT DISTINCT FROM r.region)),
+                COUNT(DISTINCT tid)
+         FROM r GROUP BY r.region",
     ));
     assert_eq!(got, want, "{}", c.sql);
-    // EU 60 / 3 tickets; US and APAC keep their tickets and contribute no orders.
-    // Customer 5 (no region) is kept by `customers LEFT JOIN tickets`: no tickets.
-    let row = |region: &str, amt: &str, tickets: &str| -> Vec<String> {
-        vec![region.into(), amt.into(), tickets.into()]
-    };
     assert_eq!(
         got,
-        vec![
-            row("APAC", "NULL", "1.000000"),
-            row("EU", "60.000000", "3.000000"),
-            row("NULL", "NULL", "0.000000"),
-            row("US", "NULL", "3.000000"),
-        ]
-    );
-    // One tree would fan orders through tickets: customer 2's amount is doubled
-    // (EU orders 90) and customer 1's ticket is doubled (EU tickets 4), and the
-    // inner join drops US and APAC.
-    let naive = sorted(duckdb_rows(
-        &db,
-        "SELECT c.region, SUM(o.amount), COUNT(t.id)
-         FROM customers c
-         LEFT JOIN orders o ON o.customer_id = c.id
-         LEFT JOIN tickets t ON t.customer_id = c.id
-         JOIN (SELECT customer_id FROM orders GROUP BY customer_id
-               ORDER BY SUM(amount) DESC, customer_id LIMIT 2) d
-           ON o.customer_id = d.customer_id
-         GROUP BY c.region",
-    ));
-    assert_ne!(
-        got, naive,
-        "derived join must not inflate across facts: {naive:?}"
+        vec![vec![
+            "EU".to_string(),
+            "60.000000".to_string(),
+            "3.000000".to_string()
+        ]]
     );
 }
 
@@ -2743,10 +2817,10 @@ fn include_unmatched_with_role_played_derived_attach() {
     assert!(got.iter().all(|r| r[0] != "Paris"), "{got:?}");
 }
 
+/// The ratio over a relation the derived join narrows: only EU's top customers
+/// are in it, for orders and tickets alike (§7.6, §10.2): 60 / 3.
 #[test]
-fn a4_ratio_with_partial_fact_derived_join() {
-    // Derived join hosts orders only: ticket counts stay complete across every
-    // region, and the ratio does not fan either fact through the other.
+fn a4_ratio_with_a_derived_join_on_one_fact() {
     let g = two_facts_graph();
     let sql = "SELECT c.region, \
                       AGG(o.order_amt) / AGG(t.ticket_count) AS sales_per_ticket \
@@ -2759,38 +2833,8 @@ fn a4_ratio_with_partial_fact_derived_join() {
                GROUP BY c.region";
     let c = ossiec::compile_layer2(&g, sql, &two_facts_opts()).unwrap();
     assert!(c.sql.contains("UNION ALL"), "{}", c.sql);
-    let db = two_facts_db();
-    let got = rows_f64(duckdb_rows(&db, &c.sql));
-    let want = rows_f64(duckdb_rows(
-        &db,
-        "SELECT region, \
-                CASE WHEN order_amt IS NULL THEN NULL \
-                     ELSE order_amt * 1.0 / ticket_count END \
-         FROM (
-            SELECT region, MAX(order_amt) AS order_amt, COALESCE(MAX(ticket_count), 0) AS ticket_count FROM (
-                SELECT c.region AS region, SUM(o.amount) AS order_amt, NULL::BIGINT AS ticket_count
-                FROM orders o
-                LEFT JOIN customers c ON o.customer_id = c.id
-                JOIN (SELECT customer_id FROM orders GROUP BY customer_id
-                      ORDER BY SUM(amount) DESC, customer_id LIMIT 2) d
-                  ON o.customer_id = d.customer_id
-                GROUP BY c.region
-                UNION ALL
-                SELECT c.region, NULL, COUNT(t.customer_id)
-                FROM customers c
-                LEFT JOIN tickets t ON t.customer_id = c.id
-                GROUP BY c.region
-             ) GROUP BY region
-         )",
-    ));
-    assert_eq!(got, want, "{}", c.sql);
-    let eu = got.iter().find(|r| r.0 == "EU").unwrap();
-    assert!((eu.1 - 20.0).abs() < 1e-9, "60/3 = 20: {got:?}");
-    // US / APAC keep unrestricted tickets and a NULL numerator → NULL ratio.
-    // Customer 5 (no region, nothing bought) is a group too, with a NULL ratio.
-    assert!(got.iter().any(|r| r.0 == "US" && r.1 < 0.0), "{got:?}");
-    assert!(got.iter().any(|r| r.0 == "NULL" && r.1 < 0.0), "{got:?}");
-    assert!(got.iter().any(|r| r.0 == "APAC" && r.1 < 0.0), "{got:?}");
+    let got = rows_f64(duckdb_rows(&two_facts_db(), &c.sql));
+    assert_eq!(got, vec![("EU".to_string(), 20.0)], "{}", c.sql);
 }
 
 /// Appendix A.7: conformed-dimension bridge as a session `CREATE VIEW`.

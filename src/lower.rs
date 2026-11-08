@@ -256,6 +256,62 @@ fn tree_sql(
     out
 }
 
+/// `EXISTS (SELECT 1 FROM <other's tree> WHERE <shared rows match>)`: `leg`'s row
+/// is in the query's one relation only if the rows it shares with `other` (the
+/// datasets in `on` that both trees reach, under the same alias) survive `other`'s joins
+/// (relational_semantics §7.6, §10.2). `other`'s aliases take a `__semi` suffix.
+/// A shared row is matched by its primary key, or else by the columns `leg`
+/// joins it on. With nothing shared, `other`'s tree only has to be non-empty, as
+/// in a cross join.
+fn shared_rows_survive(
+    g: &SemanticGraph,
+    leg: &Leg,
+    other: &Leg,
+    on: &[String],
+    t: &mut Tpl,
+    ctx: &mut Ctx,
+) -> String {
+    let semi = |a: &str| format!("{}__semi", crate::plan::unquoted(a));
+    let steps: Vec<&JoinStep> = other.joins.iter().collect();
+    let tree = tree_sql(
+        g,
+        (other.root, &g.datasets[other.root].name),
+        &steps,
+        &other.derived,
+        &semi,
+        t,
+        ctx,
+    );
+    let mut conds = vec![];
+    for step in &leg.joins {
+        if !on.contains(&step.to_alias) || !other.joins.iter().any(|o| o.to_alias == step.to_alias)
+        {
+            continue;
+        }
+        let Some(r) = step.rel.map(|r| &g.rels[r]) else {
+            continue;
+        };
+        let (ds, join_cols) = if step.reverse {
+            (r.from, &r.from_fields)
+        } else {
+            (step.to, &r.to_fields)
+        };
+        let pk = &g.datasets[ds].primary_key;
+        let key = if pk.is_empty() { join_cols } else { pk };
+        for &f in key {
+            let inner = t.e(g.field_sql_as(ds, f, &semi(&step.to_alias), ctx));
+            let outer = t.e(g.field_sql_as(ds, f, &step.to_alias, ctx));
+            conds.push(format!("{inner} = {outer}"));
+        }
+    }
+    let filter = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    format!("EXISTS (SELECT 1{tree}{filter})")
+}
+
 /// A leg's whole join tree, as `FROM ...`.
 fn leg_sql(g: &SemanticGraph, leg: &Leg, t: &mut Tpl, ctx: &mut Ctx) -> String {
     let steps: Vec<&JoinStep> = leg.joins.iter().collect();
@@ -281,13 +337,18 @@ fn from_where(
 ) {
     let from = leg_sql(g, leg, t, ctx);
     t.push(&from);
-    let preds: Vec<String> = p
+    let mut preds: Vec<String> = p
         .filters
         .iter()
         .cloned()
         .chain(extra)
         .map(|f| t.e(f))
         .collect();
+    for other in p.legs.iter().filter(|o| !std::ptr::eq(*o, leg)) {
+        if let Some(on) = &other.narrows_on {
+            preds.push(shared_rows_survive(g, leg, other, on, t, ctx));
+        }
+    }
     if !preds.is_empty() {
         t.push(&format!(" WHERE {}", preds.join(" AND ")));
     }

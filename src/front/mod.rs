@@ -1269,6 +1269,69 @@ pub(super) fn protect_inflating_joins(
     Ok(())
 }
 
+/// Mark each leg whose own written joins can drop rows it shares with the other
+/// legs: an `INNER` or `LEFT` relationship join the consumer wrote, or a derived
+/// table joined other than `LEFT`/`FULL`, that the other legs don't carry too
+/// (one they all carry restricts each of them already). Joins the planner added
+/// to reach a dimension are not the consumer's and narrow nothing. `lower` then
+/// keeps every other leg to the shared rows that survive this leg's tree,
+/// matched on the datasets the consumer bound.
+pub(super) fn mark_narrowing_legs(
+    graph: &SemanticGraph,
+    logical: &mut LogicalPlan,
+    consumer: &[ConsumerJoin],
+    include_unmatched: bool,
+) -> Result<()> {
+    if logical.legs.len() < 2 {
+        return Ok(());
+    }
+    let written: Vec<usize> = consumer.iter().filter_map(|c| c.rel).collect();
+    let mut marks = vec![];
+    for (i, leg) in logical.legs.iter().enumerate() {
+        let others = || {
+            logical
+                .legs
+                .iter()
+                .enumerate()
+                .filter(move |(j, _)| *j != i)
+        };
+        let own_step = leg.joins.iter().any(|s| {
+            s.rel.is_some_and(|r| written.contains(&r))
+                && matches!(s.kind, JoinKind::Inner | JoinKind::Left)
+                && !others().all(|(_, o)| {
+                    o.joins
+                        .iter()
+                        .any(|x| x.rel == s.rel && x.to_alias == s.to_alias)
+                })
+        });
+        let own_derived = leg.derived.iter().any(|d| {
+            !matches!(d.kind, JoinKind::Left | JoinKind::Full)
+                && !others().all(|(_, o)| o.derived.iter().any(|x| x.rel_alias == d.rel_alias))
+        });
+        if !(own_step || own_derived) {
+            marks.push(None);
+            continue;
+        }
+        let mut bound: Vec<String> = consumer
+            .iter()
+            .flat_map(|c| [(c.attach_ds, c.attach_role), (c.other_ds, None)])
+            .filter_map(|(ds, role)| planned_alias_on_leg(graph, leg, ds, role))
+            .collect();
+        bound.sort();
+        bound.dedup();
+        marks.push(Some(bound));
+    }
+    for (leg, mark) in logical.legs.iter_mut().zip(marks) {
+        leg.narrows_on = mark;
+    }
+    if include_unmatched && logical.legs.iter().any(|l| l.narrows_on.is_some()) {
+        return Err(unsupported(
+            "Layer 2 includeUnmatched with independent facts whose joins narrow each other is not implemented yet",
+        ));
+    }
+    Ok(())
+}
+
 /// The predicate that holds on exactly the leg's rows that carry a fact row, when
 /// every join that adds rows is a `RIGHT JOIN` along a many-to-one relationship,
 /// as `customers LEFT JOIN orders` is planned (`orders RIGHT JOIN customers`).

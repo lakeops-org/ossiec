@@ -771,6 +771,71 @@ pub const A7_BASE_TO_MEASURE_SCRIPT: &str = "CREATE VIEW completed_counts AS \
 
 pub const A7_BASE_TO_MEASURE_SCRIPT_REF: &str = BASE_TO_MEASURE_SHOP_REF;
 
+/// Two independent facts over the shop tables, sharing `customers`: every order,
+/// and the completed ones. A join on one narrows the other through `EXISTS`.
+pub const TWO_FACT_SHOP: &str = r#"
+version: "0.2.0.dev0"
+name: shop_two_facts
+datasets:
+  - name: orders
+    source: orders
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: order_id }, datatype: Integer }
+      - { name: customer_id, expression: { sql: customer_id }, datatype: Integer }
+    metrics:
+      - { name: order_count, expression: { sql: COUNT(*) } }
+  - name: completed
+    source: SELECT * FROM orders WHERE status = 'completed'
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: order_id }, datatype: Integer }
+      - { name: customer_id, expression: { sql: customer_id }, datatype: Integer }
+    metrics:
+      - { name: completed_count, expression: { sql: COUNT(*) } }
+  - name: customers
+    source: SELECT * FROM raw_customers WHERE NOT deleted
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: customer_id }, datatype: Integer }
+      - { name: region, expression: { sql: region }, datatype: String, dimension: {} }
+relationships:
+  - { name: o_c, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
+  - { name: k_c, from: completed, to: customers, from_columns: [customer_id], to_columns: [id] }
+"#;
+
+/// [`TWO_FACT_SHOP`] cases: §7.6 / §10.2, the query is one relation.
+pub const LAYER2_TWO_FACT_CASES: &[Layer2NestedCase] = &[
+    Layer2NestedCase {
+        // Only customers with a completed order: their orders of any status.
+        name: "inner_join_on_one_fact_narrows_the_other",
+        sql: "SELECT c.region, AGG(o.order_count) AS n, AGG(k.completed_count) AS k \
+              FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
+              JOIN completed k ON k.customer_id = c.id GROUP BY c.region",
+        reference:
+            "SELECT c.region, COUNT(DISTINCT o.order_id) AS n, COUNT(DISTINCT k.order_id) AS k \
+                    FROM {customers} c LEFT JOIN orders o ON o.customer_id = c.customer_id \
+                    JOIN (SELECT * FROM orders WHERE status = 'completed') k \
+                      ON k.customer_id = c.customer_id \
+                    GROUP BY c.region",
+        script: false,
+    },
+    Layer2NestedCase {
+        // From the fact: customers with an order, and orders with no customer.
+        name: "left_join_from_one_fact_narrows_the_other",
+        sql: "SELECT c.region, AGG(o.order_count) AS n, AGG(k.completed_count) AS k \
+              FROM orders o LEFT JOIN customers c ON o.customer_id = c.id \
+              LEFT JOIN completed k ON k.customer_id = c.id GROUP BY c.region",
+        reference:
+            "SELECT c.region, COUNT(DISTINCT o.order_id) AS n, COUNT(DISTINCT k.order_id) AS k \
+                    FROM orders o LEFT JOIN {customers} c ON o.customer_id = c.customer_id \
+                    LEFT JOIN (SELECT * FROM orders WHERE status = 'completed') k \
+                      ON k.customer_id = c.customer_id \
+                    GROUP BY c.region",
+        script: false,
+    },
+];
+
 /// One shop Layer 2 nested case for the DuckDB parity check and the engine tier.
 #[derive(Clone, Copy)]
 pub struct Layer2NestedCase {
