@@ -1228,7 +1228,9 @@ pub(super) fn protect_inflating_joins(
     ctx: &mut graph::Ctx,
 ) -> Result<()> {
     for leg_i in 0..logical.legs.len() {
-        if only_null_extends_the_root(graph, logical, leg_i, ctx) {
+        let skipped = fact_row_present(graph, &logical.legs[leg_i], ctx)
+            .is_some_and(|present| filter_inline_terms(logical, leg_i, &present));
+        if skipped {
             continue;
         }
         let inflates = logical.legs[leg_i]
@@ -1265,59 +1267,55 @@ pub(super) fn protect_inflating_joins(
     Ok(())
 }
 
-/// A `RIGHT JOIN` along a many-to-one relationship, as `customers LEFT JOIN
-/// orders` is planned (`orders RIGHT JOIN customers`). A left-side row matches at
-/// most one row, so none repeats; the join only adds a row for each right-side row
-/// nothing matched, with the left side all NULL. Those rows keep their groups but
-/// derive from no fact row (§8.1), so each inline aggregate skips them with a
-/// filter: every such join's left-side key is NOT NULL, as it is on every row that
-/// matched. No primary key is needed.
+/// The predicate that holds on exactly the leg's rows that carry a fact row, when
+/// every join that adds rows is a `RIGHT JOIN` along a many-to-one relationship,
+/// as `customers LEFT JOIN orders` is planned (`orders RIGHT JOIN customers`).
+/// Such a join repeats no left-side row; it only adds a row for each right-side
+/// row nothing matched, with everything to its left NULL. Those rows keep their
+/// groups but derive from no fact row (§8.1). Every matched row has the join's
+/// left-side key and every added row lacks it, at any depth of the chain.
 ///
-/// `true` when the leg's inflating joins are all of that kind and every inline
-/// term took the filter. Otherwise nothing changes, and the primary-key path
-/// applies: a `FULL` join's unmatched fact rows have a NULL key and do count.
-fn only_null_extends_the_root(
+/// `None` when a join could add rows some other way: a `FULL` join's unmatched
+/// fact rows have a NULL key and do count, a `RIGHT` join to the many side fans
+/// rows out, and `CROSS` multiplies them.
+fn fact_row_present(
     graph: &SemanticGraph,
-    logical: &mut LogicalPlan,
-    leg_i: usize,
+    leg: &plan::Leg,
     ctx: &mut graph::Ctx,
-) -> bool {
-    let leg = &logical.legs[leg_i];
-    let mut conditions = vec![];
-    for s in &leg.joins {
-        if !s.kind.inflates_inline() {
-            continue;
-        }
-        let Some(r) = s.rel.filter(|_| s.kind == JoinKind::Right && !s.reverse) else {
-            return false;
-        };
+) -> Option<Expression> {
+    if leg.derived.iter().any(|d| d.kind.inflates_inline()) {
+        return None;
+    }
+    let mut keys = vec![];
+    for s in leg.joins.iter().filter(|s| s.kind.inflates_inline()) {
+        let r = s.rel.filter(|_| s.kind == JoinKind::Right && !s.reverse)?;
         let rel = &graph.rels[r];
         for &f in &rel.from_fields {
-            conditions.push(graph.field_sql_as(rel.from, f, &s.from_alias, ctx));
+            keys.push(graph.field_sql_as(rel.from, f, &s.from_alias, ctx));
         }
     }
-    if conditions.is_empty() || leg.derived.iter().any(|d| d.kind.inflates_inline()) {
-        return false;
+    if keys.is_empty() {
+        return None;
     }
     let mut t = Tpl::new();
-    let parts: Vec<String> = conditions
+    let parts: Vec<String> = keys
         .into_iter()
-        .map(|c| format!("{} IS NOT NULL", t.e(c)))
+        .map(|k| format!("{} IS NOT NULL", t.e(k)))
         .collect();
     t.push(&parts.join(" AND "));
-    let Ok(present) = t.build() else {
-        return false;
-    };
-    let inline: Vec<usize> = logical
-        .terms
-        .iter()
-        .enumerate()
-        .filter(|(_, term)| term.leg == leg_i && term.strategy == Strategy::Inline)
-        .map(|(i, _)| i)
-        .collect();
+    t.build().ok()
+}
+
+/// Add `present` to the `FILTER` of every inline term on the leg, so none needs
+/// de-duplicating. All or nothing: `false`, and no term changed, when one of them
+/// is not an aggregate that takes a filter.
+fn filter_inline_terms(logical: &mut LogicalPlan, leg_i: usize, present: &Expression) -> bool {
     let mut filtered = vec![];
-    for &i in &inline {
-        match graph::with_aggregate_filter(logical.terms[i].term.ast.clone(), present.clone()) {
+    for (i, term) in logical.terms.iter().enumerate() {
+        if term.leg != leg_i || term.strategy != Strategy::Inline {
+            continue;
+        }
+        match graph::with_aggregate_filter(term.term.ast.clone(), present.clone()) {
             Some(ast) => filtered.push((i, ast)),
             None => return false,
         }
