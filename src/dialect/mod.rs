@@ -15,6 +15,8 @@
 //! Engines without a file need no rules. To add one: create `<engine>.rs`
 //! with `adapt` (and `finish` if needed) and add its arms below.
 
+mod filter;
+pub(crate) use filter::lower_filters;
 mod bigquery;
 mod clickhouse;
 mod mysql;
