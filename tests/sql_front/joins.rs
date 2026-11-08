@@ -515,3 +515,21 @@ fn left_join_from_the_one_side_drops_unmatched_fact_rows() {
         sorted(duckdb_rows(&db, every_order))
     );
 }
+
+/// The join kind is part of a query's identity: an `INNER` and a `LEFT` join
+/// compile to different SQL, so they must not share a `request_hash`.
+#[test]
+fn join_kind_changes_the_request_hash() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let compile = |join: &str| {
+        let sql = format!(
+            "SELECT c.region, AGG(o.order_count) FROM orders o {join} customers c \
+             ON o.customer_id = c.id GROUP BY c.region"
+        );
+        ossiec::compile_sql(&g, &sql, &duck()).unwrap()
+    };
+    let (inner, left) = (compile("JOIN"), compile("LEFT JOIN"));
+    assert_ne!(inner.sql, left.sql);
+    assert_ne!(inner.request_hash, left.request_hash);
+    assert_eq!(left.request_hash, compile("LEFT JOIN").request_hash);
+}

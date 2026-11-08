@@ -326,3 +326,27 @@ fn appendix_a7_ungrouped_view_answers() {
         sorted(duckdb_rows(&db, reference))
     );
 }
+
+/// §3.1: an unaliased `AGG(m)` is named by its final part, `m`, also when `m` is
+/// a view's ratio, read from the view or joined in. It used to come back `__l2_1`.
+#[test]
+fn unaliased_agg_of_a_view_measure_takes_its_name() {
+    let (g, catalog) = define_region_metrics();
+    for q in [
+        "SELECT region, AGG(sales_per_ticket) FROM region_metrics GROUP BY region",
+        "SELECT r.region, AGG(m.sales_per_ticket) FROM customers r \
+         JOIN region_metrics m ON r.region = m.region GROUP BY r.region",
+    ] {
+        let c = ossiec::compile_layer2_with(&g, &catalog, q, &two_facts_opts()).unwrap();
+        assert!(c.sql.contains("AS \"sales_per_ticket\""), "{q}\n{}", c.sql);
+        assert!(!c.sql.contains("__l2_"), "{q}\n{}", c.sql);
+    }
+    // A derived column renamed with AS is named by that name.
+    let c = ossiec::compile_layer2(
+        &graph(),
+        "SELECT t.status, AGG(t.n) FROM (SELECT status, order_count AS n FROM orders) t GROUP BY t.status",
+        &duck(),
+    )
+    .unwrap();
+    assert!(c.sql.contains("AS \"n\""), "{}", c.sql);
+}

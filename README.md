@@ -8,6 +8,7 @@ Define a metric once. Get correct SQL for any engine.
 [![CI](https://github.com/lakeops-org/ossiec/actions/workflows/ci.yml/badge.svg)](https://github.com/lakeops-org/ossiec/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Ossie spec](https://img.shields.io/badge/Apache%20Ossie-0.2.0.dev0-orange.svg)](https://github.com/apache/ossie/blob/main/core-spec/spec.md)
+[![Docs](https://img.shields.io/badge/docs-lakeops--org.github.io%2Fossiec-informational.svg)](https://lakeops-org.github.io/ossiec/)
 
 </div>
 
@@ -21,6 +22,8 @@ Define a metric once. Get correct SQL for any engine.
 $ echo '{"metrics": ["total_revenue", "total_stock"], "dimensions": ["products.category"]}' \
     | ossiec compile shop.yaml - --dialect snowflake
 ```
+
+**[Documentation](https://lakeops-org.github.io/ossiec/)**: what ossiec supports of the spec, [section by section](https://lakeops-org.github.io/ossiec/spec-coverage.html) and [engine by engine](https://lakeops-org.github.io/ossiec/generated/functions.html).
 
 ## Why a compiler?
 

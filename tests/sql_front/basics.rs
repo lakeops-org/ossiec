@@ -302,3 +302,31 @@ fn columns_are_named_as_in_standard_sql() {
         ["id", "customer"]
     );
 }
+
+/// `SELECT *` and a select-list subquery are refused by name, not as `AGG`
+/// arithmetic or a plain aggregate, which is what they would otherwise be read as.
+#[test]
+fn select_star_and_select_list_subqueries_are_refused_by_name() {
+    for (q, why) in [
+        ("SELECT * FROM orders", "SELECT *"),
+        ("SELECT o.* FROM orders o", "SELECT *"),
+        (
+            "SELECT * FROM (SELECT status, order_count FROM orders) t",
+            "SELECT *",
+        ),
+        (
+            "SELECT status, (SELECT MAX(order_date) FROM orders) AS d FROM orders GROUP BY status",
+            "subqueries in the select list",
+        ),
+    ] {
+        let m = unsupported_msg(ossiec::compile_layer2(&graph(), q, &duck()).unwrap_err());
+        assert!(m.contains(why), "{q}: {m}");
+    }
+    // COUNT(*) is not a select-list star.
+    ossiec::compile_layer2(
+        &graph(),
+        "SELECT status, COUNT(*), AGG(order_count) FROM orders GROUP BY status",
+        &duck(),
+    )
+    .unwrap();
+}

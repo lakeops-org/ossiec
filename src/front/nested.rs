@@ -36,7 +36,7 @@ use super::{
     StageCfg,
 };
 use crate::graph::{Ctx, SemanticGraph};
-use crate::plan::{self, DerivedJoin, Request};
+use crate::plan::{self, DerivedJoin};
 use crate::{lower_stage, render_compiled, sql, Compiled, Error, Options, Result};
 
 /// Nesting depth: the top query is 0, its derived tables 1, theirs 2, …
@@ -139,8 +139,6 @@ pub(super) struct Compiler<'a> {
     pub(super) base_seq: usize,
     /// Outermost `AGG` stage also returns one-side rows no fact reaches.
     include_unmatched: bool,
-    /// The flat top-level request, when the query has no derived tables.
-    flat_request: Option<Request>,
     /// Expressions of the query's `TO MEASURE` items, by marker index.
     pub to_measures: Vec<Expression>,
 }
@@ -163,37 +161,30 @@ pub(super) fn compile(
         derived_count: 0,
         base_seq: 0,
         include_unmatched: opts.include_unmatched || pragma_include_unmatched(sql_text),
-        flat_request: None,
         to_measures,
     };
     let node = c.select(&sel, 0, false, &[])?;
     let ast = resolve(node)?;
-    // Flat queries keep their Request as identity. Nested SQL, and any query with
-    // TO MEASURE (markers only appear in the select list; fold can leave
-    // derived_count at 0), hashes the normalized consumer SQL plus formulas.
-    let identity = match c.flat_request.take() {
-        Some(req) if c.derived_count == 0 && c.to_measures.is_empty() => serde_json::json!(req),
-        _ => {
-            let render = |e: Expression| {
-                generate(&e, DialectType::Generic).map_err(|e| Error::Internal(e.to_string()))
-            };
-            let text = render(Expression::Select(Box::new(sel)))?;
-            let mut id = serde_json::json!({ "layer2_sql": text });
-            if !c.to_measures.is_empty() {
-                let tm = c
-                    .to_measures
-                    .iter()
-                    .cloned()
-                    .map(render)
-                    .collect::<Result<Vec<_>>>()?;
-                id["to_measures"] = serde_json::json!(tm);
-            }
-            if c.include_unmatched {
-                id["includeUnmatched"] = serde_json::json!(true);
-            }
-            id
-        }
+    // The identity is the normalized consumer SQL plus the TO MEASURE formulas:
+    // two queries that differ only in a join kind compile to different SQL, so
+    // they must not share a hash.
+    let render = |e: Expression| {
+        generate(&e, DialectType::Generic).map_err(|e| Error::Internal(e.to_string()))
     };
+    let text = render(Expression::Select(Box::new(sel)))?;
+    let mut identity = serde_json::json!({ "layer2_sql": text });
+    if !c.to_measures.is_empty() {
+        let tm = c
+            .to_measures
+            .iter()
+            .cloned()
+            .map(render)
+            .collect::<Result<Vec<_>>>()?;
+        identity["to_measures"] = serde_json::json!(tm);
+    }
+    if c.include_unmatched {
+        identity["includeUnmatched"] = serde_json::json!(true);
+    }
     render_compiled(graph, identity, ast, c.ctx, opts)
 }
 
@@ -214,7 +205,6 @@ pub(super) fn view_outputs(
         derived_count: 0,
         base_seq: 0,
         include_unmatched: false,
-        flat_request: None,
         to_measures: to_measures.to_vec(),
     };
     Ok(c.select(sel, 0, true, &[])?.outputs)
@@ -241,6 +231,26 @@ enum Kind {
     Fold,
     /// `FROM <derived> [JOIN <derived> ...]`: ordinary SQL over derived tables.
     Shell,
+}
+
+/// Select items no stage reads yet, refused by name before a stage would read
+/// them as something else (`*` as multiplication, a subquery's `MAX` as a plain
+/// aggregate) and refuse them with a misleading reason.
+fn refuse_unsupported_items(sel: &Select) -> Result<()> {
+    for item in &sel.expressions {
+        let (inner, _) = super::strip_alias(item);
+        if matches!(inner, Expression::Star(_)) {
+            return Err(unsupported(
+                "Layer 2 `SELECT *` is not supported yet: name the columns (§7.1)",
+            ));
+        }
+        if inner.contains(|e| matches!(e, Expression::Subquery(_) | Expression::Select(_))) {
+            return Err(unsupported(
+                "Layer 2 subqueries in the select list are not supported yet (§7.7)",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn classify(sel: &Select) -> Result<Kind> {
@@ -290,6 +300,7 @@ impl Compiler<'_> {
                 "Layer 2 derived tables nest at most {MAX_DEPTH} levels deep"
             )));
         }
+        refuse_unsupported_items(sel)?;
         match classify(sel)? {
             Kind::Agg => self.agg_stage(sel, depth, derived_mode, outer),
             Kind::Fold => self.fold(sel, depth, derived_mode, outer),
@@ -390,13 +401,6 @@ impl Compiler<'_> {
             if !parsed.request.ensure_datasets.contains(&spec.attach_ds) {
                 parsed.request.ensure_datasets.push(spec.attach_ds);
             }
-        }
-        if depth == 0
-            && parsed.derived.is_empty()
-            && parsed.having.is_none()
-            && parsed.order_exprs.is_empty()
-        {
-            self.flat_request = Some(parsed.request.clone());
         }
         let graph = &self.graph;
 

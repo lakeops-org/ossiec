@@ -1,4 +1,5 @@
-//! Role-playing dimensions (`relationship.field`) and `includeUnmatched`.
+//! Roles and `includeUnmatched`: role-playing dimensions (`relationship.field`),
+//! and the one-side rows no fact reaches.
 
 use super::*;
 

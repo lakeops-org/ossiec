@@ -207,8 +207,16 @@ pub(super) fn parse_stage_from(
                     "Layer 2 derived table: every AGG(...) item needs an explicit alias so the outer query can name it (e.g. AGG(order_count) AS n)",
                 ));
             }
+            // An unaliased `AGG(t.m)` is named by its final part, `m`, as any
+            // column is (§3.1), even when `m` is a view's ratio.
+            let agg_column = take_agg(unwrap_paren(inner))
+                .ok()
+                .flatten()
+                .and_then(as_column)
+                .map(|c| c.name.name.clone());
             let out_name = alias
                 .clone()
+                .or(agg_column)
                 .unwrap_or_else(|| default_measure_name(&formula, idx));
             let order_ref = match &formula {
                 L2Formula::Agg(m) => m.clone(),
