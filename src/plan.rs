@@ -371,6 +371,15 @@ impl JoinKind {
         }
     }
 
+    /// The same join read from the other side: `a LEFT JOIN b` is `b RIGHT JOIN a`.
+    pub(crate) fn mirrored(self) -> JoinKind {
+        match self {
+            JoinKind::Left => JoinKind::Right,
+            JoinKind::Right => JoinKind::Left,
+            other => other,
+        }
+    }
+
     /// RIGHT/FULL null-extend one side and CROSS multiplies rows. An inline
     /// aggregate would then see rows that are not the measure's source rows
     /// (relational_semantics §7.6, G2).

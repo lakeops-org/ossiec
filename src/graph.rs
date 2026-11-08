@@ -732,6 +732,65 @@ fn aggregate_filter(e: &Expression) -> Option<&Expression> {
     }
 }
 
+/// The aggregate with `p` added to its `FILTER (WHERE …)`, ANDed with any it has.
+/// `None` for an aggregate whose filter can't be read back here.
+pub(crate) fn with_aggregate_filter(e: Expression, p: Expression) -> Option<Expression> {
+    let and = |old: Option<Expression>| -> Expression {
+        match old {
+            None => p.clone(),
+            Some(old) => {
+                let mut t = Tpl::new();
+                let (a, b) = (t.e(old), t.e(p.clone()));
+                t.push(&format!("({a}) AND ({b})"));
+                t.build().expect("constant template")
+            }
+        }
+    };
+    macro_rules! add {
+        ($($v:ident),*) => {
+            match e {
+                $(Expression::$v(mut f) => {
+                    f.filter = Some(and(f.filter.take()));
+                    Expression::$v(f)
+                })*
+                Expression::Count(mut c) => {
+                    c.filter = Some(and(c.filter.take()));
+                    Expression::Count(c)
+                }
+                Expression::AggregateFunction(mut a) => {
+                    a.filter = Some(and(a.filter.take()));
+                    Expression::AggregateFunction(a)
+                }
+                Expression::Filter(mut f) => {
+                    f.expression = Box::new(and(Some(*f.expression)));
+                    Expression::Filter(f)
+                }
+                Expression::WithinGroup(w) => Expression::Filter(Box::new(polyglot_sql::expressions::Filter {
+                    this: Box::new(Expression::WithinGroup(w)),
+                    expression: Box::new(and(None)),
+                })),
+                _ => return None,
+            }
+        };
+    }
+    Some(add!(
+        Sum,
+        Avg,
+        Min,
+        Max,
+        Median,
+        Stddev,
+        StddevPop,
+        StddevSamp,
+        Variance,
+        VarPop,
+        VarSamp,
+        ApproxDistinct,
+        ApproxCountDistinct,
+        AnyValue
+    ))
+}
+
 /// Same aggregate with its FILTER clause removed (for dataset checks on the body).
 fn clear_aggregate_filter(e: Expression) -> Expression {
     match e {

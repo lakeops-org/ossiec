@@ -428,8 +428,12 @@ fn two_facts_opts() -> Options {
     }
 }
 
+/// `customers LEFT JOIN orders LEFT JOIN tickets` keeps every customer, so
+/// customer 5 (no region, nothing bought) is a NULL-region group with no sales
+/// and no tickets. Layer 3 roots at each fact and has no such group; the rows
+/// both return carry the same values (§10.2).
 #[test]
-fn a4_independent_measures_via_joins_match_layer3() {
+fn a4_independent_measures_via_joins_agree_with_layer3() {
     let g = two_facts_graph();
     let opts = two_facts_opts();
     let sql = "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) \
@@ -439,6 +443,21 @@ fn a4_independent_measures_via_joins_match_layer3() {
                GROUP BY c.region";
     let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
     assert!(l2.sql.contains("UNION ALL"), "{}", l2.sql);
+    let db = two_facts_db();
+    let got = sorted(duckdb_rows(&db, &l2.sql));
+    let want = sorted(duckdb_rows(
+        &db,
+        "SELECT c.region, o.s, COALESCE(t.n, 0) \
+         FROM (SELECT DISTINCT region FROM customers) c \
+         LEFT JOIN (SELECT x.region, SUM(o.amount) AS s FROM orders o \
+                    JOIN customers x ON o.customer_id = x.id GROUP BY x.region) o \
+           ON o.region IS NOT DISTINCT FROM c.region \
+         LEFT JOIN (SELECT x.region, COUNT(*) AS n FROM tickets t \
+                    JOIN customers x ON t.customer_id = x.id GROUP BY x.region) t \
+           ON t.region IS NOT DISTINCT FROM c.region",
+    ));
+    assert_eq!(got, want, "{}", l2.sql);
+    assert!(got.iter().any(|r| r[0] == "NULL"), "{got:?}");
     let l3 = ossiec::compile(
         &g,
         &serde_json::from_str(
@@ -448,7 +467,9 @@ fn a4_independent_measures_via_joins_match_layer3() {
         &opts,
     )
     .unwrap();
-    assert_eq!(l2.sql, l3.sql);
+    let l3_rows = sorted(duckdb_rows(&db, &l3.sql));
+    let shared: Vec<_> = got.into_iter().filter(|r| r[0] != "NULL").collect();
+    assert_eq!(l3_rows, shared);
 }
 
 #[test]
@@ -574,6 +595,34 @@ fn a5_reverse_fanout_join_uses_pk_dedup() {
         !upper.contains("\"O\".") && !upper.contains(" O."),
         "ON/FROM must use planned aliases, not consumer `o`: {}",
         l2.sql
+    );
+}
+
+/// `orders RIGHT JOIN order_items` keeps every line. The plan roots at the lines,
+/// the many side, and counts orders as a one-side term de-duplicated by primary
+/// key: two orders, not three lines, and no FILTER.
+#[test]
+fn a5_right_join_to_the_many_side_of_a_fanout_dedups() {
+    let g = ossiec::from_yaml(FANOUT).unwrap();
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE orders (order_id INTEGER);
+         INSERT INTO orders VALUES (1), (2), (3);
+         CREATE TABLE order_items (line_id INTEGER, order_id INTEGER);
+         INSERT INTO order_items VALUES (1, 1), (2, 1), (3, 2), (4, 9);",
+    )
+    .unwrap();
+    let sql = "SELECT AGG(o.order_count) FROM orders o \
+               RIGHT JOIN order_items i ON i.order_id = o.id";
+    let c = ossiec::compile_layer2(&g, sql, &duck()).unwrap();
+    assert!(!c.sql.contains("FILTER"), "{}", c.sql);
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(
+            &db,
+            "SELECT COUNT(DISTINCT o.order_id) FROM order_items i \
+             LEFT JOIN orders o ON i.order_id = o.order_id"
+        )
     );
 }
 
@@ -827,14 +876,15 @@ fn a2_derived_join_restricts_only_the_fact_that_hosts_it() {
               ON o.customer_id = d.customer_id
             GROUP BY c.region
             UNION ALL
-            SELECT c.region, NULL, COUNT(*)
-            FROM tickets t
-            LEFT JOIN customers c ON t.customer_id = c.id
+            SELECT c.region, NULL, COUNT(t.customer_id)
+            FROM customers c
+            LEFT JOIN tickets t ON t.customer_id = c.id
             GROUP BY c.region
          ) GROUP BY region",
     ));
     assert_eq!(got, want, "{}", c.sql);
     // EU 60 / 3 tickets; US and APAC keep their tickets and contribute no orders.
+    // Customer 5 (no region) is kept by `customers LEFT JOIN tickets`: no tickets.
     let row = |region: &str, amt: &str, tickets: &str| -> Vec<String> {
         vec![region.into(), amt.into(), tickets.into()]
     };
@@ -843,6 +893,7 @@ fn a2_derived_join_restricts_only_the_fact_that_hosts_it() {
         vec![
             row("APAC", "NULL", "1.000000"),
             row("EU", "60.000000", "3.000000"),
+            row("NULL", "NULL", "0.000000"),
             row("US", "NULL", "3.000000"),
         ]
     );
@@ -2292,24 +2343,45 @@ const REGION_METRICS: &str = "CREATE VIEW region_metrics AS \
     LEFT JOIN orders o ON o.customer_id = c.id \
     LEFT JOIN tickets t ON t.customer_id = c.id";
 
-fn region_ratio_oracle() -> &'static str {
-    "SELECT c.region, \
-            (SELECT SUM(o.amount) FROM orders o JOIN customers x ON o.customer_id = x.id WHERE x.region = c.region) * 1.0 \
-            / (SELECT COUNT(*) FROM tickets t JOIN customers x ON t.customer_id = x.id WHERE x.region = c.region) \
-     FROM (SELECT DISTINCT region FROM customers WHERE region IS NOT NULL) c"
+/// The ratio per customer region. With `keep_null` the NULL region is a group
+/// too (customer 5 has no region and bought nothing): a view written
+/// `customers LEFT JOIN ...` drops no customer. A query that inner-joins on
+/// `region` drops it.
+fn region_ratio_oracle(keep_null: bool) -> String {
+    let filter = if keep_null {
+        ""
+    } else {
+        " WHERE region IS NOT NULL"
+    };
+    format!(
+        "SELECT c.region, o.s * 1.0 / NULLIF(t.n, 0) \
+         FROM (SELECT DISTINCT region FROM customers{filter}) c \
+         LEFT JOIN (SELECT x.region, SUM(o.amount) AS s FROM orders o \
+                    JOIN customers x ON o.customer_id = x.id GROUP BY x.region) o \
+           ON o.region IS NOT DISTINCT FROM c.region \
+         LEFT JOIN (SELECT x.region, COUNT(*) AS n FROM tickets t \
+                    JOIN customers x ON t.customer_id = x.id GROUP BY x.region) t \
+           ON t.region IS NOT DISTINCT FROM c.region"
+    )
 }
 
-fn assert_region_ratio(sql: &str) {
+fn assert_region_ratio(sql: &str, keep_null: bool) {
     let got = rows_f64(duckdb_rows(&two_facts_db(), sql));
-    let want = rows_f64(duckdb_rows(&two_facts_db(), region_ratio_oracle()));
+    let want = rows_f64(duckdb_rows(
+        &two_facts_db(),
+        &region_ratio_oracle(keep_null),
+    ));
     assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
     for (g, w) in got.iter().zip(&want) {
         assert_eq!(g.0, w.0);
         assert!((g.1 - w.1).abs() < 1e-9, "{got:?} vs {want:?}");
     }
-    assert!((got[0].1 - -1.0).abs() < 1e-9, "APAC: {got:?}");
-    assert!((got[1].1 - 20.0).abs() < 1e-9, "EU: {got:?}");
-    assert!((got[2].1 - 5.0 / 3.0).abs() < 1e-5, "US: {got:?}");
+    let value = |region: &str| got.iter().find(|r| r.0 == region).map(|r| r.1);
+    // APAC has a ticket and no orders: a NULL ratio (-1 here).
+    assert_eq!(value("APAC"), Some(-1.0), "{got:?}");
+    assert_eq!(value("EU"), Some(20.0), "{got:?}");
+    assert!((value("US").unwrap() - 5.0 / 3.0).abs() < 1e-5, "{got:?}");
+    assert_eq!(value("NULL"), keep_null.then_some(-1.0), "{got:?}");
 }
 
 fn define_region_metrics() -> (ossiec::SemanticGraph, Layer2Catalog) {
@@ -2344,7 +2416,7 @@ fn create_view_agg_of_measure_matches_inline_ratio() {
         c.sql
     );
     assert!(c.sql.contains("UNION ALL"), "{}", c.sql);
-    assert_region_ratio(&c.sql);
+    assert_region_ratio(&c.sql, true);
     // The catalog is session state: compile_layer2 does not see the view.
     let missing = ossiec::compile_layer2(&g, via, &two_facts_opts()).unwrap_err();
     assert!(
@@ -2368,7 +2440,7 @@ fn create_view_join_form_matches_derived_table() {
     let c = ossiec::compile_layer2_with(&g, &catalog, via, &two_facts_opts()).unwrap();
     let direct = ossiec::compile_layer2(&g, &inline, &two_facts_opts()).unwrap();
     assert_eq!(c.sql, direct.sql);
-    assert_region_ratio(&c.sql);
+    assert_region_ratio(&c.sql, false);
 }
 
 #[test]
@@ -2447,7 +2519,7 @@ fn create_view_script_splits_on_semicolons_outside_strings() {
          SELECT region, AGG(sales_per_ticket) AS spt FROM region_metrics GROUP BY region;"
     );
     let c = ossiec::compile_layer2_script(&g, &script, &two_facts_opts()).unwrap();
-    assert_region_ratio(&c.sql);
+    assert_region_ratio(&c.sql, true);
     // A semicolon inside a string is not a statement boundary.
     let mut catalog = Layer2Catalog::new();
     ossiec::define_layer2_view(
@@ -2596,7 +2668,7 @@ fn create_view_with_base_sum_to_measure() {
     let want = rows_f64(duckdb_rows(
         &two_facts_db(),
         "SELECT c.region, SUM(o.amount) \
-         FROM orders o JOIN customers c ON o.customer_id = c.id \
+         FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
          GROUP BY c.region",
     ));
     assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
@@ -2704,9 +2776,9 @@ fn a4_ratio_with_partial_fact_derived_join() {
                   ON o.customer_id = d.customer_id
                 GROUP BY c.region
                 UNION ALL
-                SELECT c.region, NULL, COUNT(*)
-                FROM tickets t
-                LEFT JOIN customers c ON t.customer_id = c.id
+                SELECT c.region, NULL, COUNT(t.customer_id)
+                FROM customers c
+                LEFT JOIN tickets t ON t.customer_id = c.id
                 GROUP BY c.region
              ) GROUP BY region
          )",
@@ -2715,7 +2787,9 @@ fn a4_ratio_with_partial_fact_derived_join() {
     let eu = got.iter().find(|r| r.0 == "EU").unwrap();
     assert!((eu.1 - 20.0).abs() < 1e-9, "60/3 = 20: {got:?}");
     // US / APAC keep unrestricted tickets and a NULL numerator → NULL ratio.
+    // Customer 5 (no region, nothing bought) is a group too, with a NULL ratio.
     assert!(got.iter().any(|r| r.0 == "US" && r.1 < 0.0), "{got:?}");
+    assert!(got.iter().any(|r| r.0 == "NULL" && r.1 < 0.0), "{got:?}");
     assert!(got.iter().any(|r| r.0 == "APAC" && r.1 < 0.0), "{got:?}");
 }
 
@@ -2726,7 +2800,7 @@ fn a7_appendix_conformed_dimension_bridge() {
     let via = "SELECT region, AGG(sales_per_ticket) AS sales_per_ticket \
         FROM region_metrics GROUP BY region";
     let c = ossiec::compile_layer2_with(&g, &catalog, via, &two_facts_opts()).unwrap();
-    assert_region_ratio(&c.sql);
+    assert_region_ratio(&c.sql, true);
 }
 
 // -------------------------------------------------------- A.7 persist into model
@@ -2752,7 +2826,7 @@ fn persist_view_ratio_becomes_model_metric() {
         &two_facts_opts(),
     )
     .unwrap();
-    assert_region_ratio(&l3.sql);
+    assert_region_ratio(&l3.sql, false);
     // Round-trip YAML still binds.
     let yaml = ossiec::to_yaml(g2.model()).unwrap();
     let g3 = ossiec::from_yaml(&yaml).unwrap();
@@ -2962,11 +3036,13 @@ fn persist_view_refuses_a_filter_in_a_nested_relation() {
     }
 }
 
-/// `COUNT(*)` on the nullable side of a LEFT JOIN becomes `COUNT(dataset.key)`.
-/// A NULL-extended row (product 13 never sold) must not make that differ from
-/// the view.
+/// `products LEFT JOIN orders` keeps product 13, which never sold, as a group
+/// with no orders (`COUNT(*)` on the nullable side skips the NULL-extended row),
+/// and drops the order with no product. The persisted metric is queried over the
+/// model's `orders -> products` path, which does the opposite: no product 13, and
+/// that order under a NULL product. The products both return agree.
 #[test]
-fn persist_view_count_star_on_the_nullable_side_matches_the_view() {
+fn persist_view_left_join_from_the_one_side_agrees_on_shared_groups() {
     let g = graph();
     let mut catalog = Layer2Catalog::new();
     ossiec::define_layer2_view(
@@ -2977,13 +3053,28 @@ fn persist_view_count_star_on_the_nullable_side_matches_the_view() {
         &persist_opts(),
     )
     .unwrap();
+    let view = view_rows(&g, &catalog, "SELECT id, AGG(d) FROM v GROUP BY id");
+    let want = sorted_rows(
+        "SELECT p.product_id, COUNT(o.order_id) FROM products p \
+         LEFT JOIN orders o ON o.product_id = p.product_id GROUP BY p.product_id",
+    );
+    assert_eq!(view, want);
+    let unsold = vec!["13.000000".to_string(), "0.000000".to_string()];
+    assert!(view.contains(&unsold), "{view:?}");
+    assert!(view.iter().all(|r| r[0] != "NULL"), "{view:?}");
+
     let (g2, _) = ossiec::persist_layer2_view(&g, &catalog, "v", &persist_opts()).unwrap();
     let persisted = persisted_rows(&g2, r#"{"metrics":["d"],"dimensions":["products.id"]}"#);
-    assert!(!persisted.is_empty());
-    assert_eq!(
-        persisted,
-        view_rows(&g, &catalog, "SELECT id, AGG(d) FROM v GROUP BY id"),
-    );
+    assert!(persisted.iter().any(|r| r[0] == "NULL"), "{persisted:?}");
+    let shared = |rows: &[Vec<String>], other: &[Vec<String>]| -> Vec<Vec<String>> {
+        rows.iter()
+            .filter(|r| other.iter().any(|o| o[0] == r[0]))
+            .cloned()
+            .collect()
+    };
+    let in_both = shared(&view, &persisted);
+    assert_eq!(in_both.len(), 3, "{view:?} vs {persisted:?}");
+    assert_eq!(in_both, shared(&persisted, &view));
 }
 
 /// `orders` without a primary key whose first field, `customer_id`, holds NULLs
@@ -3860,22 +3951,244 @@ fn appendix_a7_ungrouped_view_answers() {
     );
 }
 
+/// Two-facts `orders` has no primary key, so null-extended customers are kept out
+/// of `SUM` by a FILTER on the join key rather than by de-duplication. `tickets`
+/// has one, and its `COUNT(*)` must not count a customer without tickets.
+#[test]
+fn join_from_either_side_without_a_fact_key() {
+    let g = two_facts_graph();
+    let db = two_facts_db();
+    let joins = [
+        "customers c LEFT JOIN {f}",
+        "{f} RIGHT JOIN customers c",
+        "customers c RIGHT JOIN {f}",
+        "{f} LEFT JOIN customers c",
+        "customers c JOIN {f}",
+        "customers c FULL JOIN {f}",
+    ];
+    let facts = [
+        ("orders o", "AGG(o.order_amt)", "SUM(o.amount)", "o"),
+        ("tickets t", "AGG(t.ticket_count)", "COUNT(t.id)", "t"),
+    ];
+    for ((fact, agg, plain, a), join) in
+        facts.iter().flat_map(|f| joins.iter().map(move |j| (f, j)))
+    {
+        let join = join.replace("{f}", fact);
+        let on = format!("ON {a}.customer_id = c.id GROUP BY c.region");
+        let reference = format!("SELECT c.region, {plain} FROM {join} {on}");
+        let q = format!("SELECT c.region, {agg} FROM {join} {on}");
+        let compiled = ossiec::compile_layer2(&g, &q, &two_facts_opts());
+        if join == "customers c FULL JOIN orders o" {
+            // An order whose `customer_id` is NULL is a real row of a FULL join,
+            // so a filter on the key can't stand in for the missing primary key.
+            let e = compiled.expect_err("FULL JOIN without a key compiled");
+            assert!(
+                matches!(e, Error::Unsupported(ref m) if m.contains("primary_key")),
+                "{e}"
+            );
+            continue;
+        }
+        let c = compiled.unwrap_or_else(|e| panic!("{join}: {e}"));
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(&db, &reference)),
+            "{join}\n{}",
+            c.sql
+        );
+    }
+}
+
+/// A composite metric is planned as one aggregate per term, and each takes the
+/// FILTER: `COUNT(*)` counts no orders for a customer that has none, so its
+/// ratio is NULL rather than divided by the one null-extended row.
+#[test]
+fn join_from_the_one_side_filters_each_term_of_a_composite_metric() {
+    let model = TWO_FACTS.replace(
+        "      - { name: order_amt, expression: { sql: SUM(amount) } }",
+        "      - { name: order_amt, expression: { sql: SUM(amount) } }\n      \
+         - { name: amt_per_order, expression: { sql: SUM(amount) / COUNT(*) } }",
+    );
+    assert_ne!(model, TWO_FACTS);
+    let g = ossiec::from_yaml(&model).unwrap();
+    let q = "SELECT c.region, AGG(o.amt_per_order) FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region";
+    let c = ossiec::compile_layer2(&g, q, &two_facts_opts()).unwrap();
+    assert!(c.sql.contains("FILTER"), "{}", c.sql);
+    let db = two_facts_db();
+    let got = rows_f64(duckdb_rows(&db, &c.sql));
+    let want = rows_f64(duckdb_rows(
+        &db,
+        "SELECT c.region, SUM(o.amount) * 1.0 / NULLIF(COUNT(o.customer_id), 0) \
+         FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
+    ));
+    assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+    for (g, w) in got.iter().zip(&want) {
+        assert_eq!(g.0, w.0);
+        assert!((g.1 - w.1).abs() < 1e-9, "{got:?} vs {want:?}");
+    }
+    assert!(got.contains(&("APAC".to_string(), -1.0)), "{got:?}");
+}
+
+/// Aggregates of every shape take the FILTER, ANDed with a FILTER of their own,
+/// so a fact without a primary key needs no de-duplication for any of them.
+#[test]
+fn join_from_the_one_side_filters_every_aggregate_shape() {
+    let metrics = [
+        (
+            "filtered",
+            "SUM(amount) FILTER (WHERE amount > 10)",
+            "SUM(o.amount) FILTER (WHERE o.amount > 10)",
+        ),
+        (
+            "median",
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)",
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.amount)",
+        ),
+        (
+            "big_median",
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) FILTER (WHERE amount > 10)",
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.amount) FILTER (WHERE o.amount > 10)",
+        ),
+        (
+            "biggest",
+            "ARG_MAX(amount, amount)",
+            "ARG_MAX(o.amount, o.amount)",
+        ),
+    ];
+    for (name, metric, plain) in metrics {
+        let model = TWO_FACTS.replace(
+            "      - { name: order_amt, expression: { sql: SUM(amount) } }",
+            &format!(
+                "      - {{ name: order_amt, expression: {{ sql: SUM(amount) }} }}\n      \
+                 - {{ name: {name}, expression: {{ sql: \"{metric}\" }} }}"
+            ),
+        );
+        let g = ossiec::from_yaml(&model).unwrap();
+        let q = format!(
+            "SELECT c.region, AGG(o.{name}) FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region"
+        );
+        let c = ossiec::compile_layer2(&g, &q, &two_facts_opts())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let db = two_facts_db();
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(
+                &db,
+                &format!(
+                    "SELECT c.region, {plain} FROM customers c \
+                     LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region"
+                )
+            )),
+            "{name}\n{}",
+            c.sql
+        );
+    }
+}
+
+/// orders -> customers -> regions, `orders` without a primary key. A RIGHT join
+/// below the root null-extends the whole chain above it, so the filter on that
+/// join's own key keeps those rows out too.
+#[test]
+fn right_joins_along_a_chain_without_a_fact_key() {
+    let g = ossiec::from_yaml(
+        r#"
+version: "0.2.0.dev0"
+name: chain
+datasets:
+  - name: orders
+    source: orders
+    fields:
+      - { name: customer_id, expression: { sql: customer_id } }
+      - { name: amount, expression: { sql: amount } }
+    metrics:
+      - { name: amt, expression: { sql: SUM(amount) } }
+      - { name: n, expression: { sql: COUNT(*) } }
+  - name: customers
+    source: customers
+    fields:
+      - { name: id, expression: { sql: id } }
+      - { name: region_id, expression: { sql: region_id } }
+  - name: regions
+    source: regions
+    fields:
+      - { name: id, expression: { sql: id } }
+      - { name: name, expression: { sql: name }, dimension: {} }
+relationships:
+  - { name: o_c, from: orders, to: customers, from_columns: [customer_id], to_columns: [id] }
+  - { name: c_r, from: customers, to: regions, from_columns: [region_id], to_columns: [id] }
+"#,
+    )
+    .unwrap();
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE regions (id INTEGER, name VARCHAR);
+         INSERT INTO regions VALUES (1, 'EU'), (2, 'US'), (3, 'APAC');
+         CREATE TABLE customers (id INTEGER, region_id INTEGER);
+         INSERT INTO customers VALUES (10, 1), (11, 1), (12, 2), (13, NULL);
+         CREATE TABLE orders (customer_id INTEGER, amount INTEGER);
+         INSERT INTO orders VALUES (10, 5), (10, 7), (12, 3), (13, 4), (NULL, 9), (99, 1);",
+    )
+    .unwrap();
+    for joins in [
+        "regions r LEFT JOIN customers c ON c.region_id = r.id \
+         LEFT JOIN orders o ON o.customer_id = c.id",
+        "orders o LEFT JOIN customers c ON o.customer_id = c.id \
+         RIGHT JOIN regions r ON c.region_id = r.id",
+        "orders o RIGHT JOIN customers c ON o.customer_id = c.id \
+         RIGHT JOIN regions r ON c.region_id = r.id",
+    ] {
+        let q = format!("SELECT r.name, AGG(o.amt), AGG(o.n) FROM {joins} GROUP BY r.name");
+        let c = ossiec::compile_layer2(&g, &q, &duck()).unwrap_or_else(|e| panic!("{joins}: {e}"));
+        let want =
+            format!("SELECT r.name, SUM(o.amount), COUNT(o.amount) FROM {joins} GROUP BY r.name");
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(&db, &want)),
+            "{joins}\n{}",
+            c.sql
+        );
+    }
+}
+
 /// §7.6, §8.1: `customers LEFT JOIN orders` keeps every customer and the orders that
 /// match one. An order with no customer isn't in that join, so `AGG(order_count)`
-/// mustn't count it. Today ossiec plans the join from `orders` and counts it under
-/// the NULL region: 3 instead of 1. Known bug, not yet fixed.
+/// mustn't count it (it once did, under the NULL region: 3 instead of 1). The plan
+/// roots at `orders`, so the join it writes runs the other way: LEFT and RIGHT
+/// trade places, and a FULL join stays FULL.
 #[test]
-#[ignore = "known bug: a LEFT JOIN from the one side counts unmatched fact rows"]
 fn left_join_from_the_one_side_drops_unmatched_fact_rows() {
     let g = ossiec::from_yaml(common::MODEL).unwrap();
     let db = duckdb();
-    let q = "SELECT c.region, AGG(o.order_count) FROM customers c \
-             LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region";
-    let c = ossiec::compile_sql(&g, q, &duck()).unwrap();
-    let reference = "SELECT c.region, COUNT(o.order_id) FROM {customers} c \
-                     LEFT JOIN orders o ON o.customer_id = c.customer_id GROUP BY c.region";
-    assert_eq!(
-        sorted(duckdb_rows(&db, &c.sql)),
-        sorted(duckdb_rows(&db, reference))
+    let every_customer = "SELECT c.region, COUNT(o.order_id) FROM {customers} c \
+                          LEFT JOIN orders o ON o.customer_id = c.customer_id GROUP BY c.region";
+    let every_order = "SELECT c.region, COUNT(o.order_id) FROM orders o \
+                       LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region";
+    let both = "SELECT c.region, COUNT(o.order_id) FROM orders o \
+                FULL JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region";
+    for (join, reference) in [
+        ("customers c LEFT JOIN orders o", every_customer),
+        ("orders o RIGHT JOIN customers c", every_customer),
+        ("customers c RIGHT JOIN orders o", every_order),
+        ("orders o LEFT JOIN customers c", every_order),
+        ("customers c FULL JOIN orders o", both),
+        ("orders o FULL JOIN customers c", both),
+    ] {
+        let q = format!(
+            "SELECT c.region, AGG(o.order_count) FROM {join} \
+             ON o.customer_id = c.id GROUP BY c.region"
+        );
+        let c = ossiec::compile_sql(&g, &q, &duck()).unwrap();
+        assert_eq!(
+            sorted(duckdb_rows(&db, &c.sql)),
+            sorted(duckdb_rows(&db, reference)),
+            "{join}\n{}",
+            c.sql
+        );
+    }
+    // The two answers differ: the guard above is not vacuous.
+    assert_ne!(
+        sorted(duckdb_rows(&db, every_customer)),
+        sorted(duckdb_rows(&db, every_order))
     );
 }
