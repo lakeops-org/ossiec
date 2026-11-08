@@ -790,11 +790,9 @@ fn a2_refuses_derived_column_outside_on() {
 }
 
 #[test]
-fn a2_refuses_set_operator_and_distinct_inside_derived_table() {
-    for inner in [
-        "SELECT customer_id FROM orders UNION SELECT customer_id FROM orders",
-        "SELECT DISTINCT customer_id FROM orders",
-    ] {
+fn a2_refuses_set_operator_inside_derived_table() {
+    {
+        let inner = "SELECT customer_id FROM orders UNION SELECT customer_id FROM orders";
         let sql = format!(
             "SELECT o.status, AGG(o.order_count) FROM orders o JOIN ({inner}) t ON o.customer_id = t.customer_id GROUP BY o.status"
         );
@@ -3576,4 +3574,201 @@ fn order_by_reads_measures_that_are_not_selected() {
         ossiec::compile_sql(&g, &sql, &duck()).unwrap().request_hash
     };
     assert_ne!(hash("AGG(order_count)"), hash("AGG(order_count) DESC"));
+}
+
+/// §7.4: `GROUP BY ALL` is the list of selected non-aggregates.
+#[test]
+fn group_by_all_groups_by_the_selected_fields() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let sql = |q: &str| ossiec::compile_sql(&g, q, &duck()).map(|c| c.sql);
+    for (all, explicit) in [
+        (
+            "SELECT status, AGG(order_count) AS n FROM orders GROUP BY ALL",
+            "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status",
+        ),
+        (
+            "SELECT status AS s, customer_id, AGG(order_count) FROM orders GROUP BY ALL",
+            "SELECT status AS s, customer_id, AGG(order_count) FROM orders GROUP BY status, customer_id",
+        ),
+        // Nothing to group by: a grand total.
+        (
+            "SELECT AGG(order_count) FROM orders GROUP BY ALL",
+            "SELECT AGG(order_count) FROM orders",
+        ),
+        // A listing of fields.
+        (
+            "SELECT status FROM orders GROUP BY ALL",
+            "SELECT status FROM orders GROUP BY status",
+        ),
+        // In a derived table, a CTE and an outer query.
+        (
+            "SELECT status, AGG(order_count) FROM (SELECT status FROM orders GROUP BY ALL) t JOIN orders o ON o.status = t.status GROUP BY ALL",
+            "SELECT status, AGG(order_count) FROM (SELECT status FROM orders GROUP BY status) t JOIN orders o ON o.status = t.status GROUP BY status",
+        ),
+        (
+            "WITH t AS (SELECT status, AGG(order_count) AS n FROM orders GROUP BY ALL) SELECT status, SUM(n) FROM t GROUP BY ALL",
+            "WITH t AS (SELECT status, AGG(order_count) AS n FROM orders GROUP BY status) SELECT status, SUM(n) FROM t GROUP BY status",
+        ),
+    ] {
+        match (sql(all), sql(explicit)) {
+            (Ok(a), Ok(e)) => assert_eq!(a, e, "{all}"),
+            (Err(a), Err(e)) => assert_eq!(a.to_string(), e.to_string(), "{all}"),
+            (a, e) => panic!("{all}: {a:?} but {explicit}: {e:?}"),
+        }
+    }
+    // A definition isn't grouped by, and a later CTE's body expands too.
+    let joined = |group: &str| {
+        format!("SELECT o.status, AGG(t.n) FROM orders o JOIN (SELECT customer_id, COUNT(*) TO MEASURE AS n FROM orders GROUP BY {group}) t ON o.customer_id = t.customer_id GROUP BY o.status")
+    };
+    match (sql(&joined("ALL")), sql(&joined("customer_id"))) {
+        (Ok(a), Ok(e)) => assert_eq!(a, e),
+        (Err(a), Err(e)) => assert_eq!(a.to_string(), e.to_string()),
+        (a, e) => panic!("{a:?} but {e:?}"),
+    }
+    let view = |group: &str| {
+        let q = format!("CREATE VIEW v AS SELECT status, COUNT(*) TO MEASURE AS n FROM orders GROUP BY {group}; SELECT status, AGG(n) FROM v GROUP BY status");
+        ossiec::compile_sql_script(&g, &q, &duck()).map(|c| c.sql)
+    };
+    assert_eq!(view("ALL").unwrap(), view("status").unwrap());
+    assert_eq!(
+        sql("SELECT status, AGG(n) FROM (SELECT status, COUNT(*) TO MEASURE AS n FROM orders GROUP BY ALL) t GROUP BY ALL").unwrap(),
+        sql("SELECT status, AGG(n) FROM (SELECT status, COUNT(*) TO MEASURE AS n FROM orders GROUP BY status) t GROUP BY status").unwrap(),
+    );
+    assert_eq!(
+        sql("WITH a AS (SELECT status FROM orders GROUP BY status), b AS (SELECT status FROM a GROUP BY ALL) SELECT status FROM b").unwrap(),
+        sql("WITH a AS (SELECT status FROM orders GROUP BY status), b AS (SELECT status FROM a GROUP BY status) SELECT status FROM b").unwrap(),
+    );
+    // A literal isn't a column to group by, and is refused as it is without ALL.
+    assert!(sql("SELECT 1, AGG(order_count) FROM orders GROUP BY ALL").is_err());
+    // §7.4: a bare measure has nothing to group by.
+    let e =
+        sql("SELECT status, x FROM (SELECT status, order_count AS x FROM orders GROUP BY ALL) t")
+            .unwrap_err()
+            .to_string();
+    assert!(e.contains("cannot name measure"), "{e}");
+    let e = sql("SELECT status, order_count FROM orders GROUP BY ALL")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("measure"), "{e}");
+    let e = sql("SELECT * FROM orders GROUP BY ALL")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not `*`"), "{e}");
+    let e = sql("SELECT status, AGG(order_count) FROM orders GROUP BY ALL status")
+        .map(|_| String::new())
+        .unwrap_or_else(|e| e.to_string());
+    assert!(e.contains("GROUP BY") || e.contains("Parse"), "{e}");
+}
+
+/// §7.8: `DISTINCT` is valid over fields and evaluated measures.
+#[test]
+fn distinct_keeps_one_of_each_row() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = common::duckdb();
+    let rows = |q: &str| {
+        let c = ossiec::compile_sql(&g, q, &duck()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let mut r = common::duckdb_rows(&db, &c.sql);
+        r.sort();
+        r
+    };
+    let reference = |q: &str| {
+        let mut r = common::duckdb_rows(&db, q);
+        r.sort();
+        r
+    };
+    assert_eq!(
+        rows("SELECT DISTINCT status FROM orders"),
+        reference("SELECT DISTINCT status FROM orders")
+    );
+    assert_eq!(
+        rows("SELECT DISTINCT status, AGG(order_count) AS n FROM orders GROUP BY status"),
+        reference("SELECT status, COUNT(*) FROM orders GROUP BY status")
+    );
+    // An outer query's rows can repeat, so it needs the real thing.
+    let outer = |d: &str| {
+        format!("SELECT {d}t.status FROM (SELECT status, customer_id FROM orders GROUP BY status, customer_id) t")
+    };
+    let all = rows(&outer(""));
+    let one_each = rows(&outer("DISTINCT "));
+    assert!(all.len() > one_each.len(), "{all:?}");
+    assert_eq!(one_each, reference("SELECT DISTINCT status FROM orders"));
+    // In a derived table, a CTE, and through an outer aggregate.
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM (SELECT DISTINCT status FROM orders) t"),
+        reference("SELECT COUNT(*) FROM (SELECT DISTINCT status FROM orders) t")
+    );
+    assert_eq!(
+        rows("WITH s AS (SELECT DISTINCT status FROM orders) SELECT status FROM s"),
+        reference("SELECT DISTINCT status FROM orders")
+    );
+    // Joined in, without repeating the rows it restricts.
+    assert_eq!(
+        rows("SELECT o.status, AGG(o.order_count) FROM orders o JOIN (SELECT DISTINCT customer_id FROM orders) t ON o.customer_id = t.customer_id GROUP BY o.status"),
+        reference("SELECT status, COUNT(*) FROM orders WHERE customer_id IS NOT NULL GROUP BY status")
+    );
+    // A sort by what it selects.
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT DISTINCT status FROM orders ORDER BY status DESC LIMIT 1",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        common::duckdb_rows(&db, &c.sql),
+        reference("SELECT MAX(status) FROM orders")
+    );
+}
+
+/// §7.8: an unevaluated measure has no value to compare.
+#[test]
+fn distinct_refuses_unevaluated_measures() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let refused = |q: &str, why: &str| {
+        let e = ossiec::compile_sql(&g, q, &duck())
+            .map(|c| c.sql)
+            .expect_err(q)
+            .to_string();
+        assert!(e.contains(why), "{q}: {e}");
+    };
+    // Passed through a derived table, as a measure or a new one.
+    refused(
+        "SELECT status, AGG(x) FROM (SELECT DISTINCT status, order_count AS x FROM orders) t GROUP BY status",
+        "DISTINCT",
+    );
+    refused(
+        "SELECT o.status, AGG(o.order_count) FROM orders o JOIN (SELECT DISTINCT status, order_count AS x FROM orders) t ON o.status = t.status GROUP BY o.status",
+        "DISTINCT can't compare unevaluated measure `x`",
+    );
+    refused(
+        "SELECT status, AGG(x) FROM (SELECT DISTINCT status, COUNT(*) TO MEASURE AS x FROM orders GROUP BY status) t GROUP BY status",
+        "DISTINCT",
+    );
+    // Read by an outer query.
+    refused(
+        "SELECT DISTINCT t.x FROM (SELECT status, order_count AS x FROM orders) t",
+        "unevaluated measure",
+    );
+    // At the top, where it was never allowed.
+    refused(
+        "SELECT DISTINCT status, order_count FROM orders",
+        "bare measure",
+    );
+    // A sort by what it doesn't select, which SQL refuses too.
+    refused(
+        "SELECT DISTINCT status FROM orders GROUP BY status ORDER BY AGG(order_count)",
+        "only sort by columns it selects",
+    );
+    // What isn't standard SQL stays refused.
+    refused(
+        "SELECT DISTINCT ON (status) status FROM orders",
+        "DISTINCT ON",
+    );
+    refused(
+        "SELECT DISTINCT ON (t.status) t.status FROM (SELECT status FROM orders GROUP BY status) t",
+        "DISTINCT ON",
+    );
+    refused(
+        "SELECT DISTINCT ON (status) status, AGG(x) FROM (SELECT status, order_count AS x FROM orders) t GROUP BY status",
+        "DISTINCT ON",
+    );
 }

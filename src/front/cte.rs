@@ -14,12 +14,14 @@ use crate::{Error, Result};
 /// The CTEs in scope: name and body, innermost last.
 type Scope = Vec<(String, Select)>;
 
-/// Replace every `WITH` in `sel` and its derived tables with what it names.
+/// Replace every `WITH` in `sel` and its derived tables with what it names, and every
+/// `GROUP BY ALL` with what it groups by.
 pub(super) fn expand(sel: &mut Select) -> Result<()> {
     expand_in(sel, &vec![])
 }
 
 fn expand_in(sel: &mut Select, outer: &Scope) -> Result<()> {
+    super::expand_group_by_all(sel)?;
     let mut scope = outer.clone();
     if let Some(with) = sel.with.take() {
         if with.recursive {

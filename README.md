@@ -185,6 +185,8 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **`ORDER BY`** (§7.5) takes a selected column or measure by name, or `AGG()` and expressions over it, selected or not, so a Top-N can select only its join column. `ORDER BY 1` is refused, since it means a position in SQL.
 
+**`GROUP BY ALL`** (§7.4) groups by every selected column that isn't an aggregate, and refuses a bare measure. **`DISTINCT`** (§7.8) works over fields and evaluated measures, and refuses an unevaluated one.
+
 **`WITH`** (§7.7) is a named derived table, so a measure passes through a CTE as it does through a subquery. `WITH RECURSIVE`, a column list and a set operator in a CTE are refused.
 
 **`WHERE`** is any row predicate over the query's columns (§7.3): comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT` and expressions, across datasets. Aggregates and windows are refused, and subqueries aren't supported yet.
@@ -460,7 +462,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 1 rules: identifiers, `source.column`, reserved `AGG`, no subqueries
 - [x] Layer 1 functions on six engines, each implemented or refused (`functions.rs`)
 - [ ] Exact percentiles on MySQL and Trino, which have no such function
-- [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, `DISTINCT` and the `MEASURE` marker
+- [x] Layer 2 `GROUP BY ALL` and `DISTINCT`
+- [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
 - [ ] Publish to crates.io

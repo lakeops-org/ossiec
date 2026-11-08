@@ -796,6 +796,27 @@ macro_rules! shop_joins {
 
 pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
     Layer2NestedCase {
+        // §7.4: `GROUP BY ALL` groups by the selected fields.
+        name: "group_by_all",
+        sql: "SELECT status, AGG(order_count) AS n FROM orders GROUP BY ALL",
+        reference: "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.8: an outer query's rows can repeat, and a stage's can't.
+        name: "distinct_over_a_derived_table",
+        sql: "SELECT DISTINCT t.status FROM \
+              (SELECT status, customer_id FROM orders GROUP BY status, customer_id) t",
+        reference: "SELECT DISTINCT status FROM orders",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "distinct_over_fields_and_measures",
+        sql: "SELECT DISTINCT status, AGG(order_count) AS n FROM orders GROUP BY status",
+        reference: "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.5: a Top-N by a measure nothing selects, stacked with a de-duplicated part.
         name: "top_n_by_an_unselected_measure",
         sql: shop_joins!(
