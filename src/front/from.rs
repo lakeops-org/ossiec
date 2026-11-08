@@ -145,6 +145,20 @@ pub(super) fn parse_from_clause(
             dataset: right_ds,
             alias: right_alias.unwrap_or_else(|| graph.datasets[right_ds].name.clone()),
         };
+        // One alias names one relation, however it was joined: a comma item, a
+        // CROSS JOIN or a relationship join.
+        let taken = scope
+            .bindings
+            .iter()
+            .map(|b| &b.alias)
+            .chain(&scope.derived)
+            .any(|a| a.eq_ignore_ascii_case(&right_binding.alias));
+        if taken {
+            return Err(Error::Request(format!(
+                "Layer 2 duplicate relation alias `{}` in FROM/JOIN",
+                right_binding.alias
+            )));
+        }
         if kind == JoinKind::Cross {
             if j.on.is_some() {
                 return Err(cross_join_on());
