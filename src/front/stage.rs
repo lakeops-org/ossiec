@@ -291,10 +291,7 @@ pub(super) fn parse_stage_from(
     // (a dimension listing is one row per combination anyway: Appendix A.3's `d`).
     // A measure definition reads `AGG` without aggregating the query (§4.2), so a
     // relation of fields and definitions needs none either: Appendix A.7's view.
-    let aggregates = sel.expressions.iter().any(|e| {
-        let (inner, _) = strip_alias(e);
-        contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
-    });
+    let aggregates = super::measures::select_aggregates(sel);
     match &sel.group_by {
         None if aggregates && !dimensions.is_empty() => {
             return Err(Error::Request(
