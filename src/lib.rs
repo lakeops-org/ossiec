@@ -35,6 +35,7 @@ mod lower;
 pub mod model;
 mod plan;
 mod portable;
+mod protect;
 mod sql;
 mod wide_table;
 
