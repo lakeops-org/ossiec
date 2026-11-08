@@ -1,0 +1,14 @@
+{
+  "LABEL": {
+    "name": "invalid-title",
+    "color": "EEEEEE"
+  },
+  "CHECKS": {
+    "regexp": "^(feat|fix|docs|test|refactor|perf|ci|chore)(\\([a-z0-9-]+\\))?!?: \\S.*|^Bump .+"
+  },
+  "MESSAGES": {
+    "success": "PR title is valid",
+    "failure": "PR title is invalid",
+    "notice": "PR title must follow Conventional Commits: type(scope): summary, with type one of feat, fix, docs, test, refactor, perf, ci, chore (see CONTRIBUTING.md), or be a Dependabot title (Bump ...)"
+  }
+}
