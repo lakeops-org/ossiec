@@ -12,7 +12,12 @@ pub fn site_page(name: &str, content: &str) {
         std::fs::write(&path, content).unwrap();
         return;
     }
-    let committed = std::fs::read_to_string(&path).unwrap_or_default();
+    let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "can't read {}: {e}; generate it with `OSSIEC_UPDATE_SITE=1 cargo test`",
+            path.display()
+        )
+    });
     assert!(
         committed == content,
         "{} is out of date: regenerate it with `OSSIEC_UPDATE_SITE=1 cargo test`",

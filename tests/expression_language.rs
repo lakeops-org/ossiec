@@ -188,7 +188,7 @@ fn winv(e: &'static str, w: &'static [&'static str]) -> P {
 
 fn probes() -> Vec<P> {
     vec![
-        // Operators
+        // ## Operators
         row("i + j", "9"), row("i - j", "5"), row("i * j", "14"), row("i / j", "3.5"),
         row("i % j", "1"), row("neg % j", "-1"), row("-i", "-7"), row("+i", "7"),
         row("i = 7", "T"), row("i <> 7", "F"), row("i != 7", "F"), row("i < 7", "F"),
@@ -205,35 +205,35 @@ fn probes() -> Vec<P> {
         row("j + 3 * 4", "14"), row("(j + 3) * 4", "20"), row("-j * 3", "-6"),
         row("NOT i = 1 AND i = 1", "F"), row("i = 7 OR i = 7 AND i = 1", "T"),
         row("j + 1 = 3 AND NOT j = 1", "T"),
-        // Current date/time
+        // ## Current date/time
         row("d < CURRENT_DATE", "T"), row("d < CURRENT_DATE()", "T"),
         row("ts < CURRENT_TIMESTAMP", "T"), row("ts < CURRENT_TIMESTAMP()", "T"),
         row("CURRENT_TIME IS NOT NULL", "T"), row("CURRENT_TIME() IS NOT NULL", "T"),
-        // Extraction functions
+        // ## Extraction functions
         row("YEAR(d)", "2024"), row("QUARTER(d)", "1"), row("MONTH(d)", "3"), row("DAY(d)", "15"),
         row("DAYOFYEAR(d)", "75"), row("HOUR(ts)", "13"), row("MINUTE(ts)", "45"), row("SECOND(ts)", "30"),
-        // EXTRACT
+        // ## EXTRACT
         row("EXTRACT(YEAR FROM d)", "2024"), row("EXTRACT(QUARTER FROM d)", "1"),
         row("EXTRACT(MONTH FROM d)", "3"), row("EXTRACT(WEEK FROM d)", "11"),
         row("EXTRACT(DAY FROM d)", "15"), row("EXTRACT(DAYOFWEEK FROM d)", "5"),
         row("EXTRACT(DAYOFYEAR FROM d)", "75"), row("EXTRACT(HOUR FROM ts)", "13"),
         row("EXTRACT(MINUTE FROM ts)", "45"), row("EXTRACT(SECOND FROM ts)", "30"),
         row("EXTRACT(MILLISECOND FROM ts)", "30000"),
-        // DATE_PART
+        // ## DATE_PART
         row("DATE_PART('year', d)", "2024"), row("DATE_PART('quarter', d)", "1"),
         row("DATE_PART('month', d)", "3"), row("DATE_PART('week', d)", "11"),
         row("DATE_PART('day', d)", "15"), row("DATE_PART('dayofweek', d)", "5"),
         row("DATE_PART('dayofyear', d)", "75"), row("DATE_PART('hour', ts)", "13"),
         row("DATE_PART('minute', ts)", "45"), row("DATE_PART('second', ts)", "30"),
         row("DATE_PART('millisecond', ts)", "30000"),
-        // DATE_TRUNC
+        // ## DATE_TRUNC
         row("DATE_TRUNC('year', d)", "2024-01-01"), row("DATE_TRUNC('quarter', d)", "2024-01-01"),
         row("DATE_TRUNC('month', d)", "2024-03-01"), row("DATE_TRUNC('week', d)", "2024-03-11"),
         row("DATE_TRUNC('day', ts)", "2024-03-15"),
         row("HOUR(DATE_TRUNC('hour', ts))", "13"), row("MINUTE(DATE_TRUNC('hour', ts))", "0"),
         row("MINUTE(DATE_TRUNC('minute', ts))", "45"), row("SECOND(DATE_TRUNC('minute', ts))", "0"),
         row("SECOND(DATE_TRUNC('second', ts))", "30"),
-        // Date arithmetic
+        // ## Date arithmetic
         row("DATEADD(day, 7, d)", "2024-03-22"), row("DATEADD(month, -1, d)", "2024-02-15"),
         row("DATEADD(year, 1, d)", "2025-03-15"),
         row("DATEADD(month, 1, DATE '2024-01-31')", "2024-02-29"),
@@ -251,7 +251,7 @@ fn probes() -> Vec<P> {
         row("DATEDIFF(year, d, DATE '2026-03-15')", "2"),
         row("DATEDIFF(month, DATE '2024-01-31', DATE '2024-02-01')", "1"),
         row("DATEDIFF(year, DATE '2024-12-31', DATE '2025-01-01')", "1"),
-        // Construction
+        // ## Construction
         row("YEAR(DATE '2024-01-15')", "2024"),
         row("HOUR(TIMESTAMP_NTZ '2024-01-15 10:30:00')", "10"),
         row("TIME '10:30:00' IS NOT NULL", "T"),
@@ -261,12 +261,12 @@ fn probes() -> Vec<P> {
         row("HOUR(CAST(tsstr AS TIMESTAMP_NTZ))", "10"),
         row("CAST('10:30:00' AS TIME) IS NOT NULL", "T"),
         row("TO_DATE(datestr)", "2024-01-15"), row("HOUR(TO_TIMESTAMP(tsstr))", "10"),
-        // Experimental
+        // ## Experimental
         row("TO_DATE(datestr, 'YYYY-MM-DD')", "2024-01-15"),
         row("HOUR(TO_TIMESTAMP(tsstr, 'YYYY-MM-DD HH24:MI:SS'))", "10"),
         row("TO_CHAR(d, 'YYYY-MM-DD')", "2024-03-15"),
         row("TO_CHAR(ts, 'HH24:MI:SS')", "13:45:30"), row("TO_CHAR(ts, 'YY')", "24"),
-        // Strings
+        // ## Strings
         row("CONCAT(s, '!')", "Hello!"), row("CONCAT(s, '-', s)", "Hello-Hello"), row("s || '!'", "Hello!"),
         row("LENGTH(s)", "5"), row("LENGTH(uni)", "5"), row("LOWER(s)", "hello"), row("UPPER(s)", "HELLO"),
         row("LENGTH(TRIM(sp))", "3"), row("LENGTH(LTRIM(sp))", "5"), row("LENGTH(RTRIM(sp))", "5"),
@@ -280,7 +280,7 @@ fn probes() -> Vec<P> {
         row("REGEXP_LIKE(s, '^H.*o$')", "T"), row("REGEXP_LIKE(s, '^x')", "F"),
         row("REGEXP_EXTRACT(s, 'l+')", "ll"), row("REGEXP_REPLACE(s, 'l+', 'L')", "HeLo"),
         row("REGEXP_REPLACE(s, 'l', 'L')", "HeLLo"), row("REGEXP_COUNT(s, 'l')", "2"),
-        // Math
+        // ## Math
         row("ABS(neg)", "7"), row("ROUND(pi, 2)", "3.14"), row("FLOOR(f)", "2"), row("CEIL(f)", "3"),
         row("CEILING(f)", "3"), row("TRUNC(pi, 2)", "3.14"), row("TRUNCATE(pi, 2)", "3.14"),
         row("MOD(i, j)", "1"), row("SIGN(neg)", "-1"), row("POWER(j, 3)", "8"), row("SQRT(i + 9)", "4"),
@@ -289,24 +289,25 @@ fn probes() -> Vec<P> {
         row("ACOS(z)", "1.570796"), row("ATAN(z)", "0"), row("ATAN2(j, j)", "0.785398"),
         row("RADIANS(i + 173)", "3.141593"), row("DEGREES(z)", "0"), row("PI()", "3.141593"),
         row("GREATEST(i, j)", "7"), row("LEAST(i, j)", "2"), row("GREATEST(i, j, 9)", "9"),
-        // Conditional
+        // ## Conditional
         row("IF(i > j, 'y', 'n')", "y"), row("IFF(i < j, 'y', 'n')", "n"), row("NULLIF(i, 7)", "NULL"),
         row("NULLIF(i, 1)", "7"), row("COALESCE(nul, j)", "2"), row("COALESCE(nul, nul, i)", "7"),
         row("IFNULL(nul, j)", "2"), row("NVL(nul, j)", "2"), row("NVL2(nul, 1, 2)", "2"),
         row("NVL2(i, 1, 2)", "1"), row("ZEROIFNULL(nul)", "0"), row("ZEROIFNULL(i)", "7"),
         row("NULLIFZERO(z)", "NULL"), row("NULLIFZERO(i)", "7"),
         row("i = 7 AND TRUE", "T"), row("i = 7 AND FALSE", "F"), row("bt", "T"),
-        // Casts
+        // ## Casts
         row("CAST(i AS VARCHAR)", "7"), row("CAST(i AS STRING)", "7"), row("CAST(FLOOR(f) AS INTEGER)", "2"),
         row("CAST(i AS INT)", "7"), row("CAST(i AS BIGINT)", "7"), row("CAST(f AS DECIMAL(10,2))", "2.5"),
         row("CAST(f AS NUMERIC(10,2))", "2.5"), row("CAST(i AS FLOAT)", "7"), row("CAST(i AS DOUBLE)", "7"),
         row("CAST(i AS DOUBLE) / 2", "3.5"), row("CAST(z AS BOOLEAN)", "F"),
         row("CAST(datestr AS DATE)", "2024-01-15"), row("HOUR(CAST(tsstr AS TIMESTAMP))", "10"),
         row("TRY_CAST('12' AS INT)", "12"), row("TRY_CAST(s AS INT)", "NULL"),
-        // Null-safe
+        // ## Null-safe
         row("nul IS NOT DISTINCT FROM i", "F"),
         row("nul IS NOT DISTINCT FROM nul", "T"), row("i IS DISTINCT FROM nul", "T"),
         row("i IS DISTINCT FROM 7", "F"), row("i IS NOT DISTINCT FROM 7", "T"),
+        // ## Edge cases
         // Boundaries: what a single fixed date can't tell apart.
         row("EXTRACT(DAYOFWEEK FROM DATE '2024-03-17')", "0"),
         row("EXTRACT(DAYOFWEEK FROM DATE '2024-03-16')", "6"),
@@ -410,9 +411,9 @@ fn probes() -> Vec<P> {
         row("ROUND(0 - pi, 2)", "-3.14"),
         row("ROUND(pi, 0)", "3"),
         row("TRUNC(pi, 0)", "3"),
-        // Case-insensitive function names
+        // ## Case-insensitive function names
         row("upper(s)", "HELLO"), row("Upper(s)", "HELLO"),
-        // Aggregates
+        // ## Aggregates
         agg("SUM(v)", "19"), agg("COUNT(v)", "5"), agg("COUNT(*)", "6"), agg("COUNT(DISTINCT v)", "4"),
         agg("AVG(v)", "3.8"), agg("MIN(v)", "1"), agg("MAX(v)", "10"), agg("SUM(DISTINCT v)", "17"),
         agg("sum(v)", "19"), agg("Sum(v)", "19"),
@@ -442,7 +443,7 @@ fn probes() -> Vec<P> {
         agg("PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY v)", "4"),
         agg("PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY v)", "10"),
         agg("APPROX_COUNT_DISTINCT(v)", "4"), agg("APPROX_PERCENTILE(v, 0.5) BETWEEN 1 AND 4", "T"),
-        // Conditional aggregates
+        // ## Conditional aggregates
         agg("SUM(CASE WHEN g = 'a' THEN v END)", "5"), agg("COUNT(CASE WHEN g = 'a' THEN 1 END)", "3"),
         agg("SUM(v) FILTER (WHERE g = 'a')", "5"), agg("COUNT(*) FILTER (WHERE g = 'a')", "3"),
         agg("COUNT(v) FILTER (WHERE g = 'b')", "2"), agg("COUNT(DISTINCT v) FILTER (WHERE g = 'a')", "2"),
@@ -462,7 +463,7 @@ fn probes() -> Vec<P> {
         agg("MAX(UPPER(s))", "Z"),
         agg("SUM(v) FILTER (WHERE g = 'zzz')", "NULL"), agg("COUNT(*) FILTER (WHERE g = 'zzz')", "0"),
         agg("APPROX_COUNT_DISTINCT(v) FILTER (WHERE g = 'a')", "2"),
-        // Windows
+        // ## Windows
         win("ROW_NUMBER() OVER (ORDER BY k)", &["1","2","3","4","5","6"]),
         win("RANK() OVER (ORDER BY SUM(v) DESC NULLS LAST)", &["5","3","3","2","6","1"]),
         win("RANK() OVER (ORDER BY SUM(v) DESC NULLS FIRST)", &["6","4","4","3","1","2"]),
@@ -1592,11 +1593,13 @@ const SITE_ENGINES: &[(Engine, &str)] = &[
 /// How a construct fares on an engine, from [`gaps`] (which the engine tier holds
 /// to what really happens) and from compiling it here.
 fn site_status(e: Engine, p: &P) -> (&'static str, Option<String>) {
-    let (label, compiled) = compile_probe(e, p);
+    let label = match *p {
+        P::Row(x, _) | P::Agg(x, _) | P::Win(x, _) | P::WinV(x, _) => x,
+    };
     if !gaps(e).contains(&label) {
         return ("verified", None);
     }
-    match compiled {
+    match compile_probe(e, p).1 {
         Err(err) => {
             let why = err.to_string();
             let why = why.split(": ").last().unwrap_or(&why).trim().to_string();
@@ -1607,7 +1610,8 @@ fn site_status(e: Engine, p: &P) -> (&'static str, Option<String>) {
     }
 }
 
-/// The section heading each construct sits under in [`probes`], read from this file.
+/// The section each construct sits under in [`probes`], read from this file: a
+/// `// ## Name` comment starts a section; other comments are notes.
 fn probe_sections() -> Vec<(String, Vec<&'static str>)> {
     let src = include_str!("expression_language.rs");
     let body = &src[src.find("fn probes() -> Vec<P> {").unwrap()..];
@@ -1622,10 +1626,11 @@ fn probe_sections() -> Vec<(String, Vec<&'static str>)> {
     let mut placed = std::collections::HashSet::new();
     for line in body.lines() {
         let t = line.trim();
-        if let Some(h) = t.strip_prefix("// ") {
-            if !h.is_empty() && h.chars().next().unwrap().is_uppercase() {
-                sections.push((h.trim_end_matches('.').to_string(), vec![]));
-            }
+        if let Some(h) = t.strip_prefix("// ## ") {
+            sections.push((h.trim().to_string(), vec![]));
+            continue;
+        }
+        if t.starts_with("//") {
             continue;
         }
         for &l in &labels {

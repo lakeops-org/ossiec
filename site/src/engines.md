@@ -4,7 +4,7 @@ ossiec builds one SQL syntax tree and renders it for the target with [polyglot-s
 
 ## Verified by execution
 
-These engines run every test tier, in Docker, and must return the same rows as the DuckDB reference, with no type leniency (a month comes back as a `DATE` everywhere, and NULL stays distinct from `''`).
+These engines run every test tier, in Docker, and must return the same rows as the DuckDB reference. Values are compared as the engine prints them: a month must print as `2026-01-01` everywhere, not as a timestamp, numbers must agree to six significant digits, and NULL stays distinct from `''`. Column types themselves aren't compared.
 
 | Engine | Version tested | Layer 3 cases | Layer 2 cases | Expression language | TPC-DS | Fuzzing |
 |---|---|:-:|:-:|:-:|:-:|:-:|

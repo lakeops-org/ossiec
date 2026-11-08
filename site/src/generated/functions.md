@@ -22,18 +22,11 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 | Conditional | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 |
 | Casts | ✅ 14/14 | ⚠️ 12/14 | ⚠️ 12/14 | ✅ 14/14 | ✅ 14/14 | ✅ 14/14 |
 | Null-safe | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 |
-| Boundaries: what a single fixed date can't tell apart | ✅ 38/38 | ✅ 38/38 | ✅ 38/38 | ✅ 38/38 | ✅ 38/38 | ✅ 38/38 |
-| Not found, empty and NULL | ✅ 29/29 | ✅ 29/29 | ✅ 29/29 | ✅ 29/29 | ✅ 29/29 | ⚠️ 28/29 |
-| A rewritten call stays one operand | ✅ 22/22 | ✅ 22/22 | ✅ 22/22 | ✅ 22/22 | ✅ 22/22 | ✅ 22/22 |
-| Expressions polyglot reads as statements unless they're in a select list | ✅ 1/1 | ✅ 1/1 | ✅ 1/1 | ✅ 1/1 | ✅ 1/1 | ✅ 1/1 |
-| Signs | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 |
+| Edge cases | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ⚠️ 97/98 |
 | Case-insensitive function names | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 |
-| Aggregates | ✅ 19/19 | ✅ 19/19 | ⚠️ 17/19 | ✅ 19/19 | ⚠️ 17/19 | ✅ 19/19 |
-| An even count interpolates, and a picked percentile takes the lower value | ✅ 7/7 | ✅ 7/7 | ⚠️ 0/7 | ✅ 7/7 | ⚠️ 0/7 | ✅ 7/7 |
-| Over no rows, NULL | ✅ 13/13 | ✅ 13/13 | ⚠️ 4/13 | ✅ 13/13 | ⚠️ 6/13 | ✅ 13/13 |
+| Aggregates | ✅ 39/39 | ✅ 39/39 | ⚠️ 21/39 | ✅ 39/39 | ⚠️ 23/39 | ✅ 39/39 |
 | Conditional aggregates | ✅ 26/26 | ✅ 26/26 | ⚠️ 23/26 | ✅ 26/26 | ⚠️ 23/26 | ✅ 26/26 |
-| Windows | ✅ 21/21 | ✅ 21/21 | ✅ 21/21 | ✅ 21/21 | ✅ 21/21 | ⚠️ 20/21 |
-| The spec's own forms, over a field rather than an aggregate | ✅ 4/4 | ✅ 4/4 | ✅ 4/4 | ✅ 4/4 | ✅ 4/4 | ✅ 4/4 |
+| Windows | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ⚠️ 24/25 |
 
 ## Gaps
 
@@ -372,7 +365,7 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 
 </details>
 
-<details><summary>Boundaries: what a single fixed date can't tell apart (38)</summary>
+<details><summary>Edge cases (98)</summary>
 
 - `EXTRACT(DAYOFWEEK FROM DATE '2024-03-17')`
 - `EXTRACT(DAYOFWEEK FROM DATE '2024-03-16')`
@@ -412,11 +405,6 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 - `TO_CHAR(ts, 'HH12 PM')`
 - `TO_CHAR(TIMESTAMP '2024-03-15 00:05:09', 'HH24:MI:SS')`
 - `TO_CHAR(TIMESTAMP '2024-03-15 09:05:09', 'HH12 AM')`
-
-</details>
-
-<details><summary>Not found, empty and NULL (29)</summary>
-
 - `POSITION('z' IN s)`
 - `CHARINDEX('z', s)`
 - `SPLIT_PART(csv, ',', 9) = ''`
@@ -446,11 +434,6 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 - `SUBSTRING(s, 4, 99)`
 - `ZEROIFNULL(z)`
 - `NVL2(z, 1, 2)`
-
-</details>
-
-<details><summary>A rewritten call stays one operand (22)</summary>
-
 - `2 * EXTRACT(DAYOFWEEK FROM d)`
 - `10 - EXTRACT(DAYOFWEEK FROM d)`
 - `2 * DATEDIFF(month, DATE '2024-01-31', DATE '2024-03-01')`
@@ -473,17 +456,7 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 - `2 * CHARINDEX('l', s)`
 - `IFF(i > j, 1, 2) * 2`
 - `CASE WHEN CONTAINS(s, 'ell') THEN 1 ELSE 0 END`
-
-</details>
-
-<details><summary>Expressions polyglot reads as statements unless they're in a select list (1)</summary>
-
 - `((i = 7)) AND j = 2`
-
-</details>
-
-<details><summary>Signs (8)</summary>
-
 - `MOD(neg, j)`
 - `SIGN(z)`
 - `FLOOR(0 - f)`
@@ -502,7 +475,7 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 
 </details>
 
-<details><summary>Aggregates (19)</summary>
+<details><summary>Aggregates (39)</summary>
 
 - `SUM(v)`
 - `COUNT(v)`
@@ -523,11 +496,6 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 - `2 * MEDIAN(v)`
 - `10 - COUNT(*)`
 - `MEDIAN(v)`
-
-</details>
-
-<details><summary>An even count interpolates, and a picked percentile takes the lower value (7)</summary>
-
 - `MEDIAN(v) FILTER (WHERE g = 'b')`
 - `PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')`
 - `PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')`
@@ -535,11 +503,6 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 - `PERCENTILE_DISC(0.6) WITHIN GROUP (ORDER BY v)`
 - `PERCENTILE_DISC(0) WITHIN GROUP (ORDER BY v)`
 - `PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY v)`
-
-</details>
-
-<details><summary>Over no rows, NULL (13)</summary>
-
 - `MEDIAN(v) FILTER (WHERE g = 'zzz')`
 - `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')`
 - `PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'zzz')`
@@ -587,7 +550,7 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 
 </details>
 
-<details><summary>Windows (21)</summary>
+<details><summary>Windows (25)</summary>
 
 - `ROW_NUMBER() OVER (ORDER BY k)`
 - `RANK() OVER (ORDER BY SUM(v) DESC NULLS LAST)`
@@ -610,11 +573,6 @@ Every construct of `expression_language.md` that ossiec tests: 404 in all. Each 
 - `MAX(SUM(v)) OVER (ORDER BY k)`
 - `COUNT(SUM(v)) OVER (ORDER BY k)`
 - `SUM(v) / SUM(SUM(v)) OVER () * 100`
-
-</details>
-
-<details><summary>The spec's own forms, over a field rather than an aggregate (4)</summary>
-
 - `SUM(v) OVER (ORDER BY k)`
 - `AVG(v) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)`
 - `SUM(v) OVER (PARTITION BY g)`

@@ -23,7 +23,7 @@ Engines disagree on many of these functions. `LENGTH` counts bytes on MySQL, `DA
 
 - **A standard form** in core SQL, used wherever it means the same thing.
 - **An engine's own form** where it needs one: `CHAR_LENGTH` on MySQL, the UTF-8 string functions on ClickHouse, a `CAST(… AS BIGINT)` around MySQL's unsigned `YEAR`.
-- **A refusal** where the engine has no form that gives the same answer. A query never gets a different answer silently.
+- **A refusal** where the engine has no form that gives the same answer, so a query doesn't get a different answer silently. One exception is known: on StarRocks, `UPPER` of non-ASCII text changes ASCII letters only ([gaps](generated/functions.md#gaps)).
 
 The result, construct by construct and engine by engine, is on [Functions by engine](generated/functions.md). That page is generated from the test suite, which runs every construct on every engine against a value worked out by hand.
 

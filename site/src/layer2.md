@@ -12,7 +12,7 @@ GROUP BY c.region
 
 `order_count` counts each order once. `stock_units` sums each product's stock once per region, however many orders repeat it. A plain `SUM(p.stock)` would count it once per order.
 
-Compile from the CLI with `ossiec compile-sql model.yaml query.sql --dialect trino`, or from Rust with `ossiec::compile_sql`.
+Compile from the CLI with `ossiec compile-sql model.yaml query.sql --dialect trino`, or from Rust with `ossiec::compile_sql` for one query. A script with `CREATE VIEW` statements before the query goes to `ossiec::compile_sql_script`; or register views in a `Layer2Catalog` with `define_layer2_view` and compile with `compile_sql_with`.
 
 ## The rules ossiec follows
 
@@ -77,7 +77,7 @@ LEFT JOIN tickets t ON t.customer_id = c.id;
 SELECT region, AGG(sales_per_ticket) FROM region_metrics GROUP BY region;
 ```
 
-Every region appears, including one whose customers bought nothing. `ossiec persist-view` (or `persist_layer2_view`) can write `sales_per_ticket` into the model as a metric.
+Every region appears, including one whose customers bought nothing. `ossiec persist-view` (or `persist_layer2_view`) can write `sales_per_ticket` into the model as a metric. The persisted metric is then queried over the model's own paths from each fact to `customers`, not over the view's joins, so its groups can differ: a region with no facts can drop out, and facts with no customer can appear under a NULL region. The groups both return agree.
 
 **One relation across facts.** An inner join on one fact narrows the other too, as in plain SQL:
 

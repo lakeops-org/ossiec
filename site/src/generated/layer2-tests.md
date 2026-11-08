@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 141 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 142 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -31,7 +31,7 @@ Model-qualified relations, measure names, aliases and output labels, and what is
 
 Every kind, from either side, fan-out, and G2.
 
-[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 18 tests
+[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 19 tests
 
 | Test | What it shows |
 |---|---|
@@ -53,6 +53,7 @@ Every kind, from either side, fan-out, and G2.
 | `join_from_the_one_side_filters_every_aggregate_shape` | Aggregates of every shape take the FILTER, ANDed with a FILTER of their own, so a fact without a primary key needs no de-duplication for any of them. |
 | `right_joins_along_a_chain_without_a_fact_key` | orders -> customers -> regions, `orders` without a primary key. |
 | `left_join_from_the_one_side_drops_unmatched_fact_rows` | §7.6, §8.1: `customers LEFT JOIN orders` keeps every customer and the orders that match one. |
+| `join_kind_changes_the_request_hash` | The join kind is part of a query's identity: an `INNER` and a `LEFT` join compile to different SQL, so they must not share a `request_hash`. |
 
 ## Appendix A.4
 

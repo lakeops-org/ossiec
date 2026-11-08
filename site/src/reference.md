@@ -54,7 +54,7 @@ let out = ossiec::compile_sql(&graph, sql, &opts)?;     // Layer 2
 | `dialect` | The dialect `sql` is written in |
 | `source_dialect` | The dialect the model's expressions were read in: `generic`, unless a vendor-only expression was used |
 | `model`, `model_version` | Which model it was compiled against |
-| `request_hash` | A stable hash of model, version, request and options: the same inputs give the same SQL |
+| `request_hash` | A stable hash of the model's name and version, the request (or the Layer 2 SQL) and the options: the same inputs give the same SQL. It doesn't cover the model's contents |
 | `warnings` | For example `FAN_TRAP_RISK` when a Layer 2 measure is de-duplicated, or a bare name accepted in a model-scoped metric |
 
 ### `Error`

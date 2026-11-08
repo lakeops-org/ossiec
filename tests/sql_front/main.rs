@@ -249,24 +249,36 @@ fn site_layer2_evidence_is_current() {
         let lines: Vec<&str> = src.lines().collect();
         let mut rows = vec![];
         for (i, l) in lines.iter().enumerate() {
-            let Some(name) = l
-                .strip_prefix("fn ")
-                .and_then(|r| r.split('(').next())
-                .filter(|_| i > 0 && lines[..i].iter().rev().take(4).any(|p| *p == "#[test]"))
-            else {
+            let sig = l.trim_start();
+            let sig = sig
+                .strip_prefix("pub(crate) ")
+                .or(sig.strip_prefix("pub "))
+                .unwrap_or(sig);
+            let sig = sig.strip_prefix("async ").unwrap_or(sig);
+            let Some(name) = sig.strip_prefix("fn ").and_then(|r| r.split('(').next()) else {
                 continue;
             };
+            // The attributes and doc lines above it, however many.
             let mut j = i;
-            while j > 0 && (lines[j - 1].starts_with("#[") || lines[j - 1].starts_with("///")) {
+            while j > 0 && {
+                let p = lines[j - 1].trim_start();
+                p.starts_with("#[") || p.starts_with("///")
+            } {
                 j -= 1;
+            }
+            if !lines[j..i].iter().any(|p| p.trim() == "#[test]") {
+                continue;
             }
             let doc: String = lines[j..i]
                 .iter()
+                .map(|d| d.trim_start())
                 .filter(|d| d.starts_with("///"))
                 .map(|d| d.trim_start_matches("///").trim())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let ignored = lines[j..i].iter().any(|d| d.starts_with("#[ignore"));
+            let ignored = lines[j..i]
+                .iter()
+                .any(|d| d.trim_start().starts_with("#[ignore"));
             rows.push((name.to_string(), first_sentence(&doc), ignored));
         }
         total += rows.len();
