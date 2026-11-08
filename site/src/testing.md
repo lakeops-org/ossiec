@@ -27,3 +27,5 @@ OSSIEC_UPDATE_SITE=1 cargo test                                    # regenerate 
 ## How this site stays true
 
 [Functions by engine](generated/functions.md) and [Layer 2 test evidence](generated/layer2-tests.md) are written by tests. Each test also fails when its committed page differs from what it would write, so a change that closes a gap or adds a test must update the site in the same commit.
+
+CI skips a change that only touches Markdown or the site source, since neither changes what the tests check. A change to a generated page still runs CI, so a hand edit there can't slip through.
