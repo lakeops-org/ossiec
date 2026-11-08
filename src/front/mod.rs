@@ -190,6 +190,8 @@ pub(super) struct EphemeralMetric {
     pub body: Expression,
     pub dataset: String,
     pub bare: String,
+    /// A plain SQL aggregate in the select list (§7.2), not a `TO MEASURE`.
+    pub raw: bool,
 }
 
 /// A select-list column that stays a measure for an outer `AGG()`.
@@ -368,8 +370,8 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
     let mut base_seq = 0usize;
     let mut parsed = parse_stage_from(graph, &sel, &cfg, parsed_from, &[], &mut base_seq)?;
     if !parsed.ephemeral.is_empty() {
-        return Err(Error::Internal(
-            "flat Layer 2 query cannot install a query-local base measure".into(),
+        return Err(unsupported(
+            "a plain SQL aggregate (SUM, COUNT, ...) beside AGG() is not a Layer 3 request; use compile_sql",
         ));
     }
     if pragma_include_unmatched(sql) {
@@ -544,6 +546,49 @@ pub(super) fn parse_stage_from(
                 });
                 continue;
             }
+        }
+        if inner.contains(is_base_agg_expr) && !inner.contains(is_measure_agg_expr) {
+            // §7.2: an ordinary aggregate over fields, beside the measures. An
+            // ephemeral metric marked raw: evaluated over the joined rows as written.
+            if !is_single_base_aggregate(inner) {
+                return Err(unsupported(
+                    "Layer 2 plain aggregates are one SUM|COUNT|AVG|MIN|MAX(...) per select item for now; arithmetic on them, or with AGG(), is not implemented yet",
+                ));
+            }
+            if cfg.derived && alias.is_none() {
+                return Err(unsupported(
+                    "Layer 2 derived table: every aggregate needs an explicit alias so the outer query can name it (e.g. MAX(order_date) AS last_order)",
+                ));
+            }
+            // `COUNT(*)` reads no field: it counts the joined rows whichever
+            // dataset holds it, so it sits on the first one in FROM.
+            let (owner, body) = match scope.bindings.first() {
+                Some(b) if get_columns(inner).is_empty() => {
+                    (b.dataset, unwrap_paren(inner).clone())
+                }
+                _ => base_measure_body(graph, scope, inner)?,
+            };
+            let bare = format!("__l2_bm{base_seq}");
+            *base_seq += 1;
+            let dataset = graph.datasets[owner].name.clone();
+            let metric = format!("{dataset}.{bare}");
+            ephemeral.push(EphemeralMetric {
+                name: metric.clone(),
+                owner,
+                body,
+                dataset,
+                bare,
+                raw: true,
+            });
+            metrics.push(metric.clone());
+            let out_name = match alias.clone() {
+                Some(a) => a,
+                None => polyglot_sql::generate(inner, DialectType::Generic)
+                    .map_err(|e| Error::Internal(e.to_string()))?,
+            };
+            measure_outputs.push((out_name.clone(), L2Formula::Agg(metric)));
+            outputs.push((out_name.clone(), out_name));
+            continue;
         }
         if let Some(formula) = parse_measure_formula(graph, scope, inner)? {
             for leaf in formula_leaves(&formula) {
@@ -878,6 +923,7 @@ fn classify_to_measure(
             body,
             dataset,
             bare,
+            raw: false,
         }));
     }
     if !measure {

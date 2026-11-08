@@ -636,7 +636,7 @@ pub(crate) fn plan(
             .map(|t| {
                 match terms
                     .iter()
-                    .position(|x| x.key == t.key && x.datasets == t.datasets)
+                    .position(|x| x.key == t.key && x.datasets == t.datasets && x.raw == t.raw)
                 {
                     Some(i) => i,
                     None => {
@@ -749,8 +749,9 @@ pub(crate) fn plan(
         let root = legs[leg].root;
         // With includeUnmatched, every one-side term is de-duplicated, so its
         // unmatched rows can be added (an inline COUNT DISTINCT can't take them).
-        let inline =
-            term.datasets.contains(&root) || (term.dup_insensitive && !req.include_unmatched);
+        let inline = term.raw
+            || term.datasets.contains(&root)
+            || (term.dup_insensitive && !req.include_unmatched);
         let strategy = if inline {
             Strategy::Inline
         } else {

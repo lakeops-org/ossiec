@@ -21,8 +21,11 @@
 //! result is an ordinary `AGG` stage ([`Compiler::agg_stage`]). An inner `GROUP BY`
 //! is dropped (it only fixes a grain; the measure is re-evaluated at the outer one).
 //!
-//! Inners that would change which rows feed the measure (`HAVING`, `DISTINCT`,
-//! `ORDER BY` / `LIMIT`, `WITH`, a derived `FROM`) are refused. The derived-table
+//! A derived table whose own `FROM` is a sole derived table is folded first,
+//! innermost out, so a measure passes through any number of levels. Inners that
+//! would change which rows feed the measure (`HAVING`, `DISTINCT`, `ORDER BY` /
+//! `LIMIT`, `WITH`, a derived table joined in its `FROM`, a grouping innermost)
+//! are refused. The derived-table
 //! join form (`FROM orders o JOIN (...) t ON ...`) does not fold; see
 //! [`super::nested`].
 
@@ -271,6 +274,14 @@ impl Compiler<'_> {
         derived_mode: bool,
         outer: &[String],
     ) -> Result<Node> {
+        let folded = self.fold_select(sel, outer)?;
+        self.agg_stage(&folded, depth, derived_mode, outer)
+    }
+
+    /// `sel` with its sole derived table folded in. A derived table whose own
+    /// `FROM` is a sole derived table is folded first, innermost out, so a measure
+    /// passes through any number of plain projections and filters (§7.7).
+    fn fold_select(&mut self, sel: &Select, outer: &[String]) -> Result<Select> {
         if sel.distinct_on.is_some() || sel.qualify.is_some() || sel.offset.is_some() {
             return Err(unsupported(
                 "Layer 2 DISTINCT ON / QUALIFY / OFFSET are not implemented yet",
@@ -290,6 +301,19 @@ impl Compiler<'_> {
         if inner.order_by.is_some() || inner.limit.is_some() || inner.offset.is_some() {
             return Err(why("ORDER BY / LIMIT / OFFSET"));
         }
+        let flattened;
+        let inner = match sole_derived(inner)? {
+            Some(innermost) => {
+                // Its GROUP BY would be dropped here, and a grouped query can't
+                // carry a measure out (§7.2).
+                if super::is_aggregated(innermost) {
+                    return Err(why("a derived table that aggregates as its FROM"));
+                }
+                flattened = self.fold_select(inner, outer)?;
+                &flattened
+            }
+            None => inner,
+        };
         let inner_from = inner.from.as_ref().ok_or_else(|| why("no FROM"))?;
         for e in &inner_from.expressions {
             if as_derived(e)?.is_some() {
@@ -441,8 +465,19 @@ impl Compiler<'_> {
         folded.offset = None;
         for ep in pending {
             self.graph
-                .install_ephemeral_metric(&ep.name, ep.owner, ep.body)?;
+                .install_ephemeral_metric(&ep.name, ep.owner, ep.body, ep.raw)?;
         }
-        self.agg_stage(&folded, depth, derived_mode, outer)
+        Ok(folded)
     }
+}
+
+/// The select's derived table, when it is the whole of its `FROM`.
+fn sole_derived(sel: &Select) -> Result<Option<&Select>> {
+    let Some(from) = &sel.from else {
+        return Ok(None);
+    };
+    if from.expressions.len() != 1 || !sel.joins.is_empty() {
+        return Ok(None);
+    }
+    Ok(as_derived(&from.expressions[0])?.map(|(s, _)| s))
 }

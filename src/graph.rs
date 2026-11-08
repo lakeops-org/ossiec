@@ -70,6 +70,8 @@ pub(crate) struct MetricInfo {
     pub variants: Vec<Variant>,
     /// Set when the metric is valid Ossie that this version can't compile yet.
     pub unsupported: Option<String>,
+    /// A Layer 2 plain SQL aggregate (§7.2), not a measure: see [`Term::raw`].
+    pub raw: bool,
 }
 
 /// A validated, bound Ossie model, ready to compile requests against.
@@ -97,6 +99,10 @@ pub(crate) struct Term {
     pub null_type: Option<&'static str>,
     /// Generated SQL of `ast`; identical aggregates over the same datasets share one term.
     pub key: String,
+    /// A plain SQL aggregate beside `AGG()` (relational_semantics §7.2): evaluated
+    /// over the query's joined rows as written, repeats and NULL-extended rows
+    /// included, so it is always inline and never de-duplicated or filtered.
+    pub raw: bool,
 }
 
 /// One reason wide table §5.2 refuses a query naming a model-scoped metric.
@@ -663,6 +669,7 @@ pub fn bind(model: Model) -> Result<SemanticGraph> {
                     owner,
                     variants: vs,
                     unsupported: None,
+                    raw: false,
                 })
             }
             Err(e) => errs.push(e),
@@ -1063,6 +1070,7 @@ impl SemanticGraph {
         name: &str,
         owner: usize,
         ast: Expression,
+        raw: bool,
     ) -> Result<()> {
         if self
             .metrics
@@ -1081,6 +1089,7 @@ impl SemanticGraph {
                 ast: true_division(ast),
             }],
             unsupported: None,
+            raw,
         });
         let i = self.metrics.len() - 1;
         match self.resolve_metric_unchecked(i, &mut Ctx::default()) {
@@ -1610,6 +1619,7 @@ impl SemanticGraph {
                 ast,
                 datasets,
                 key,
+                raw: info.raw,
             });
         }
         Ok(ResolvedMetric {
