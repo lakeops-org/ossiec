@@ -1,9 +1,22 @@
 name: CI
 
+# Markdown and the site source don't change what the tests check, so a change
+# to them alone doesn't run CI. The exception is site/src/generated/: the tests
+# fail when those pages drift from what ossiec does. Later patterns win.
 on:
   push:
     branches: [main]
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!site/**'
+      - 'site/src/generated/**'
   pull_request:
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!site/**'
+      - 'site/src/generated/**'
 
 env:
   CARGO_TERM_COLOR: always
