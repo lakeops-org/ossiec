@@ -173,11 +173,11 @@ pub(super) fn dataset_field(graph: &SemanticGraph, ds: usize, col: &Column) -> R
             });
             if is_measure {
                 Err(unsupported(format!(
-                    "Layer 2 TO MEASURE base aggregate `{label}` is a measure on `{ds_name}`, not a field; name a field (SUM(amount)) or read the measure with AGG()"
+                    "Layer 2 aggregate argument `{label}` is a measure on `{ds_name}`, not a field; name a field (SUM(amount)) or read the measure with AGG()"
                 )))
             } else {
                 Err(Error::Request(format!(
-                    "Layer 2 TO MEASURE base aggregate `{label}` is not a field of `{ds_name}`"
+                    "Layer 2 aggregate argument `{label}` is not a field of `{ds_name}`"
                 )))
             }
         }
@@ -273,4 +273,49 @@ pub(super) fn take_agg(e: &Expression) -> Result<Option<&Expression>> {
 pub(super) fn is_agg_name(name: &str) -> bool {
     // Spec §6: AGG is normative; MEASURE is a non-normative synonym.
     matches!(name.to_ascii_uppercase().as_str(), "AGG" | "MEASURE")
+}
+
+/// The plain aggregates (§7.2) of one stage, wherever they appear: the select
+/// list, `HAVING` or `ORDER BY`. Each becomes an ephemeral metric marked raw,
+/// evaluated over the query's joined rows as written, so a repeated or
+/// NULL-extended row counts, as in plain SQL.
+pub(super) struct RawAggs<'a> {
+    pub seq: &'a mut usize,
+    pub made: &'a mut Vec<EphemeralMetric>,
+}
+
+impl RawAggs<'_> {
+    /// The raw metric for one `SUM|COUNT|AVG|MIN|MAX(...)`.
+    pub(super) fn metric(
+        &mut self,
+        graph: &SemanticGraph,
+        scope: &QueryScope,
+        e: &Expression,
+    ) -> Result<String> {
+        let e = unwrap_paren(e);
+        if e.count(is_base_agg_expr) != 1 || e.contains(is_measure_agg_expr) {
+            return Err(unsupported(
+                "Layer 2 plain aggregates can't nest: an aggregate's argument is a row expression, with no aggregate or AGG() inside it",
+            ));
+        }
+        // `COUNT(*)` reads no field: it counts the joined rows whichever
+        // dataset holds it, so it sits on the first one in FROM.
+        let (owner, body) = match scope.bindings.first() {
+            Some(b) if get_columns(e).is_empty() => (b.dataset, e.clone()),
+            _ => base_measure_body(graph, scope, e)?,
+        };
+        let bare = format!("__l2_bm{}", *self.seq);
+        *self.seq += 1;
+        let dataset = graph.datasets[owner].name.clone();
+        let metric = format!("{dataset}.{bare}");
+        self.made.push(EphemeralMetric {
+            name: metric.clone(),
+            owner,
+            body,
+            dataset,
+            bare,
+            raw: true,
+        });
+        Ok(metric)
+    }
 }

@@ -84,15 +84,15 @@ use clauses::{
 };
 use formula::{
     apply_select_formulas, default_measure_name, formula_leaves, formula_to_expr,
-    parse_formula_or_agg, parse_measure_formula, resolve_agg, unwrap_paren,
+    parse_formula_or_agg, parse_formula_with_plain, parse_measure_formula, resolve_agg,
+    unwrap_paren,
 };
 use from::{
     as_derived, consumer_join_kind, cross_join_on, parse_from_clause, table_expr, ParsedFrom,
 };
 use measures::{
-    aggregated_measure, bare_field, bare_measure, base_measure_body, classify_to_measure,
-    is_agg_name, is_aggregated, is_base_agg_expr, is_measure_agg_expr, is_model_metric,
-    is_single_base_aggregate, model_scoped, take_agg,
+    aggregated_measure, bare_field, bare_measure, classify_to_measure, is_agg_name, is_aggregated,
+    is_base_agg_expr, is_measure_agg_expr, is_model_metric, model_scoped, take_agg, RawAggs,
 };
 use nested::{OutCol, OutKind};
 use resolve::{

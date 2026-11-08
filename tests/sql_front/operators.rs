@@ -133,10 +133,6 @@ fn having_keeps_or_drops_finished_groups() {
         "order_count",
     );
     refuses(
-        "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING SUM(id) > 1",
-        "plain aggregate",
-    );
-    refuses(
         "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING AGG(order_count) > (SELECT 1)",
         "subqueries",
     );
@@ -373,10 +369,6 @@ fn order_by_reads_measures_that_are_not_selected() {
         "not in GROUP BY",
     );
     refuses(
-        "SELECT status FROM orders GROUP BY status ORDER BY SUM(id)",
-        "plain aggregate",
-    );
-    refuses(
         "SELECT status FROM orders GROUP BY status ORDER BY (SELECT 1)",
         "subqueries",
     );
@@ -595,5 +587,58 @@ fn distinct_refuses_unevaluated_measures() {
     refused(
         "SELECT DISTINCT ON (status) status, AGG(x) FROM (SELECT status, order_count AS x FROM orders) t GROUP BY status",
         "DISTINCT ON",
+    );
+}
+
+/// §7.2, §7.5: a plain aggregate in `HAVING` or `ORDER BY` reads the group's
+/// joined rows as plain SQL does, beside `AGG()`, whether or not it is selected.
+#[test]
+fn having_and_order_by_read_plain_aggregates() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duck_db();
+    let run = |sql: &str| {
+        let c = ossiec::compile_sql(&g, sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        duckdb_rows(&db, &c.sql)
+    };
+    assert_eq!(
+        sorted(run(
+            "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status HAVING COUNT(*) > 1"
+        )),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 1"
+        ))
+    );
+    // Regions with a customer who has no orders: more joined rows than orders.
+    assert_eq!(
+        sorted(run(
+            "SELECT c.region, AGG(o.order_count) AS n FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             GROUP BY c.region HAVING COUNT(*) > AGG(o.order_count)"
+        )),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT c.region, COUNT(o.order_id) FROM {customers} c \
+             LEFT JOIN orders o ON o.customer_id = c.customer_id \
+             GROUP BY c.region HAVING COUNT(*) > COUNT(o.order_id)"
+        ))
+    );
+    // Sorted, not just the same rows.
+    assert_eq!(
+        run("SELECT status FROM orders GROUP BY status ORDER BY MAX(id) DESC, status LIMIT 3"),
+        duckdb_rows(
+            &db,
+            "SELECT status FROM orders GROUP BY status ORDER BY MAX(order_id) DESC, status LIMIT 3"
+        )
+    );
+    // A HAVING conjunct with a plain aggregate filters groups, not rows.
+    assert_eq!(
+        sorted(run(
+            "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status HAVING SUM(id) > 3"
+        )),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING SUM(order_id) > 3"
+        ))
     );
 }

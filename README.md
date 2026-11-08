@@ -184,9 +184,9 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **Roles.** Qualify a column with the relationship name, the same form as a Layer 3 dimension: `departs_from.city`. That name may also be the JOIN alias (`JOIN airports AS departs_from`). In Layer 2 a plain `airports.city` takes the unique shortest path and is refused when departure and arrival both tie.
 
-**`HAVING`** (§7.5) takes `AGG()`, expressions over it and selected columns, and the measure needn't be selected. It's computed in its own part like any measure, so a one-side measure is de-duplicated before it's compared. A plain aggregate or a window in `HAVING` is refused.
+**`HAVING`** (§7.5) takes `AGG()`, expressions over it and selected columns, and the measure needn't be selected. It's computed in its own part like any measure, so a one-side measure is de-duplicated before it's compared. A plain aggregate there (`HAVING COUNT(*) > 5`) reads the group's joined rows, as in plain SQL; a window in `HAVING` is refused.
 
-**Plain aggregates** (§7.2) sit beside `AGG()` in the select list: `SELECT region, MAX(order_date), AGG(total_revenue) … GROUP BY region`. Each is ordinary SQL over the query's joined rows, so repeats and NULL-extended rows count (`COUNT(*)` over `customers LEFT JOIN orders` counts a customer without orders once), while each measure still counts its own source rows once. Today an item is one `SUM|COUNT|AVG|MIN|MAX(...)` over one dataset's fields; arithmetic on it, plain aggregates beside measures from independent facts, and `includeUnmatched` are refused.
+**Plain aggregates** (§7.2) sit beside `AGG()` in the select list: `SELECT region, MAX(order_date), AGG(total_revenue) … GROUP BY region`. Each is ordinary SQL over the query's joined rows, so repeats and NULL-extended rows count (`COUNT(*)` over `customers LEFT JOIN orders` counts a customer without orders once), while each measure still counts its own source rows once. Each `SUM|COUNT|AVG|MIN|MAX(...)` reads one dataset's fields, and select items, `HAVING` and `ORDER BY` combine them with each other and with `AGG()` (`+ - * /`, `NULLIF`): `COUNT(*) - AGG(o.order_count)`. Nested aggregates, plain aggregates beside measures from independent facts, and `includeUnmatched` are refused.
 
 **Nested pass-through** (§7.7): a measure passes through any number of plain projections and filters (`FROM (SELECT … FROM (SELECT … FROM orders WHERE …) a WHERE …) b`, or `WITH` levels reading each other) and is evaluated by the outer `AGG()`.
 
@@ -470,7 +470,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [ ] Exact percentiles on MySQL and Trino, which have no such function
 - [x] Layer 2 `GROUP BY ALL` and `DISTINCT`
 - [x] Layer 2 plain aggregates beside `AGG()` (§7.2), and a measure passed through nested derived tables (§7.7)
-- [ ] Layer 2 arithmetic on plain aggregates, and plain aggregates in `HAVING`
+- [x] Layer 2 arithmetic on plain aggregates, alone or with `AGG()`, and plain aggregates in `HAVING` and `ORDER BY`
 - [x] Fix: a LEFT JOIN written from the one side (`customers LEFT JOIN orders`) counted fact rows that match nothing
 - [x] Fix: a join on one of several independent facts left the others unrestricted, and two `COUNT(*)` metrics on different facts shared one answer
 - [x] Fix: a Layer 2 comma `FROM` (`FROM customers c, orders o, tickets t`) was read as independent facts; it is a `CROSS JOIN`, as in SQL

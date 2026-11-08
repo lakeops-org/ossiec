@@ -253,6 +253,28 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.2: arithmetic on plain aggregates, alone and with AGG(): plain SQL over
+        // the joined rows beside a measure that counts its own rows once.
+        name: "plain_aggregate_arithmetic_beside_a_measure",
+        sql: "SELECT c.region, COUNT(*) - AGG(o.order_count) AS no_orders, MAX(c.id) + 1 AS next_id \
+              FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
+        reference: "SELECT c.region, COUNT(*) - COUNT(o.order_id), MAX(c.customer_id) + 1 \
+              FROM {customers} c LEFT JOIN orders o ON o.customer_id = c.customer_id \
+              GROUP BY c.region",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.5: plain aggregates in HAVING and ORDER BY, beside AGG().
+        name: "having_and_order_by_on_plain_aggregates",
+        sql: "SELECT c.region, AGG(o.order_count) AS n FROM customers c \
+              LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region \
+              HAVING COUNT(*) > AGG(o.order_count) ORDER BY COUNT(*) DESC, c.region",
+        reference: "SELECT c.region, COUNT(o.order_id) FROM {customers} c \
+              LEFT JOIN orders o ON o.customer_id = c.customer_id GROUP BY c.region \
+              HAVING COUNT(*) > COUNT(o.order_id) ORDER BY COUNT(*) DESC, c.region",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.5: over the finished groups, on a selected measure.
         name: "having_on_a_selected_measure",
         sql: "SELECT status, AGG(order_count) AS n FROM orders GROUP BY status HAVING AGG(order_count) > 1",
