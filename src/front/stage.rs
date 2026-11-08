@@ -174,8 +174,7 @@ pub(super) fn parse_stage_from(
                 }
                 _ => base_measure_body(graph, scope, inner)?,
             };
-            let bare = format!("__l2_bm{base_seq}");
-            *base_seq += 1;
+            let bare = super::measures::fresh_measure_name(graph, owner, base_seq);
             let dataset = graph.datasets[owner].name.clone();
             let metric = format!("{dataset}.{bare}");
             ephemeral.push(EphemeralMetric {

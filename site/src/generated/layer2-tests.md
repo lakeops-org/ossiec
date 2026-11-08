@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 146 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 148 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -31,7 +31,7 @@ Model-qualified relations, measure names, aliases and output labels, and what is
 
 Every kind, from either side, fan-out, and G2.
 
-[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 22 tests
+[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 23 tests
 
 | Test | What it shows |
 |---|---|
@@ -57,6 +57,7 @@ Every kind, from either side, fan-out, and G2.
 | `right_joins_along_a_chain_without_a_fact_key` | orders -> customers -> regions, `orders` without a primary key. |
 | `left_join_from_the_one_side_drops_unmatched_fact_rows` | §7.6, §8.1: `customers LEFT JOIN orders` keeps every customer and the orders that match one. |
 | `join_kind_changes_the_request_hash` | The join kind is part of a query's identity: an `INNER` and a `LEFT` join compile to different SQL, so they must not share a `request_hash`. |
+| `a_repeated_alias_is_refused_in_every_join_form` | One alias names one relation, however the second one is joined: a comma item, a `CROSS JOIN` or a relationship join. |
 
 ## Appendix A.4
 
@@ -121,7 +122,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 §7.2 aggregated queries and plain aggregates, §7.7 pass-through, query-local `TO MEASURE`, and the fold of a sole derived table.
 
-[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 32 tests
+[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 33 tests
 
 | Test | What it shows |
 |---|---|
@@ -157,6 +158,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 | `folded_to_measure_formulas_participate_in_request_hash` |  |
 | `aggregated_queries_refuse_unevaluated_measures` | §7.2: an aggregated query reports values, so it can't carry an unevaluated measure out, whether passed through or defined there. |
 | `quoted_measure_names_follow_the_identifier_rules` | A measure name follows the identifier rules, as a field does: a regular name matches whatever its case, a quoted one only exactly as the model normalizes it. |
+| `query_local_measure_names_avoid_model_metrics` | A query-local measure's generated name skips any the model already uses, by the identifier rules: `__L2_BM0` is the regular name `__l2_bm0` is too. |
 
 ## Query operators (§7.3–§7.8)
 

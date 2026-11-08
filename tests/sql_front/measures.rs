@@ -891,3 +891,32 @@ fn quoted_measure_names_follow_the_identifier_rules() {
     );
     assert!(pass("\"order_count\"").is_err());
 }
+
+/// A query-local measure's generated name skips any the model already uses, by
+/// the identifier rules: `__L2_BM0` is the regular name `__l2_bm0` is too.
+#[test]
+fn query_local_measure_names_avoid_model_metrics() {
+    let model = common::MODEL.replacen(
+        "      - { name: gross_revenue, expression: { sql: SUM(revenue) } }",
+        "      - { name: gross_revenue, expression: { sql: SUM(revenue) } }\n      - { name: __L2_BM0, expression: { sql: SUM(amount_cents) } }",
+        1,
+    );
+    assert_ne!(model, common::MODEL);
+    let g = ossiec::from_yaml(&model).unwrap();
+    let db = duckdb();
+    let c = ossiec::compile_layer2(
+        &g,
+        "SELECT status, MAX(order_date) AS last, AGG(__L2_BM0) AS cents FROM orders GROUP BY status",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT status, MAX(order_date), SUM(amount_cents) FROM orders GROUP BY status"
+        )),
+        "{}",
+        c.sql
+    );
+}

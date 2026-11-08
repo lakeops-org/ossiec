@@ -587,3 +587,20 @@ fn join_kind_changes_the_request_hash() {
     assert_ne!(inner.request_hash, left.request_hash);
     assert_eq!(left.request_hash, compile("LEFT JOIN").request_hash);
 }
+
+/// One alias names one relation, however the second one is joined: a comma
+/// item, a `CROSS JOIN` or a relationship join. Refused, never resolved to one.
+#[test]
+fn a_repeated_alias_is_refused_in_every_join_form() {
+    for from in [
+        "orders o, customers o",
+        "orders o CROSS JOIN customers o",
+        "orders o JOIN customers o ON o.customer_id = o.id",
+    ] {
+        let sql = format!("SELECT AGG(o.order_count) FROM {from}");
+        let e = ossiec::compile_layer2(&graph(), &sql, &duck())
+            .expect_err(&sql)
+            .to_string();
+        assert!(e.contains("duplicate relation alias `o`"), "{from}: {e}");
+    }
+}
