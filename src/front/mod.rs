@@ -388,6 +388,26 @@ pub(super) fn pragma_include_unmatched(sql: &str) -> bool {
     })
 }
 
+/// Whether a query aggregates (§7.2): `GROUP BY`, `HAVING`, or an aggregate in its
+/// select list. A measure definition's own aggregate doesn't count: it's cut out of
+/// the text as a `TO MEASURE` marker before this runs.
+pub(super) fn is_aggregated(sel: &Select) -> bool {
+    sel.group_by.is_some()
+        || sel.having.is_some()
+        || sel.expressions.iter().any(|e| {
+            let (inner, _) = strip_alias(e);
+            contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
+        })
+}
+
+/// §7.2's refusal of an unevaluated measure in an aggregated query.
+/// `what` names the measure, or where it comes from.
+pub(super) fn aggregated_measure(what: &str) -> Error {
+    Error::Request(format!(
+        "Layer 2 query aggregates, so it can't return an unevaluated measure ({what}) (relational_semantics §7.2): read it with AGG(), or carry it through a query without GROUP BY, HAVING or aggregates"
+    ))
+}
+
 /// `GROUP BY ALL` (§7.4) as the list it stands for: every selected column that isn't
 /// an aggregate. A bare measure stays in the list, and is refused as `GROUP BY m` is.
 pub(super) fn expand_group_by_all(sel: &mut Select) -> Result<()> {
@@ -616,8 +636,14 @@ pub(super) fn parse_stage_from(
     // `GROUP BY` must name exactly the selected dimensions. With `AGG` it is
     // required whenever dimensions are selected; without `AGG` it is optional
     // (a dimension listing is one row per combination anyway: Appendix A.3's `d`).
+    // A measure definition reads `AGG` without aggregating the query (§4.2), so a
+    // relation of fields and definitions needs none either: Appendix A.7's view.
+    let aggregates = sel.expressions.iter().any(|e| {
+        let (inner, _) = strip_alias(e);
+        contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
+    });
     match &sel.group_by {
-        None if !metrics.is_empty() && !dimensions.is_empty() => {
+        None if aggregates && !dimensions.is_empty() => {
             return Err(Error::Request(
                 "Layer 2 aggregated query with dimensions needs GROUP BY".into(),
             ));
@@ -747,6 +773,11 @@ pub(super) fn parse_stage_from(
                 nulls,
             });
         }
+    }
+    // §7.2: an aggregated query reports values, and an unevaluated measure isn't one.
+    // A measure passes through, or is defined, only in a query that doesn't aggregate.
+    if let Some(m) = unevaluated.first().filter(|_| is_aggregated(sel)) {
+        return Err(aggregated_measure(&format!("`{}`", m.name)));
     }
     // §7.8: `DISTINCT` compares whole rows, and an unevaluated measure has no value.
     // Otherwise it changes nothing: `GROUP BY` must name exactly the selected

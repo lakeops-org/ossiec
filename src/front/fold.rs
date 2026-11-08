@@ -68,6 +68,8 @@ enum Col {
 struct FoldMap {
     alias: String,
     cols: Vec<(String, Col)>,
+    /// The inner query aggregates, so it can't carry a measure out (§7.2).
+    aggregated: bool,
 }
 
 impl FoldMap {
@@ -208,7 +210,14 @@ impl FoldMap {
         let Some(c) = as_column(arg) else {
             return Ok(Agg::Keep(arg.clone()));
         };
-        Ok(match self.lookup(c)? {
+        let col = self.lookup(c)?;
+        if self.aggregated && !matches!(col, Col::Evaluated) {
+            return Err(super::aggregated_measure(&format!(
+                "`{}.{}`",
+                self.alias, c.name.name
+            )));
+        }
+        Ok(match col {
             Col::Inner(x) => Agg::Keep(x.clone()),
             Col::Deferred(x) => Agg::Expand(Expression::Paren(Box::new(
                 polyglot_sql::expressions::Paren {
@@ -275,8 +284,8 @@ impl Compiler<'_> {
                 "Layer 2 AGG() over derived table `{alias}` (relational_semantics §7.7) folds a plain filter + projection of model datasets; the derived table has {what}. Join the derived table to a dataset (FROM <dataset> JOIN (...) {alias} ON ...) instead"
             ))
         };
-        if inner.distinct || inner.having.is_some() || inner.qualify.is_some() {
-            return Err(why("DISTINCT / HAVING / QUALIFY"));
+        if inner.distinct || inner.qualify.is_some() {
+            return Err(why("DISTINCT / QUALIFY"));
         }
         if inner.order_by.is_some() || inner.limit.is_some() || inner.offset.is_some() {
             return Err(why("ORDER BY / LIMIT / OFFSET"));
@@ -330,7 +339,11 @@ impl Compiler<'_> {
             }
             cols.push((name, col));
         }
-        let map = FoldMap { alias, cols };
+        let map = FoldMap {
+            alias,
+            cols,
+            aggregated: super::is_aggregated(inner),
+        };
 
         // Inner GROUP BY is dropped (grain is re-evaluated), but grouping by a
         // measure must still be refused.

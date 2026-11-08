@@ -185,6 +185,8 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **`ORDER BY`** (§7.5) takes a selected column or measure by name, or `AGG()` and expressions over it, selected or not, so a Top-N can select only its join column. `ORDER BY 1` is refused, since it means a position in SQL.
 
+**Measure relations** (§7.2, §4.2) are written without `GROUP BY`, as in Appendix A.7: a query that aggregates can't return an unevaluated measure, whether it passes one through or defines it with `TO MEASURE`.
+
 **`GROUP BY ALL`** (§7.4) groups by every selected column that isn't an aggregate, and refuses a bare measure. **`DISTINCT`** (§7.8) works over fields and evaluated measures, and refuses an unevaluated one.
 
 **`WITH`** (§7.7) is a named derived table, so a measure passes through a CTE as it does through a subquery. `WITH RECURSIVE`, a column list and a set operator in a CTE are refused.
@@ -212,16 +214,14 @@ FROM customers r
 JOIN (SELECT c.region, (AGG(o.order_amt) / AGG(t.ticket_count)) TO MEASURE AS sales_per_ticket
       FROM customers c
       LEFT JOIN orders o ON o.customer_id = c.id
-      LEFT JOIN tickets t ON t.customer_id = c.id
-      GROUP BY c.region) m ON r.region = m.region
+      LEFT JOIN tickets t ON t.customer_id = c.id) m ON r.region = m.region
 GROUP BY r.region;
 
 -- Base measure: SUM(...) stays unevaluated until the outer AGG
 SELECT r.region, AGG(m.total_revenue)
 FROM customers r
 JOIN (SELECT c.region, SUM(o.amount) TO MEASURE AS total_revenue
-      FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
-      GROUP BY c.region) m ON r.region = m.region
+      FROM customers c LEFT JOIN orders o ON o.customer_id = c.id) m ON r.region = m.region
 GROUP BY r.region;
 
 -- A.7: the same relation, named (session catalog). Persist into the model with
@@ -231,8 +231,7 @@ SELECT c.region,
        (AGG(o.order_amt) / AGG(t.ticket_count)) TO MEASURE AS sales_per_ticket
 FROM customers c
 LEFT JOIN orders o ON o.customer_id = c.id
-LEFT JOIN tickets t ON t.customer_id = c.id
-GROUP BY c.region;
+LEFT JOIN tickets t ON t.customer_id = c.id;
 
 SELECT region, AGG(sales_per_ticket) AS sales_per_ticket
 FROM region_metrics
@@ -463,6 +462,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 1 functions on six engines, each implemented or refused (`functions.rs`)
 - [ ] Exact percentiles on MySQL and Trino, which have no such function
 - [x] Layer 2 `GROUP BY ALL` and `DISTINCT`
+- [ ] Fix: a LEFT JOIN written from the one side (`customers LEFT JOIN orders`) counts fact rows that match nothing
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
