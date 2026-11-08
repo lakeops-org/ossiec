@@ -21,8 +21,12 @@
 //! result is an ordinary `AGG` stage ([`Compiler::agg_stage`]). An inner `GROUP BY`
 //! is dropped (it only fixes a grain; the measure is re-evaluated at the outer one).
 //!
-//! Inners that would change which rows feed the measure (`HAVING`, `DISTINCT`,
-//! `ORDER BY` / `LIMIT`, `WITH`, a derived `FROM`) are refused. The derived-table
+//! Inners that would change which rows feed the measure (`DISTINCT`, `ORDER BY` /
+//! `LIMIT`, `WITH`, a derived `FROM`) are refused. An inner that aggregates
+//! (`GROUP BY`, `HAVING`, or an aggregate in its select list) can't carry a
+//! measure out (§7.2), so an outer `AGG()` of one of its columns is refused in
+//! `FoldMap::agg_arg`; its `HAVING` is never copied into the folded query. The
+//! derived-table
 //! join form (`FROM orders o JOIN (...) t ON ...`) does not fold; see
 //! [`super::nested`].
 
@@ -68,6 +72,8 @@ enum Col {
 struct FoldMap {
     alias: String,
     cols: Vec<(String, Col)>,
+    /// The inner query aggregates, so it can't carry a measure out (§7.2).
+    aggregated: bool,
 }
 
 impl FoldMap {
@@ -208,7 +214,14 @@ impl FoldMap {
         let Some(c) = as_column(arg) else {
             return Ok(Agg::Keep(arg.clone()));
         };
-        Ok(match self.lookup(c)? {
+        let col = self.lookup(c)?;
+        if self.aggregated && !matches!(col, Col::Evaluated) {
+            return Err(super::aggregated_measure(&format!(
+                "`{}.{}`",
+                self.alias, c.name.name
+            )));
+        }
+        Ok(match col {
             Col::Inner(x) => Agg::Keep(x.clone()),
             Col::Deferred(x) => Agg::Expand(Expression::Paren(Box::new(
                 polyglot_sql::expressions::Paren {
@@ -275,8 +288,8 @@ impl Compiler<'_> {
                 "Layer 2 AGG() over derived table `{alias}` (relational_semantics §7.7) folds a plain filter + projection of model datasets; the derived table has {what}. Join the derived table to a dataset (FROM <dataset> JOIN (...) {alias} ON ...) instead"
             ))
         };
-        if inner.distinct || inner.having.is_some() || inner.qualify.is_some() {
-            return Err(why("DISTINCT / HAVING / QUALIFY"));
+        if inner.distinct || inner.qualify.is_some() {
+            return Err(why("DISTINCT / QUALIFY"));
         }
         if inner.order_by.is_some() || inner.limit.is_some() || inner.offset.is_some() {
             return Err(why("ORDER BY / LIMIT / OFFSET"));
@@ -330,7 +343,11 @@ impl Compiler<'_> {
             }
             cols.push((name, col));
         }
-        let map = FoldMap { alias, cols };
+        let map = FoldMap {
+            alias,
+            cols,
+            aggregated: super::is_aggregated(inner),
+        };
 
         // Inner GROUP BY is dropped (grain is re-evaluated), but grouping by a
         // measure must still be refused.

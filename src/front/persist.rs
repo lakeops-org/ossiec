@@ -132,8 +132,6 @@ fn refuse_narrowed_rows(view: &str, sel: &Select) -> Result<()> {
         .any(|k| *k != JoinKind::Left);
     let clause = if sel.where_clause.is_some() {
         "a WHERE filter"
-    } else if sel.having.is_some() {
-        "a HAVING filter"
     } else if sel.limit.is_some() || sel.offset.is_some() {
         "LIMIT / OFFSET"
     } else if non_left_join {

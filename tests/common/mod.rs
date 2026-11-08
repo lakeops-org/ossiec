@@ -702,7 +702,7 @@ pub const S77_FOLD_WHERE_SHOP_REF: &str = "SELECT status, COUNT(*) AS n FROM ord
 /// the derived table only restricts (customers who ordered); the outer stage evaluates.
 pub const A2_UNEVALUATED_SHOP: &str = "SELECT o.status, AGG(t.order_count) \
     FROM orders o \
-    JOIN (SELECT customer_id, order_count FROM orders GROUP BY customer_id) t \
+    JOIN (SELECT customer_id, order_count FROM orders) t \
       ON o.customer_id = t.customer_id \
     GROUP BY o.status";
 
@@ -712,7 +712,7 @@ pub const A2_UNEVALUATED_SHOP_REF: &str =
 /// Base `COUNT(*) TO MEASURE` folded through a sole derived `FROM` (shop).
 pub const BASE_TO_MEASURE_SHOP: &str = "SELECT status, AGG(n) AS n \
     FROM (SELECT status, COUNT(*) TO MEASURE AS n FROM orders \
-          WHERE customer_id IS NOT NULL GROUP BY status) t \
+          WHERE customer_id IS NOT NULL) t \
     WHERE status = 'completed' \
     GROUP BY status";
 
@@ -765,7 +765,7 @@ pub const UNMATCHED_DERIVED_SHOP_REF: &str =
 /// A.7 session view with a base `TO MEASURE`, then an outer `AGG`.
 pub const A7_BASE_TO_MEASURE_SCRIPT: &str = "CREATE VIEW completed_counts AS \
     SELECT status, COUNT(*) TO MEASURE AS n FROM orders \
-    WHERE customer_id IS NOT NULL GROUP BY status; \
+    WHERE customer_id IS NOT NULL; \
     SELECT status, AGG(n) AS n FROM completed_counts \
     WHERE status = 'completed' GROUP BY status";
 
