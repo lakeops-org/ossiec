@@ -30,9 +30,10 @@ use polyglot_sql::{generate, DialectType, Expression, ExpressionWalk};
 
 use super::catalog::{self, Layer2Catalog};
 use super::{
-    apply_consumer_joins, apply_select_formulas, parse_stage_from, parse_stage_prep,
-    parse_top_select, planned_alias_on_leg, pragma_include_unmatched, protect_inflating_joins,
-    rename_consumer_outputs, stage_aliases, unsupported, L2Formula, StageCfg,
+    apply_consumer_joins, apply_select_formulas, mark_narrowing_legs, parse_stage_from,
+    parse_stage_prep, parse_top_select, planned_alias_on_leg, pragma_include_unmatched,
+    protect_inflating_joins, rename_consumer_outputs, stage_aliases, unsupported, L2Formula,
+    StageCfg,
 };
 use crate::graph::{Ctx, SemanticGraph};
 use crate::plan::{self, DerivedJoin, Request};
@@ -504,6 +505,12 @@ impl Compiler<'_> {
                 }
             }
         }
+        mark_narrowing_legs(
+            graph,
+            &mut logical,
+            &parsed.consumer_joins,
+            self.include_unmatched,
+        )?;
         protect_inflating_joins(graph, &mut logical, &mut self.ctx)?;
         super::apply_group_exprs(&mut logical, parsed.having.as_ref(), &parsed.order_exprs)?;
         apply_select_formulas(

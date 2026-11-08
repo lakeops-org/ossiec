@@ -13,7 +13,8 @@ mod common;
 use std::sync::Mutex;
 
 use common::{
-    comparable, compile, duckdb, duckdb_rows, run, seed_sql, Engine, CASES, LAYER2_NESTED_CASES,
+    comparable, compile, duckdb, duckdb_rows, run, seed_sql, Engine, Layer2NestedCase, CASES,
+    LAYER2_NESTED_CASES, LAYER2_TWO_FACT_CASES, TWO_FACT_SHOP,
 };
 
 static SEEDED: Mutex<Vec<Engine>> = Mutex::new(Vec::new());
@@ -69,14 +70,33 @@ fn sweep(engine: Engine) {
 /// `TO MEASURE` / `includeUnmatched`+derived / A.7 script).
 fn sweep_layer2_nested(engine: Engine) {
     seed(engine);
+    let mut failures = vec![];
+    for (model, cases) in [
+        (common::MODEL, LAYER2_NESTED_CASES),
+        (TWO_FACT_SHOP, LAYER2_TWO_FACT_CASES),
+    ] {
+        sweep_cases(engine, model, cases, &mut failures);
+    }
+    assert!(
+        failures.is_empty(),
+        "{engine:?}:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+fn sweep_cases(
+    engine: Engine,
+    model: &str,
+    cases: &[Layer2NestedCase],
+    failures: &mut Vec<String>,
+) {
     let db = duckdb();
-    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let g = ossiec::from_yaml(model).unwrap();
     let opts = ossiec::Options {
         target: Some(engine.dialect()),
         ..Default::default()
     };
-    let mut failures = vec![];
-    for case in LAYER2_NESTED_CASES {
+    for case in cases {
         let compiled = if case.script {
             ossiec::compile_sql_script(&g, case.sql, &opts)
         } else {
@@ -98,11 +118,6 @@ fn sweep_layer2_nested(engine: Engine) {
             Err(e) => failures.push(format!("{}: {e}\n{}", case.name, compiled.sql)),
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{engine:?}:\n\n{}",
-        failures.join("\n\n")
-    );
 }
 
 #[test]

@@ -245,7 +245,7 @@ JOIN (SELECT customer_id, AGG(order_count) AS n FROM orders GROUP BY customer_id
 GROUP BY d.status;
 ```
 
-A derived table joined into an `AGG` stage must be unique on its join columns (G2), is read only in `ON`, and needs an alias on every `AGG(...)`. It attaches only to legs that host its dataset: when independent facts are measured together, a join on one fact restricts that fact and leaves the others unrestricted. Nesting is limited to 4 levels and 8 derived tables per query. `includeUnmatched` cannot be combined with a derived join.
+A derived table joined into an `AGG` stage must be unique on its join columns (G2), is read only in `ON`, and needs an alias on every `AGG(...)`. When independent facts are measured together the query is still one relation (§7.6, §10.2): a derived join, an `INNER` join or a `LEFT` join from one fact also narrows the others to the shared rows that survive it. Nesting is limited to 4 levels and 8 derived tables per query. `includeUnmatched` cannot be combined with a derived join.
 
 ```bash
 echo "SELECT status, AGG(order_count) FROM orders GROUP BY status" \
@@ -399,7 +399,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`wide_table`](tests/wide_table.rs) | **Layer 3's own examples and rejections.** The data and results from `wide_table_semantics.md` (§1.3, §3.4, §5.2, §6.1, Appendix B), every row of §8 and the order between them. |
 | [`query_compliance`](tests/query_compliance.rs) | **Ossie's own query suite.** Every vendored `compliance/query` case returns its expected result on DuckDB, compared by the suite's rules. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including a ratio with a partial-fact derived join), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM\|COUNT\|AVG\|MIN\|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
+| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a derived join on one of several independent facts, which narrows them all; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including joins on one fact narrowing the others), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM\|COUNT\|AVG\|MIN\|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
 
 ## Known issues
 
@@ -463,6 +463,9 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [ ] Exact percentiles on MySQL and Trino, which have no such function
 - [x] Layer 2 `GROUP BY ALL` and `DISTINCT`
 - [x] Fix: a LEFT JOIN written from the one side (`customers LEFT JOIN orders`) counted fact rows that match nothing
+- [x] Fix: a join on one of several independent facts left the others unrestricted, and two `COUNT(*)` metrics on different facts shared one answer
+- [ ] Layer 2 comma `FROM` (`FROM customers c, orders o, tickets t`) is a cross join in SQL; ossiec reads it as independent facts sharing `customers`
+- [ ] Layer 2 `WHERE` on one of several independent facts' columns: refused today
 - [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
