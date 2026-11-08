@@ -95,7 +95,7 @@ pub(crate) struct Term {
     /// The result's type family (`NUMERIC`, `TEXT`, `DATE`, ...), when known.
     /// Engines that can't type a bare NULL in a UNION need it.
     pub null_type: Option<&'static str>,
-    /// Generated SQL of `ast`; identical aggregates across metrics share one term.
+    /// Generated SQL of `ast`; identical aggregates over the same datasets share one term.
     pub key: String,
 }
 

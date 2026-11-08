@@ -407,6 +407,13 @@ pub(crate) struct Leg {
     pub joins: Vec<JoinStep>,
     /// Derived tables the consumer joined in (Layer 2 A.2), after `joins`.
     pub derived: Vec<DerivedJoin>,
+    /// Layer 2: the consumer's joins on this leg, and on no other, can drop rows
+    /// of the datasets it shares with the other legs (an `INNER` join, a `LEFT`
+    /// join from the fact, a narrowing derived table). The query is one relation
+    /// (§7.6, §10.2), so every other leg keeps only the shared rows this leg's
+    /// tree still has, matched on these aliases: the datasets the consumer bound,
+    /// as this leg names them. `None` when the leg narrows nothing.
+    pub narrows_on: Option<Vec<String>>,
 }
 
 /// A derived table (an already-compiled inner query) joined onto a leg:
@@ -624,11 +631,18 @@ pub(crate) fn plan(
         let global: Vec<usize> = rm
             .terms
             .into_iter()
-            .map(|t| match terms.iter().position(|x| x.key == t.key) {
-                Some(i) => i,
-                None => {
-                    terms.push(t);
-                    terms.len() - 1
+            // The same SQL over other rows is another term: `COUNT(*)` names no
+            // column, so only its datasets tell `orders` from `tickets`.
+            .map(|t| {
+                match terms
+                    .iter()
+                    .position(|x| x.key == t.key && x.datasets == t.datasets)
+                {
+                    Some(i) => i,
+                    None => {
+                        terms.push(t);
+                        terms.len() - 1
+                    }
                 }
             })
             .collect();
@@ -1149,6 +1163,7 @@ fn tree_from(g: &SemanticGraph, root: usize, required: &BTreeSet<Node>) -> Resul
         root,
         joins: steps.into_iter().map(|(_, s)| s).collect(),
         derived: vec![],
+        narrows_on: None,
     })
 }
 
