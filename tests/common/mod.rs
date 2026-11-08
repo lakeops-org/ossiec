@@ -8,6 +8,7 @@ mod duck;
 mod engines;
 mod layer2_cases;
 mod shop;
+mod site;
 
 // Each test crate uses part of this module, so a re-export can go unused in it.
 #[allow(unused_imports)]
@@ -20,3 +21,5 @@ pub use engines::*;
 pub use layer2_cases::*;
 #[allow(unused_imports)]
 pub use shop::*;
+#[allow(unused_imports)]
+pub use site::*;

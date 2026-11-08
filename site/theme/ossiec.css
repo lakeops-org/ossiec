@@ -1,0 +1,7 @@
+/* Status marks in coverage tables, and wide tables that scroll. */
+.content table { display: block; overflow-x: auto; }
+.content td:has(> strong:only-child) { white-space: nowrap; }
+.status-yes { color: #1a7f37; font-weight: 600; }
+.status-part { color: #9a6700; font-weight: 600; }
+.status-no { color: #cf222e; font-weight: 600; }
+.hero { font-size: 1.15em; }

@@ -1,4 +1,4 @@
-//! A.7 views persisted into the model as metrics.
+//! Persisting A.7 views: `TO MEASURE` items written into the model as metrics.
 
 use super::*;
 

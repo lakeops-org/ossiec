@@ -1,0 +1,18 @@
+[book]
+title = "ossiec — the Apache Ossie compiler"
+description = "What ossiec supports of the Apache Ossie spec, engine by engine, and how to use it."
+authors = ["LakeOps"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/lakeops-org/ossiec"
+edit-url-template = "https://github.com/lakeops-org/ossiec/edit/main/site/{path}"
+site-url = "/ossiec/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/ossiec.css"]
+
+[output.html.fold]
+enable = true
+level = 1

@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{duckdb_rows, norm_text, run, Engine};
+use common::{duckdb_rows, norm_text, run, site_page, Engine};
 use ossiec::{Options, Request};
 
 /// What each engine can't do. Each is a clear refusal or an engine's error, apart from
@@ -520,40 +520,46 @@ fn exec(e: Engine, db: &duckdb::Connection, sql: &str) -> Result<Vec<Vec<String>
     run(e, sql)
 }
 
-/// One failure per construct: its text, then what happened.
-fn probe_engine(e: Engine, db: &duckdb::Connection) -> (usize, Vec<String>) {
+/// A construct compiled for `e`: its text, and the SQL or why it was refused.
+fn compile_probe(e: Engine, p: &P) -> (&'static str, ossiec::Result<ossiec::Compiled>) {
     let opts = Options {
         target: Some(e.dialect()),
         pretty: false,
         ..Default::default()
     };
+    let (label, yaml, req): (&'static str, String, &str) = match *p {
+        P::Row(x, _) => (x, model(Some(x), None), r#"{"dimensions":["one.val"]}"#),
+        P::Agg(x, _) => (x, model(None, Some(x)), r#"{"metrics":["many.m"]}"#),
+        P::Win(x, _) => (
+            x,
+            model(None, Some(x)),
+            r#"{"metrics":["many.m"],"dimensions":["many.k"]}"#,
+        ),
+        P::WinV(x, _) if x.contains("PARTITION") => (
+            x,
+            model(None, Some(x)),
+            r#"{"metrics":["many.m"],"dimensions":["many.k","many.v","many.g"]}"#,
+        ),
+        P::WinV(x, _) => (
+            x,
+            model(None, Some(x)),
+            r#"{"metrics":["many.m"],"dimensions":["many.k","many.v"]}"#,
+        ),
+    };
+    let compiled = (|| {
+        let g = ossiec::from_yaml(&yaml)?;
+        let r: Request = Request::from_json(req)?;
+        ossiec::compile(&g, &r, &opts)
+    })();
+    (label, compiled)
+}
+
+/// One failure per construct: its text, then what happened.
+fn probe_engine(e: Engine, db: &duckdb::Connection) -> (usize, Vec<String>) {
     let mut fails = vec![];
     let ps = probes();
     for p in &ps {
-        let (label, yaml, req): (&str, String, &str) = match *p {
-            P::Row(x, _) => (x, model(Some(x), None), r#"{"dimensions":["one.val"]}"#),
-            P::Agg(x, _) => (x, model(None, Some(x)), r#"{"metrics":["many.m"]}"#),
-            P::Win(x, _) => (
-                x,
-                model(None, Some(x)),
-                r#"{"metrics":["many.m"],"dimensions":["many.k"]}"#,
-            ),
-            P::WinV(x, _) if x.contains("PARTITION") => (
-                x,
-                model(None, Some(x)),
-                r#"{"metrics":["many.m"],"dimensions":["many.k","many.v","many.g"]}"#,
-            ),
-            P::WinV(x, _) => (
-                x,
-                model(None, Some(x)),
-                r#"{"metrics":["many.m"],"dimensions":["many.k","many.v"]}"#,
-            ),
-        };
-        let compiled = (|| {
-            let g = ossiec::from_yaml(&yaml)?;
-            let r: Request = Request::from_json(req)?;
-            ossiec::compile(&g, &r, &opts)
-        })();
+        let (label, compiled) = compile_probe(e, p);
         let c = match compiled {
             Ok(c) => c,
             Err(err) => {
@@ -1571,4 +1577,151 @@ fn other_argument_counts_pass_through() {
             "{d:?}"
         );
     }
+}
+
+/// The engines the expression language is run on, in the site's column order.
+const SITE_ENGINES: &[(Engine, &str)] = &[
+    (Engine::DuckDb, "DuckDB"),
+    (Engine::Postgres, "Postgres"),
+    (Engine::MySql, "MySQL"),
+    (Engine::ClickHouse, "ClickHouse"),
+    (Engine::Trino, "Trino"),
+    (Engine::StarRocks, "StarRocks"),
+];
+
+/// How a construct fares on an engine, from [`gaps`] (which the engine tier holds
+/// to what really happens) and from compiling it here.
+fn site_status(e: Engine, p: &P) -> (&'static str, Option<String>) {
+    let (label, compiled) = compile_probe(e, p);
+    if !gaps(e).contains(&label) {
+        return ("verified", None);
+    }
+    match compiled {
+        Err(err) => {
+            let why = err.to_string();
+            let why = why.split(": ").last().unwrap_or(&why).trim().to_string();
+            ("refused", Some(why))
+        }
+        Ok(_) if KNOWN_WRONG == (e, label) => ("wrong", None),
+        Ok(_) => ("engine error", None),
+    }
+}
+
+/// The section heading each construct sits under in [`probes`], read from this file.
+fn probe_sections() -> Vec<(String, Vec<&'static str>)> {
+    let src = include_str!("expression_language.rs");
+    let body = &src[src.find("fn probes() -> Vec<P> {").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let labels: Vec<&'static str> = probes()
+        .iter()
+        .map(|p| match *p {
+            P::Row(x, _) | P::Agg(x, _) | P::Win(x, _) | P::WinV(x, _) => x,
+        })
+        .collect();
+    let mut sections: Vec<(String, Vec<&'static str>)> = vec![];
+    let mut placed = std::collections::HashSet::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(h) = t.strip_prefix("// ") {
+            if !h.is_empty() && h.chars().next().unwrap().is_uppercase() {
+                sections.push((h.trim_end_matches('.').to_string(), vec![]));
+            }
+            continue;
+        }
+        for &l in &labels {
+            let quoted = format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\""));
+            if t.contains(&quoted) && placed.insert(l) {
+                if sections.is_empty() {
+                    sections.push(("Other".into(), vec![]));
+                }
+                sections.last_mut().unwrap().1.push(l);
+            }
+        }
+    }
+    let rest: Vec<&'static str> = labels.into_iter().filter(|l| !placed.contains(l)).collect();
+    if !rest.is_empty() {
+        sections.push(("Other".into(), rest));
+    }
+    sections.retain(|(_, ls)| !ls.is_empty());
+    sections
+}
+
+/// `site/src/generated/functions.md`: every construct of `expression_language.md`
+/// on every engine, as the tests establish it.
+#[test]
+fn site_function_matrix_is_current() {
+    let probes = probes();
+    let by_label: std::collections::HashMap<&str, &P> = probes
+        .iter()
+        .map(|p| match *p {
+            P::Row(x, _) | P::Agg(x, _) | P::Win(x, _) | P::WinV(x, _) => (x, p),
+        })
+        .collect();
+    let cell = |s: &str| s.replace('|', "\\|");
+    let mut out = String::new();
+    out.push_str("<!-- Generated by `site_function_matrix_is_current` in tests/expression_language.rs. Do not edit: run `OSSIEC_UPDATE_SITE=1 cargo test --test expression_language`. -->\n\n");
+    out.push_str("# Functions by engine\n\n");
+    out.push_str(&format!(
+        "Every construct of `expression_language.md` that ossiec tests: {} in all. Each is compiled for each engine and run on fixed data, against a value worked out by hand. **Verified** means it returned that value. Anything else is listed under [Gaps](#gaps): a refusal (ossiec won't compile what the engine can't express faithfully), an engine error, or the one known wrong answer.\n\n",
+        probes.len()
+    ));
+    out.push_str("## Summary\n\n| Section |");
+    for (_, n) in SITE_ENGINES {
+        out.push_str(&format!(" {n} |"));
+    }
+    out.push_str("\n|---|");
+    for _ in SITE_ENGINES {
+        out.push_str("---|");
+    }
+    out.push('\n');
+    let sections = probe_sections();
+    let mut gaps_rows = vec![];
+    for (name, labels) in &sections {
+        out.push_str(&format!("| {name} |"));
+        for &(e, en) in SITE_ENGINES {
+            let mut ok = 0;
+            for l in labels {
+                let (st, why) = site_status(e, by_label[l]);
+                if st == "verified" {
+                    ok += 1;
+                } else {
+                    gaps_rows.push((en, *l, st, why));
+                }
+            }
+            let mark = if ok == labels.len() { "✅" } else { "⚠️" };
+            out.push_str(&format!(" {mark} {ok}/{} |", labels.len()));
+        }
+        out.push('\n');
+    }
+    let engine_order = |en: &str| SITE_ENGINES.iter().position(|(_, n)| *n == en);
+    gaps_rows.sort_by_key(|(en, ..)| engine_order(en));
+    out.push_str("\n## Gaps\n\n");
+    if gaps_rows.is_empty() {
+        out.push_str("None.\n");
+    } else {
+        out.push_str("| Engine | Construct | What happens |\n|---|---|---|\n");
+        for (en, l, st, why) in &gaps_rows {
+            let what = match (*st, why) {
+                ("refused", Some(w)) => format!("Refused: {}", cell(w)),
+                ("refused", None) => "Refused".to_string(),
+                ("wrong", _) => {
+                    "**Wrong answer** (known: the engine has no Unicode form)".to_string()
+                }
+                _ => "Engine error".to_string(),
+            };
+            out.push_str(&format!("| {en} | `{}` | {what} |\n", cell(l)));
+        }
+    }
+    out.push_str("\n## Every construct\n\n");
+    for (name, labels) in &sections {
+        out.push_str(&format!(
+            "<details><summary>{name} ({})</summary>\n\n",
+            labels.len()
+        ));
+        for l in labels {
+            out.push_str(&format!("- `{}`\n", l.replace('`', "'")));
+        }
+        out.push_str("\n</details>\n\n");
+    }
+    site_page("functions.md", out.trim_end());
 }

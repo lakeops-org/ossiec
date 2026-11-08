@@ -1,3 +1,6 @@
 /target
 *.duckdb
 .DS_Store
+
+# mdBook output
+site/book/
