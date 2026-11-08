@@ -77,7 +77,7 @@ LEFT JOIN tickets t ON t.customer_id = c.id;
 SELECT region, AGG(sales_per_ticket) FROM region_metrics GROUP BY region;
 ```
 
-Every region appears, including one whose customers bought nothing. `ossiec persist-view` (or `persist_layer2_view`) can write `sales_per_ticket` into the model as a metric. The persisted metric is then queried over the model's own paths from each fact to `customers`, not over the view's joins, so its groups can differ: a region with no facts can drop out, and facts with no customer can appear under a NULL region. The groups both return agree.
+Every region appears, including one whose customers bought nothing. `ossiec persist-view` (or `persist_layer2_view`) can write `sales_per_ticket` into the model as a metric. The persisted metric is then queried over the model's own paths from each fact to `customers`, not over the view's joins, so its groups can differ: a region with no facts can drop out, and facts with no customer can appear under a NULL region. The other groups both return agree; a NULL region both return can still differ, because only the persisted metric adds those facts to it.
 
 **One relation across facts.** An inner join on one fact narrows the other too, as in plain SQL:
 
