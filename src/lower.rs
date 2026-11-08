@@ -268,6 +268,7 @@ fn shared_rows_survive(
     leg: &Leg,
     other: &Leg,
     on: &[String],
+    other_filters: &[&Expression],
     t: &mut Tpl,
     ctx: &mut Ctx,
 ) -> String {
@@ -304,6 +305,28 @@ fn shared_rows_survive(
             conds.push(format!("{inner} = {outer}"));
         }
     }
+    // The other leg's own filters (a `WHERE` on its fact), on its renamed tree.
+    let aliases: BTreeSet<String> = std::iter::once(&g.datasets[other.root].name)
+        .chain(other.joins.iter().map(|s| &s.to_alias))
+        .map(|a| crate::plan::unquoted(a).to_string())
+        .collect();
+    for f in other_filters {
+        let renamed = transform((*f).clone(), &|e| {
+            Ok(Some(match e {
+                Expression::Column(mut c) => {
+                    if let Some(tb) = c.table.as_ref().map(|x| x.name.clone()) {
+                        if aliases.contains(crate::plan::unquoted(&tb)) {
+                            c.table = Some(crate::sql::quoted(&semi(&tb)));
+                        }
+                    }
+                    Expression::Column(c)
+                }
+                other => other,
+            }))
+        })
+        .expect("renaming cannot fail");
+        conds.push(t.e(renamed));
+    }
     let filter = if conds.is_empty() {
         String::new()
     } else {
@@ -337,16 +360,32 @@ fn from_where(
 ) {
     let from = leg_sql(g, leg, t, ctx);
     t.push(&from);
+    let here = p.legs.iter().position(|o| std::ptr::eq(o, leg));
     let mut preds: Vec<String> = p
         .filters
         .iter()
-        .cloned()
+        .enumerate()
+        .filter(|(i, _)| {
+            let on = p.filter_legs.get(*i).copied().flatten();
+            on.is_none() || on == here
+        })
+        .map(|(_, f)| f.clone())
         .chain(extra)
         .map(|f| t.e(f))
         .collect();
-    for other in p.legs.iter().filter(|o| !std::ptr::eq(*o, leg)) {
+    for (o, other) in p.legs.iter().enumerate() {
+        if std::ptr::eq(other, leg) {
+            continue;
+        }
         if let Some(on) = &other.narrows_on {
-            preds.push(shared_rows_survive(g, leg, other, on, t, ctx));
+            let scoped: Vec<&Expression> = p
+                .filters
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| p.filter_legs.get(*i).copied().flatten() == Some(o))
+                .map(|(_, f)| f)
+                .collect();
+            preds.push(shared_rows_survive(g, leg, other, on, &scoped, t, ctx));
         }
     }
     if !preds.is_empty() {

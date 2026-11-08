@@ -82,6 +82,83 @@ pub(super) fn plan_legs(
     Ok((legs, term_legs))
 }
 
+/// Layer 2, when no leg plan reads every filter: independent facts, and a
+/// `WHERE` on a dataset only one of them reaches (`o.amount > 10` beside
+/// `tickets`). The query is one relation (§7.3, §10.2), so the filter drops the
+/// joined rows it fails; on a fact's columns that keeps the fact rows that pass,
+/// and the shared rows that still have one. So the filter goes on that fact's
+/// leg only, and that leg narrows the others (`lower`, `EXISTS`). This holds
+/// only for a filter that rejects NULLs: `o.amount IS NULL` would also keep the
+/// rows a join pads with NULLs, which no leg has, so that is refused.
+///
+/// `Ok(None)`: not this case (a filter spans facts), so the caller keeps its
+/// own error. Returns the legs, each term's leg and each filter's leg.
+#[allow(clippy::type_complexity)]
+pub(super) fn scope_filters(
+    g: &SemanticGraph,
+    base: &BTreeSet<Node>,
+    terms: &[Term],
+    filter_nodes: &[BTreeSet<Node>],
+    strict: &[bool],
+) -> Result<Option<(Vec<Leg>, Vec<usize>, Vec<Option<usize>>)>> {
+    let Ok((legs, term_legs)) = plan_legs(g, base, terms) else {
+        return Ok(None);
+    };
+    if legs.len() < 2 {
+        return Ok(None);
+    }
+    let paths: Vec<_> = legs.iter().map(|l| g.paths_from(l.root)).collect();
+    let reaches = |leg: usize, nodes: &BTreeSet<Node>| {
+        nodes.iter().all(|&(ds, role)| {
+            let d = role.map_or(ds, |r| g.rels[r].from);
+            d == legs[leg].root || paths[leg].contains_key(&d)
+        })
+    };
+    let mut extra: Vec<BTreeSet<Node>> = vec![BTreeSet::new(); legs.len()];
+    let mut scope = vec![];
+    for (nodes, &rejects_nulls) in filter_nodes.iter().zip(strict) {
+        let hosts: Vec<usize> = (0..legs.len()).filter(|&l| reaches(l, nodes)).collect();
+        if hosts.len() == legs.len() {
+            for l in hosts {
+                extra[l].extend(nodes.iter().copied());
+            }
+            scope.push(None);
+            continue;
+        }
+        match hosts.as_slice() {
+            [one] if rejects_nulls => {
+                extra[*one].extend(nodes.iter().copied());
+                scope.push(Some(*one));
+            }
+            [_] => {
+                return Err(Error::Unsupported(
+                    "Layer 2 WHERE on one of several independent facts is supported for a comparison (=, <>, <, <=, >, >=) on its columns; an IS NULL test or another predicate there would also keep the rows the other facts' joins pad with NULLs, which isn't implemented yet".into(),
+                ))
+            }
+            _ => return Ok(None),
+        }
+    }
+    // Each leg's tree, now reaching the datasets its filters read.
+    let mut planned = vec![];
+    for (l, leg) in legs.into_iter().enumerate() {
+        if extra[l].is_empty() {
+            planned.push(leg);
+            continue;
+        }
+        let mut req = base.clone();
+        req.extend(extra[l].iter().copied());
+        for (term, _) in terms.iter().zip(&term_legs).filter(|(_, &tl)| tl == l) {
+            req.extend(term.datasets.iter().map(|&d| (d, None)));
+        }
+        let tree = join_tree(g, &req)?;
+        if tree.root != leg.root {
+            return Ok(None);
+        }
+        planned.push(tree);
+    }
+    Ok(Some((planned, term_legs, scope)))
+}
+
 /// The dataset every required node hangs off, and the joins to reach them.
 pub(super) fn join_tree(g: &SemanticGraph, required: &BTreeSet<Node>) -> Result<Leg> {
     let plain: BTreeSet<usize> = required

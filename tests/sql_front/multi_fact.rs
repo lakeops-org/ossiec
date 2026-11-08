@@ -284,3 +284,60 @@ fn a4_ratio_with_a_derived_join_on_one_fact() {
     let got = rows_f64(duckdb_rows(&two_facts_db(), &c.sql));
     assert_eq!(got, vec![("EU".to_string(), 20.0)], "{}", c.sql);
 }
+
+/// §7.3, §10.2: a `WHERE` on one fact's columns filters the one relation, so it
+/// keeps that fact's rows that pass and the customers that still have one; the
+/// other fact keeps only those customers' rows. Orders over 10 are customer 1's
+/// 20 and customer 2's 30, both in EU, whose customers have tickets 100–102.
+#[test]
+fn a4_where_on_one_fact_narrows_the_other() {
+    let g = two_facts_graph();
+    let db = two_facts_db();
+    let run = |predicate: &str| {
+        let sql = format!(
+            "SELECT c.region, AGG(o.order_amt) AS amt, AGG(t.ticket_count) AS n FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             LEFT JOIN tickets t ON t.customer_id = c.id \
+             WHERE {predicate} GROUP BY c.region"
+        );
+        let c = ossiec::compile_layer2(&g, &sql, &two_facts_opts())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        (sorted(duckdb_rows(&db, &c.sql)), c.sql)
+    };
+    let (got, sql) = run("o.amount > 10");
+    assert_eq!(got, vec![vec!["EU", "50.000000", "3.000000"]], "{sql}");
+    // On the other fact: tickets from 103 on are customer 3's (US, 5 of orders)
+    // and customer 4's (APAC, no orders: a group with no order rows).
+    let (got, sql) = run("t.id >= 103");
+    assert_eq!(
+        got,
+        vec![
+            vec!["APAC", "NULL", "1.000000"],
+            vec!["US", "5.000000", "3.000000"],
+        ],
+        "{sql}"
+    );
+    // With a filter on the shared dimension too.
+    let (got, sql) = run("c.region = 'EU' AND o.amount > 10");
+    assert_eq!(got, vec![vec!["EU", "50.000000", "3.000000"]], "{sql}");
+}
+
+/// A predicate a padded row can pass, on one fact, keeps rows no leg has; and a
+/// predicate across both facts has no one leg to go on. Both refused, by name.
+#[test]
+fn a4_where_on_one_fact_refusals() {
+    let g = two_facts_graph();
+    let refusal = |predicate: &str| {
+        let sql = format!(
+            "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             LEFT JOIN tickets t ON t.customer_id = c.id \
+             WHERE {predicate} GROUP BY c.region"
+        );
+        unsupported_msg(ossiec::compile_layer2(&g, &sql, &two_facts_opts()).unwrap_err())
+    };
+    let m = refusal("o.amount IS NULL");
+    assert!(m.contains("one of several independent facts"), "{m}");
+    let m = refusal("o.amount > t.id");
+    assert!(m.contains("independent facts"), "{m}");
+}

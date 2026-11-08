@@ -476,7 +476,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Fix: a Layer 2 comma `FROM` (`FROM customers c, orders o, tickets t`) was read as independent facts; it is a `CROSS JOIN`, as in SQL
 - [x] Fix: a quoted Layer 2 measure name (`AGG("m")`) ignored its quotes; it now follows the identifier rules
 - [ ] Layer 2 `CROSS JOIN` (or comma `FROM`) spanning independent facts: refused today
-- [ ] Layer 2 `WHERE` on one of several independent facts' columns: refused today
+- [x] Layer 2 `WHERE` comparison on one of several independent facts' columns, narrowing the others
+- [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison (`IS NULL`, `IN`, `LIKE`, a predicate over two facts): refused today
 - [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`

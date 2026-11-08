@@ -33,7 +33,7 @@ pub use crate::request::{
 
 mod legs;
 pub(crate) use legs::grain_of;
-use legs::{branches, plan_legs};
+use legs::{branches, plan_legs, scope_filters};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Strategy {
@@ -160,6 +160,10 @@ pub(crate) struct LogicalPlan {
     /// (output name, expression with time grain applied).
     pub dims: Vec<(String, Expression)>,
     pub filters: Vec<Expression>,
+    /// Layer 2: the one leg each filter applies on, when it reads a dataset only
+    /// that leg's fact reaches (`None`: every leg). That leg then narrows the
+    /// others to the shared rows that pass it (§7.3, §10.2).
+    pub filter_legs: Vec<Option<usize>>,
     pub terms: Vec<PlannedTerm>,
     /// (output name, expression over `__ossiec_t{term}` placeholders).
     pub outputs: Vec<(String, Expression)>,
@@ -377,9 +381,16 @@ pub(crate) fn plan(
         .filter(|((_, ds, f, _), _)| is_string(*ds, *f))
         .map(|(_, (_, e))| e.clone())
         .collect();
+    // Each filter's datasets, and whether it rejects NULLs: a row a join pads with
+    // NULLs fails it, so it can't keep a row the facts don't share.
+    let base_required = required.clone();
+    let mut filter_nodes: Vec<BTreeSet<Node>> = vec![];
+    let mut filter_strict: Vec<bool> = vec![];
     for f in &req.filters {
         let (ds, fi, role) = g.field_by_name(&f.field)?;
         required.insert((ds, role));
+        filter_nodes.push(BTreeSet::from([(ds, role)]));
+        filter_strict.push(f.op != Op::IsNull);
         let lhs = g.field_sql_as(ds, fi, &alias(g, (ds, role)), ctx);
         if is_string(ds, fi) && !string_exprs.contains(&lhs) {
             string_exprs.push(lhs.clone());
@@ -389,8 +400,10 @@ pub(crate) fn plan(
     }
     if let Some(text) = &req.filter {
         let ast = wide_table::parse_filter(text)?;
+        let mut nodes = BTreeSet::new();
         for (ds, f, node) in wide_table::filter_fields(g, &ast) {
             required.insert(node);
+            nodes.insert(node);
             if is_string(ds, f) {
                 let e = g.field_sql_as(ds, f, &alias(g, node), ctx);
                 if !string_exprs.contains(&e) {
@@ -399,6 +412,8 @@ pub(crate) fn plan(
             }
         }
         filters.push(filter_sql(g, ast, ctx)?);
+        filter_nodes.push(nodes);
+        filter_strict.push(false);
     }
     let mut metric_filters = vec![];
     for mf in &req.metric_filters {
@@ -444,10 +459,17 @@ pub(crate) fn plan(
     }
 
     // Join trees (one per fact) and term strategies.
-    let (legs, term_legs) = if interface == Interface::WideTable && !terms.is_empty() {
-        branches(g, &required, &terms)?
+    let (legs, term_legs, filter_legs) = if interface == Interface::WideTable && !terms.is_empty() {
+        let (l, t) = branches(g, &required, &terms)?;
+        (l, t, vec![None; filters.len()])
     } else {
-        plan_legs(g, &required, &terms)?
+        match plan_legs(g, &required, &terms) {
+            Ok((l, t)) => (l, t, vec![None; filters.len()]),
+            Err(e) if interface == Interface::Relational && !filters.is_empty() => {
+                scope_filters(g, &base_required, &terms, &filter_nodes, &filter_strict)?.ok_or(e)?
+            }
+            Err(e) => return Err(e),
+        }
     };
     let mut planned = vec![];
     for (term, leg) in terms.into_iter().zip(term_legs) {
@@ -484,6 +506,7 @@ pub(crate) fn plan(
         legs,
         dims,
         filters,
+        filter_legs,
         terms: planned,
         outputs,
         metric_filters,
