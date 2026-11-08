@@ -488,12 +488,14 @@ fn engine_name(target: DialectType) -> String {
 /// Give every Ossie function its implementation for `target`.
 pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> {
     use DialectType::{ClickHouse, DuckDB, MySQL, StarRocks, Trino};
+    // Athena takes Trino's forms and refusals; errors still name `target`.
+    let engine = crate::dialect::runs_as(target);
     let failure = RefCell::new(None);
     let out = transform(ast, &|e| {
         let Some(mut c) = ossie_call(&e) else {
             return Ok(Some(e));
         };
-        let rule = on_engine(target, &c.key).or_else(|| standard(&c.key).map(Sql));
+        let rule = on_engine(engine, &c.key).or_else(|| standard(&c.key).map(Sql));
         let sql = match rule {
             Some(Sql(s)) => s,
             Some(Refuse) => {
@@ -509,7 +511,7 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
             None => return Ok(Some(e)),
         };
         // A format string is Ossie's, and only a constant one can be translated.
-        if matches!(target, DuckDB | MySQL | ClickHouse | StarRocks | Trino)
+        if matches!(engine, DuckDB | MySQL | ClickHouse | StarRocks | Trino)
             && matches!(c.key.as_str(), "TO_CHAR:2" | "TO_DATE:2" | "TO_TIMESTAMP:2")
         {
             let Some(format) = text(&c.args[1]).map(str::to_string) else {
@@ -522,8 +524,8 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
                     )));
                 return Ok(Some(e));
             };
-            let format = translate_format(&format, target == DuckDB);
-            let format = if matches!(target, MySQL | StarRocks | Trino) {
+            let format = translate_format(&format, engine == DuckDB);
+            let format = if matches!(engine, MySQL | StarRocks | Trino) {
                 format.replace("%S", "%s")
             } else {
                 format

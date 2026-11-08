@@ -10,30 +10,10 @@
 
 mod common;
 
-use std::sync::Mutex;
-
 use common::{
-    comparable, compile, duckdb, duckdb_rows, run, seed_sql, Engine, Layer2NestedCase, CASES,
-    LAYER2_NESTED_CASES, LAYER2_TWO_FACT_CASES, TWO_FACT_SHOP,
+    comparable, compile, duckdb, duckdb_rows, run, seed_shop as seed, Engine, Layer2NestedCase,
+    CASES, LAYER2_NESTED_CASES, LAYER2_TWO_FACT_CASES, TWO_FACT_SHOP,
 };
-
-static SEEDED: Mutex<Vec<Engine>> = Mutex::new(Vec::new());
-
-fn seed(engine: Engine) {
-    let mut done = SEEDED.lock().unwrap();
-    if !done.contains(&engine) {
-        let sql = seed_sql(engine);
-        let sql = if engine == Engine::Trino {
-            sql.trim_end().trim_end_matches(';').to_string()
-        } else {
-            sql
-        };
-        run(engine, &sql).unwrap_or_else(|e| {
-            panic!("seeding {engine:?} failed (is `scripts/engines.sh up` running?): {e}")
-        });
-        done.push(engine);
-    }
-}
 
 /// Run every case on `engine`; report all mismatches at once.
 fn sweep(engine: Engine) {
@@ -134,6 +114,12 @@ fn layer2_nested_trino() {
 
 #[test]
 #[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_athena() {
+    sweep_layer2_nested(Engine::Athena);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
 fn layer2_nested_starrocks() {
     sweep_layer2_nested(Engine::StarRocks);
 }
@@ -160,6 +146,13 @@ fn postgres() {
 #[ignore = "needs Docker: scripts/engines.sh up"]
 fn trino() {
     sweep(Engine::Trino);
+}
+
+/// Athena's engine (v3) is Trino, so its SQL runs on the Trino container.
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn athena() {
+    sweep(Engine::Athena);
 }
 
 #[test]

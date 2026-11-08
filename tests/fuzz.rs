@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{duckdb, duckdb_rows, rows_close, run, seed_sql, Engine, MODEL};
+use common::{duckdb, duckdb_rows, rows_close, run, seed_shop, Engine, MODEL};
 
 /// Tiny deterministic PRNG (xorshift64*), so failures reproduce from the seed.
 struct Rng(u64);
@@ -341,13 +341,7 @@ fn fuzz(engine: Engine, count: usize) {
     let graph = ossiec::from_yaml(MODEL).unwrap();
     let db = duckdb();
     if engine != Engine::DuckDb {
-        let sql = seed_sql(engine);
-        let sql = if engine == Engine::Trino {
-            sql.trim_end().trim_end_matches(';').to_string()
-        } else {
-            sql
-        };
-        run(engine, &sql).expect("seeding (is `scripts/engines.sh up` running?)");
+        seed_shop(engine);
     }
     let mut rng = Rng(0x0551_EC00_F00D_5EED);
     let mut failures = vec![];
@@ -432,6 +426,12 @@ fn postgres() {
 #[ignore = "needs Docker: scripts/engines.sh up"]
 fn trino() {
     fuzz(Engine::Trino, count(40));
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn athena() {
+    fuzz(Engine::Athena, count(40));
 }
 
 #[test]

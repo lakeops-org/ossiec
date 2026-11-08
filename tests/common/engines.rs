@@ -1,5 +1,6 @@
 //! The Docker engines (Trino, StarRocks, ClickHouse, Postgres, MySQL): which
-//! one, running SQL on it, and comparing its rows.
+//! one, running SQL on it, and comparing its rows. Athena has no container:
+//! its engine (v3) is Trino, so ossiec's Athena SQL runs on the Trino one.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -14,6 +15,8 @@ pub enum Engine {
     StarRocks,
     ClickHouse,
     MySql,
+    /// ossiec's Athena dialect, run on the Trino container.
+    Athena,
 }
 
 impl Engine {
@@ -26,8 +29,41 @@ impl Engine {
             Engine::StarRocks => D::StarRocks,
             Engine::ClickHouse => D::ClickHouse,
             Engine::MySql => D::MySQL,
+            Engine::Athena => D::Athena,
         }
     }
+
+    /// The engine whose container runs this one's SQL: Trino for Athena,
+    /// otherwise itself. Seed data and result parsing follow the host.
+    pub fn host(self) -> Engine {
+        match self {
+            Engine::Athena => Engine::Trino,
+            e => e,
+        }
+    }
+}
+
+/// Seed the shop tables on `engine`'s host once per test binary. Athena and
+/// Trino share a container, so whichever runs first seeds it for both; seeding
+/// again would drop the tables under the other's running queries.
+pub fn seed_shop(engine: Engine) {
+    static SEEDED: std::sync::Mutex<Vec<Engine>> = std::sync::Mutex::new(Vec::new());
+    let host = engine.host();
+    let mut done = SEEDED.lock().unwrap();
+    if done.contains(&host) {
+        return;
+    }
+    let sql = seed_sql(host);
+    // The Trino CLI's --execute takes statements separated by `;`, without a trailing one.
+    let sql = if host == Engine::Trino {
+        sql.trim_end().trim_end_matches(';').to_string()
+    } else {
+        sql
+    };
+    run(host, &sql).unwrap_or_else(|e| {
+        panic!("seeding {host:?} failed (is `scripts/engines.sh up` running?): {e}")
+    });
+    done.push(host);
 }
 
 /// Run SQL through the engine's own CLI inside its container. Every client prints
@@ -40,7 +76,7 @@ pub fn run(engine: Engine, sql: &str) -> Result<Vec<Vec<String>>, String> {
 
 /// [`run`], with Trino's catalog and schema for unqualified names.
 pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<String>>, String> {
-    let (container, args, stdin): (&str, Vec<&str>, Option<String>) = match engine {
+    let (container, args, stdin): (&str, Vec<&str>, Option<String>) = match engine.host() {
         Engine::Postgres => (
             "ossiec-postgres",
             vec![
@@ -105,6 +141,7 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
             Some(sql.to_string()),
         ),
         Engine::DuckDb => unreachable!("DuckDB runs in-process"),
+        Engine::Athena => unreachable!("Athena runs on its host, Trino"),
     };
     let mut cmd = Command::new("docker");
     cmd.arg("exec").arg("-i").arg(container).args(&args);
@@ -124,7 +161,7 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
     }
     let lines = String::from_utf8_lossy(&out.stdout);
     let lines = lines.lines().filter(|l| !l.is_empty());
-    if engine != Engine::Trino {
+    if engine.host() != Engine::Trino {
         return Ok(lines
             .map(|l| l.split('\t').map(norm_text).collect())
             .collect());

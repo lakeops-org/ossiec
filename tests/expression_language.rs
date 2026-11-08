@@ -69,6 +69,8 @@ fn gaps(e: Engine) -> &'static [&'static str] {
             "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')",
             "PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'a')",
         ],
+        // Athena's SQL runs on Trino (see `Engine::host`).
+        Engine::Athena => gaps(Engine::Trino),
         Engine::StarRocks => &[
             // A known limit, and the one wrong answer on this list: `UPPER` on a column
             // only changes ASCII letters on StarRocks, which has no Unicode form.
@@ -90,6 +92,7 @@ const MANY_ROWS: &str =
     "(1,'a',1,'x'),(2,'a',2,'x'),(3,'a',2,'y'),(4,'b',4,'y'),(5,'b',NULL,'z'),(6,'b',10,'z')";
 
 fn seed(e: Engine) -> String {
+    let e = e.host();
     let ty = |c: &str| -> String {
         let mut out = vec![];
         for col in c.split(',') {
@@ -615,13 +618,20 @@ const KNOWN_WRONG: (Engine, &str) = (Engine::StarRocks, "UPPER(uni) = 'HÉLLO'")
 fn check_engine(e: Engine) {
     let db = seeded();
     if e != Engine::DuckDb {
-        let sql = seed(e);
-        let sql = if e == Engine::Trino {
-            sql.trim_end().trim_end_matches(';').to_string()
-        } else {
-            sql
-        };
-        run(e, &sql).expect("seed (is `scripts/engines.sh up` running?)");
+        // Once per host: Athena and Trino share a container, and seeding again would
+        // drop the tables under the other's running probes.
+        static SEEDED: std::sync::Mutex<Vec<Engine>> = std::sync::Mutex::new(Vec::new());
+        let mut done = SEEDED.lock().unwrap();
+        if !done.contains(&e.host()) {
+            let sql = seed(e);
+            let sql = if e.host() == Engine::Trino {
+                sql.trim_end().trim_end_matches(';').to_string()
+            } else {
+                sql
+            };
+            run(e, &sql).expect("seed (is `scripts/engines.sh up` running?)");
+            done.push(e.host());
+        }
     }
     let (_, fails) = probe_engine(e, &db);
     let label = |f: &String| f[8..].lines().next().unwrap().to_string();
@@ -678,6 +688,13 @@ fn every_construct_on_clickhouse() {
 #[ignore]
 fn every_construct_on_trino() {
     check_engine(Engine::Trino);
+}
+
+/// Athena's SQL, run on Trino (Athena's engine v3 is Trino).
+#[test]
+#[ignore]
+fn every_construct_on_athena() {
+    check_engine(Engine::Athena);
 }
 
 #[test]
@@ -1436,6 +1453,28 @@ fn no_target_leaves_ossies_functions_alone() {
     assert!(s.contains("CONTAINS("), "{s}");
 }
 
+/// Athena's engine (v3) is Trino, so every construct compiles for Athena to the
+/// SQL Trino runs, refusals included. The engine tier runs Athena's SQL on Trino;
+/// this holds it to Trino's without Docker.
+#[test]
+fn athena_compiles_every_construct_as_trino_does() {
+    let mut differ = vec![];
+    for p in probes() {
+        let (label, athena) = compile_probe(Engine::Athena, &p);
+        let (_, trino) = compile_probe(Engine::Trino, &p);
+        match (athena, trino) {
+            (Ok(a), Ok(t)) if a.sql == t.sql => {}
+            (Err(a), Err(t)) if a.to_string() == t.to_string().replace("Trino", "Athena") => {}
+            (a, t) => differ.push(format!(
+                "{label}\n  athena: {:?}\n  trino:  {:?}",
+                a.map(|c| c.sql),
+                t.map(|c| c.sql)
+            )),
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+
 /// Where an engine can't give the same answer, the compile says so.
 #[test]
 fn an_engine_without_a_faithful_form_refuses() {
@@ -1587,6 +1626,7 @@ const SITE_ENGINES: &[(Engine, &str)] = &[
     (Engine::MySql, "MySQL"),
     (Engine::ClickHouse, "ClickHouse"),
     (Engine::Trino, "Trino"),
+    (Engine::Athena, "Athena"),
     (Engine::StarRocks, "StarRocks"),
 ];
 
@@ -1670,6 +1710,7 @@ fn site_function_matrix_is_current() {
         "Every construct of `expression_language.md` that ossiec tests: {} in all. Each is compiled for each engine and run on fixed data, against a value worked out by hand. **Verified** means it returned that value. Anything else is listed under [Gaps](#gaps): a refusal (ossiec won't compile what the engine can't express faithfully), an engine error, or the one known wrong answer. The page is written from each engine's list of gaps, and CI holds that list exact: on every commit it runs every construct on every engine, and fails if one off the list doesn't return its value or one on the list does.\n\n",
         probes.len()
     ));
+    out.push_str("Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) is built on, so a function that Trino has and Athena lacks wouldn't show up here.\n\n");
     out.push_str("## Summary\n\n| Section |");
     for (_, n) in SITE_ENGINES {
         out.push_str(&format!(" {n} |"));

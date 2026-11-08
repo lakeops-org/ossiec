@@ -88,6 +88,7 @@ pub(crate) const TABLES: &[Table] = &[
 
 /// DDL and inserts for the seed data, in `engine`'s SQL.
 pub fn seed_sql(engine: Engine) -> String {
+    let engine = engine.host();
     let mut out = String::new();
     for t in TABLES {
         let cols: Vec<String> = t
