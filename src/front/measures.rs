@@ -17,12 +17,17 @@ use super::{
 /// select list. A measure definition's own aggregate doesn't count: it's cut out of
 /// the text as a `TO MEASURE` marker before this runs.
 pub(super) fn is_aggregated(sel: &Select) -> bool {
-    sel.group_by.is_some()
-        || sel.having.is_some()
-        || sel.expressions.iter().any(|e| {
-            let (inner, _) = strip_alias(e);
-            contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
-        })
+    sel.group_by.is_some() || sel.having.is_some() || select_aggregates(sel)
+}
+
+/// The select list holds an aggregate or an `AGG()` read. A `TO MEASURE`
+/// definition is a marker column here, so it doesn't count (§4.2). One rule for
+/// both §7.2's refusal and the `GROUP BY` requirement.
+pub(super) fn select_aggregates(sel: &Select) -> bool {
+    sel.expressions.iter().any(|e| {
+        let (inner, _) = strip_alias(e);
+        contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
+    })
 }
 
 /// §7.2's refusal of an unevaluated measure in an aggregated query.
