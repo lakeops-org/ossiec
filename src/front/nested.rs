@@ -30,9 +30,10 @@ use polyglot_sql::{generate, DialectType, Expression, ExpressionWalk};
 
 use super::catalog::{self, Layer2Catalog};
 use super::{
-    apply_consumer_joins, apply_select_formulas, parse_stage_from, parse_stage_prep,
-    parse_top_select, planned_alias_on_leg, pragma_include_unmatched, protect_inflating_joins,
-    rename_consumer_outputs, stage_aliases, unsupported, L2Formula, StageCfg,
+    apply_consumer_joins, apply_select_formulas, mark_narrowing_legs, parse_stage_from,
+    parse_stage_prep, parse_top_select, planned_alias_on_leg, pragma_include_unmatched,
+    protect_inflating_joins, rename_consumer_outputs, stage_aliases, unsupported, L2Formula,
+    StageCfg,
 };
 use crate::graph::{Ctx, SemanticGraph};
 use crate::plan::{self, DerivedJoin, Request};
@@ -350,7 +351,7 @@ impl Compiler<'_> {
         self.base_seq = base_seq;
         for ep in std::mem::take(&mut parsed.ephemeral) {
             self.graph
-                .install_ephemeral_metric(&ep.name, ep.owner, ep.body)?;
+                .install_ephemeral_metric(&ep.name, ep.owner, ep.body, ep.raw)?;
         }
         if depth == 0 && self.include_unmatched {
             // The outermost AGG stage (a flat query, or the outer stage of a
@@ -502,6 +503,26 @@ impl Compiler<'_> {
                         ))
                     });
                 }
+            }
+        }
+        mark_narrowing_legs(
+            graph,
+            &mut logical,
+            &parsed.consumer_joins,
+            self.include_unmatched,
+        )?;
+        if logical.terms.iter().any(|t| t.term.raw) {
+            // A plain aggregate reads the query's joined rows. Independent facts
+            // are planned as separate trees, none of which is those rows.
+            if logical.legs.len() > 1 {
+                return Err(unsupported(
+                    "Layer 2 plain aggregates (SUM, COUNT, ...) beside measures from independent facts are not implemented yet",
+                ));
+            }
+            if logical.include_unmatched {
+                return Err(unsupported(
+                    "Layer 2 plain aggregates (SUM, COUNT, ...) with includeUnmatched are not implemented yet",
+                ));
             }
         }
         protect_inflating_joins(graph, &mut logical, &mut self.ctx)?;

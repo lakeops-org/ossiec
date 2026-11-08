@@ -34,7 +34,7 @@ LEFT JOIN products  p ON o.product_id  = p.product_id
 GROUP BY c.region
 ```
 
-It runs, it looks right, and it's wrong. Stock lives on `products`, but the join repeats each product once per order. On the [test shop](tests/common/mod.rs):
+It runs, it looks right, and it's wrong. Stock lives on `products`, but the join repeats each product once per order. On the [test shop](tests/common/shop.rs):
 
 | region | naive SQL | ossiec | truth |
 |---|---:|---:|---|
@@ -181,7 +181,11 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **Roles.** Qualify a column with the relationship name, the same form as a Layer 3 dimension: `departs_from.city`. That name may also be the JOIN alias (`JOIN airports AS departs_from`). In Layer 2 a plain `airports.city` takes the unique shortest path and is refused when departure and arrival both tie.
 
-**`HAVING`** (§7.5) takes `AGG()`, expressions over it and selected columns, and the measure needn't be selected. It's computed in its own part like any measure, so a one-side measure is de-duplicated before it's compared. A plain aggregate or a window beside `AGG` is refused.
+**`HAVING`** (§7.5) takes `AGG()`, expressions over it and selected columns, and the measure needn't be selected. It's computed in its own part like any measure, so a one-side measure is de-duplicated before it's compared. A plain aggregate or a window in `HAVING` is refused.
+
+**Plain aggregates** (§7.2) sit beside `AGG()` in the select list: `SELECT region, MAX(order_date), AGG(total_revenue) … GROUP BY region`. Each is ordinary SQL over the query's joined rows, so repeats and NULL-extended rows count (`COUNT(*)` over `customers LEFT JOIN orders` counts a customer without orders once), while each measure still counts its own source rows once. Today an item is one `SUM|COUNT|AVG|MIN|MAX(...)` over one dataset's fields; arithmetic on it, plain aggregates beside measures from independent facts, and `includeUnmatched` are refused.
+
+**Nested pass-through** (§7.7): a measure passes through any number of plain projections and filters (`FROM (SELECT … FROM (SELECT … FROM orders WHERE …) a WHERE …) b`, or `WITH` levels reading each other) and is evaluated by the outer `AGG()`.
 
 **`ORDER BY`** (§7.5) takes a selected column or measure by name, or `AGG()` and expressions over it, selected or not, so a Top-N can select only its join column. `ORDER BY 1` is refused, since it means a position in SQL.
 
@@ -245,7 +249,7 @@ JOIN (SELECT customer_id, AGG(order_count) AS n FROM orders GROUP BY customer_id
 GROUP BY d.status;
 ```
 
-A derived table joined into an `AGG` stage must be unique on its join columns (G2), is read only in `ON`, and needs an alias on every `AGG(...)`. It attaches only to legs that host its dataset: when independent facts are measured together, a join on one fact restricts that fact and leaves the others unrestricted. Nesting is limited to 4 levels and 8 derived tables per query. `includeUnmatched` cannot be combined with a derived join.
+A derived table joined into an `AGG` stage must be unique on its join columns (G2), is read only in `ON`, and needs an alias on every `AGG(...)`. When independent facts are measured together the query is still one relation (§7.6, §10.2): a derived join, an `INNER` join or a `LEFT` join from one fact also narrows the others to the shared rows that survive it. Nesting is limited to 4 levels and 8 derived tables per query. `includeUnmatched` cannot be combined with a derived join.
 
 ```bash
 echo "SELECT status, AGG(order_count) FROM orders GROUP BY status" \
@@ -389,7 +393,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 | Suite | What it proves |
 |---|---|
-| [`correctness`](tests/correctness.rs) | **The numbers are right.** 30 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
+| [`correctness`](tests/correctness.rs) | **The numbers are right.** 30 requests run on DuckDB against [seed data](tests/common/shop.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
 | [`engines`](tests/engines.rs) | **Every engine agrees.** The same 30 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1, ClickHouse 26.8 and MySQL 8.4 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
 | [`tpcds`](tests/tpcds.rs) | **Real data, and the benchmark's own SQL.**<br>• **Apache Ossie's TPC-DS example model, unchanged,** on generated TPC-DS data: all its metric kinds, including the two-branch `store_productivity` and the window metrics.<br>• **Official TPC-DS queries q3, q7, q12, q26, q42, q43, q48, q52, q55, q96 and q98**, expressed as ossiec requests and compared row by row with TPC-DS's own query text.<br>26 cases, including multi-hop joins, composite keys, date roles, store-and-web independent facts and unmatched items, on DuckDB (sf=0.1, 288k `store_sales` rows), Trino (`tpcds.tiny`), Postgres, StarRocks and ClickHouse. Each reference runs on the same engine, so data-generator differences cancel out. |
 | [`fuzz`](tests/fuzz.rs) | **Cases nobody wrote.** Random requests, each decided independently from the model's relationships: refused ones must raise the right code, and answered ones must match a reference generated from the spec's own evaluation strategy, on all six engines. |
@@ -399,7 +403,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`wide_table`](tests/wide_table.rs) | **Layer 3's own examples and rejections.** The data and results from `wide_table_semantics.md` (§1.3, §3.4, §5.2, §6.1, Appendix B), every row of §8 and the order between them. |
 | [`query_compliance`](tests/query_compliance.rs) | **Ossie's own query suite.** Every vendored `compliance/query` case returns its expected result on DuckDB, compared by the suite's rules. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a partial-fact join over independent facts; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including a ratio with a partial-fact derived join), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM\|COUNT\|AVG\|MIN\|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
+| [`sql_front`](tests/sql_front/) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a derived join on one of several independent facts, which narrows them all; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including joins on one fact narrowing the others), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM\|COUNT\|AVG\|MIN\|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
 
 ## Known issues
 
@@ -462,7 +466,12 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 1 functions on six engines, each implemented or refused (`functions.rs`)
 - [ ] Exact percentiles on MySQL and Trino, which have no such function
 - [x] Layer 2 `GROUP BY ALL` and `DISTINCT`
+- [x] Layer 2 plain aggregates beside `AGG()` (§7.2), and a measure passed through nested derived tables (§7.7)
+- [ ] Layer 2 arithmetic on plain aggregates, and plain aggregates in `HAVING`
 - [x] Fix: a LEFT JOIN written from the one side (`customers LEFT JOIN orders`) counted fact rows that match nothing
+- [x] Fix: a join on one of several independent facts left the others unrestricted, and two `COUNT(*)` metrics on different facts shared one answer
+- [ ] Layer 2 comma `FROM` (`FROM customers c, orders o, tickets t`) is a cross join in SQL; ossiec reads it as independent facts sharing `customers`
+- [ ] Layer 2 `WHERE` on one of several independent facts' columns: refused today
 - [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`

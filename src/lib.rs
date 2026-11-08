@@ -35,6 +35,8 @@ mod lower;
 pub mod model;
 mod plan;
 mod portable;
+mod protect;
+mod request;
 mod sql;
 mod wide_table;
 
@@ -230,7 +232,7 @@ pub(crate) fn lower_stage(
     let mut ast = lower::lower(graph, plan, ctx)?;
     // Ossie requires FILTER in expressions; engines MAY rewrite to CASE. Keep
     // native FILTER when the target supports it; otherwise lower for portability.
-    ast = graph::lower_filters(ast, dialect::supports_aggregate_filter(opts.target))?;
+    ast = dialect::lower_filters(ast, dialect::supports_aggregate_filter(opts.target))?;
     let Some(target) = opts.target else {
         return Ok(ast);
     };

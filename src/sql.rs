@@ -221,3 +221,158 @@ pub(crate) fn null_safe_eq(a: Expression, b: Expression, native: bool) -> Result
     });
     t.build()
 }
+
+/// The `FILTER (WHERE …)` predicate on a typed aggregate, if any.
+pub(crate) fn aggregate_filter(e: &Expression) -> Option<&Expression> {
+    match e {
+        Expression::Sum(f)
+        | Expression::Avg(f)
+        | Expression::Min(f)
+        | Expression::Max(f)
+        | Expression::Median(f)
+        | Expression::Stddev(f)
+        | Expression::StddevPop(f)
+        | Expression::StddevSamp(f)
+        | Expression::Variance(f)
+        | Expression::VarPop(f)
+        | Expression::VarSamp(f)
+        | Expression::ApproxDistinct(f)
+        | Expression::ApproxCountDistinct(f)
+        | Expression::AnyValue(f) => f.filter.as_ref(),
+        Expression::Count(c) => c.filter.as_ref(),
+        Expression::AggregateFunction(a) => a.filter.as_ref(),
+        Expression::Filter(f) => Some(&*f.expression),
+        _ => None,
+    }
+}
+
+/// The aggregate with `p` added to its `FILTER (WHERE …)`, ANDed with any it has.
+/// `None` for an aggregate whose filter can't be read back here.
+pub(crate) fn with_aggregate_filter(e: Expression, p: Expression) -> Option<Expression> {
+    let and = |old: Option<Expression>| -> Expression {
+        match old {
+            None => p.clone(),
+            Some(old) => {
+                let mut t = Tpl::new();
+                let (a, b) = (t.e(old), t.e(p.clone()));
+                t.push(&format!("({a}) AND ({b})"));
+                t.build().expect("constant template")
+            }
+        }
+    };
+    macro_rules! add {
+        ($($v:ident),*) => {
+            match e {
+                $(Expression::$v(mut f) => {
+                    f.filter = Some(and(f.filter.take()));
+                    Expression::$v(f)
+                })*
+                Expression::Count(mut c) => {
+                    c.filter = Some(and(c.filter.take()));
+                    Expression::Count(c)
+                }
+                Expression::AggregateFunction(mut a) => {
+                    a.filter = Some(and(a.filter.take()));
+                    Expression::AggregateFunction(a)
+                }
+                Expression::Filter(mut f) => {
+                    f.expression = Box::new(and(Some(*f.expression)));
+                    Expression::Filter(f)
+                }
+                Expression::WithinGroup(w) => Expression::Filter(Box::new(polyglot_sql::expressions::Filter {
+                    this: Box::new(Expression::WithinGroup(w)),
+                    expression: Box::new(and(None)),
+                })),
+                _ => return None,
+            }
+        };
+    }
+    Some(add!(
+        Sum,
+        Avg,
+        Min,
+        Max,
+        Median,
+        Stddev,
+        StddevPop,
+        StddevSamp,
+        Variance,
+        VarPop,
+        VarSamp,
+        ApproxDistinct,
+        ApproxCountDistinct,
+        AnyValue
+    ))
+}
+
+/// Same aggregate with its FILTER clause removed (for dataset checks on the body).
+pub(crate) fn clear_aggregate_filter(e: Expression) -> Expression {
+    match e {
+        Expression::Sum(mut f) => {
+            f.filter = None;
+            Expression::Sum(f)
+        }
+        Expression::Avg(mut f) => {
+            f.filter = None;
+            Expression::Avg(f)
+        }
+        Expression::Min(mut f) => {
+            f.filter = None;
+            Expression::Min(f)
+        }
+        Expression::Max(mut f) => {
+            f.filter = None;
+            Expression::Max(f)
+        }
+        Expression::Median(mut f) => {
+            f.filter = None;
+            Expression::Median(f)
+        }
+        Expression::Stddev(mut f) => {
+            f.filter = None;
+            Expression::Stddev(f)
+        }
+        Expression::StddevPop(mut f) => {
+            f.filter = None;
+            Expression::StddevPop(f)
+        }
+        Expression::StddevSamp(mut f) => {
+            f.filter = None;
+            Expression::StddevSamp(f)
+        }
+        Expression::Variance(mut f) => {
+            f.filter = None;
+            Expression::Variance(f)
+        }
+        Expression::VarPop(mut f) => {
+            f.filter = None;
+            Expression::VarPop(f)
+        }
+        Expression::VarSamp(mut f) => {
+            f.filter = None;
+            Expression::VarSamp(f)
+        }
+        Expression::ApproxDistinct(mut f) => {
+            f.filter = None;
+            Expression::ApproxDistinct(f)
+        }
+        Expression::ApproxCountDistinct(mut f) => {
+            f.filter = None;
+            Expression::ApproxCountDistinct(f)
+        }
+        Expression::AnyValue(mut f) => {
+            f.filter = None;
+            Expression::AnyValue(f)
+        }
+        Expression::Count(mut c) => {
+            c.filter = None;
+            Expression::Count(c)
+        }
+        Expression::AggregateFunction(mut a) => {
+            a.filter = None;
+            Expression::AggregateFunction(a)
+        }
+        Expression::Filter(f) => *f.this,
+        other => other,
+    }
+}
