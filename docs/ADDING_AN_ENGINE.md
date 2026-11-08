@@ -18,9 +18,9 @@ This takes roughly half a day to a day, mostly spent on the test harness.
 
 1. **Start it.** Add the image and a readiness check to [`scripts/engines.sh`](../scripts/engines.sh). Name the container `ossiec-<engine>`.
 2. **Teach the harness the engine.**
-   - In [`tests/common/mod.rs`](../tests/common/mod.rs), add an `Engine` variant mapped to polyglot's `DialectType`.
-   - In `seed_sql`, handle the engine's DDL differences: column types, table engine or properties, and date literal syntax. Keep columns non-nullable where the engine distinguishes them and the data has no NULLs; real tables look like that, and it's how the ClickHouse `lag` bug was found.
-   - In [`tests/engines.rs`](../tests/engines.rs), add a runner that uses the engine's own CLI inside the container. Its output **must print NULL differently from an empty string**. Trino's TSV doesn't, so its runner reads JSON.
+   - In [`tests/common/engines.rs`](../tests/common/engines.rs), add an `Engine` variant mapped to polyglot's `DialectType`.
+   - In `seed_sql` ([`tests/common/shop.rs`](../tests/common/shop.rs)), handle the engine's DDL differences: column types, table engine or properties, and date literal syntax. Keep columns non-nullable where the engine distinguishes them and the data has no NULLs; real tables look like that, and it's how the ClickHouse `lag` bug was found.
+   - In `run_in` ([`tests/common/engines.rs`](../tests/common/engines.rs)), add a runner that uses the engine's own CLI inside the container. Its output **must print NULL differently from an empty string**. Trino's TSV doesn't, so its runner reads JSON.
    - Add a `#[test] #[ignore]` that calls `sweep(Engine::New)`.
 3. **Run it.**
    ```console
