@@ -18,8 +18,24 @@ The planner follows the same guarantee Layer 2 states (spec §8.3, "G2"): **a me
 
 ```
 YAML ──load──► Model ──bind──► SemanticGraph ──plan(Request)──► LogicalPlan ──lower──► AST ──render──► SQL
-       model.rs        graph.rs                 plan.rs                       lower.rs        sql.rs
+       model.rs        graph/                   plan/                         lower.rs        sql.rs
 ```
+
+### Source layout
+
+| Module | Concern |
+|---|---|
+| `model.rs` | The Ossie YAML as serde types |
+| `graph/` | A bound model: `bind.rs` (validation, sources, dialect variants), `metric.rs` (metrics into terms), `describe.rs` (the catalog API), `mod.rs` (types and accessors) |
+| `request.rs` | The semantic request and its JSON (Layer 3's query) |
+| `plan/` | Decisions: `mod.rs` (`plan()`: names, terms, strategies, outputs), `legs.rs` (join roots and trees) |
+| `protect.rs` | Keeping measures duplicate-free over joins that add rows (§7.6, G2) |
+| `wide_table.rs` | Layer 3 rejections (§8) |
+| `lower.rs` | Plan → SQL AST, mechanically |
+| `sql.rs` | AST helpers: templates, quoting, aggregate `FILTER` |
+| `dialect/` | Per-engine adaptation; `filter.rs` rewrites `FILTER` for engines without it |
+| `functions.rs`, `portable.rs` | Layer 1 functions per engine, and the portable expression parser |
+| `front/` | Layer 2 SQL: `mod.rs` (entry points, shared types), `stage.rs` (one `AGG` stage), `from.rs` (`FROM`/`JOIN`, relationship matching), `resolve.rs` (naming), `measures.rs` (what is a measure), `formula.rs` (`AGG` arithmetic), `clauses.rs` (`WHERE`/`HAVING`/`ORDER BY`), `joins.rs` (consumer joins on the plan), `nested.rs` (derived tables), `fold.rs`, `shell.rs`, `cte.rs`, `to_measure.rs`, `catalog.rs` (A.7 views), `persist.rs` |
 
 | Stage | Input → output | Fails with |
 |---|---|---|

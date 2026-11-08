@@ -34,7 +34,7 @@ LEFT JOIN products  p ON o.product_id  = p.product_id
 GROUP BY c.region
 ```
 
-It runs, it looks right, and it's wrong. Stock lives on `products`, but the join repeats each product once per order. On the [test shop](tests/common/mod.rs):
+It runs, it looks right, and it's wrong. Stock lives on `products`, but the join repeats each product once per order. On the [test shop](tests/common/shop.rs):
 
 | region | naive SQL | ossiec | truth |
 |---|---:|---:|---|
@@ -393,7 +393,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 | Suite | What it proves |
 |---|---|
-| [`correctness`](tests/correctness.rs) | **The numbers are right.** 30 requests run on DuckDB against [seed data](tests/common/mod.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
+| [`correctness`](tests/correctness.rs) | **The numbers are right.** 30 requests run on DuckDB against [seed data](tests/common/shop.rs) built to break naive SQL (fan-out, NULL keys, a deleted customer, a guest checkout, a product that never sold), compared with hand-written reference SQL. |
 | [`engines`](tests/engines.rs) | **Every engine agrees.** The same 30 cases compiled for and executed on Postgres 16, Trino 484, StarRocks 4.1, ClickHouse 26.8 and MySQL 8.4 in Docker, compared with the DuckDB reference answer row by row, with no type leniency (a month must come back as a `DATE` everywhere, and NULL must stay distinct from `''`). |
 | [`tpcds`](tests/tpcds.rs) | **Real data, and the benchmark's own SQL.**<br>• **Apache Ossie's TPC-DS example model, unchanged,** on generated TPC-DS data: all its metric kinds, including the two-branch `store_productivity` and the window metrics.<br>• **Official TPC-DS queries q3, q7, q12, q26, q42, q43, q48, q52, q55, q96 and q98**, expressed as ossiec requests and compared row by row with TPC-DS's own query text.<br>26 cases, including multi-hop joins, composite keys, date roles, store-and-web independent facts and unmatched items, on DuckDB (sf=0.1, 288k `store_sales` rows), Trino (`tpcds.tiny`), Postgres, StarRocks and ClickHouse. Each reference runs on the same engine, so data-generator differences cancel out. |
 | [`fuzz`](tests/fuzz.rs) | **Cases nobody wrote.** Random requests, each decided independently from the model's relationships: refused ones must raise the right code, and answered ones must match a reference generated from the spec's own evaluation strategy, on all six engines. |
@@ -403,7 +403,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 | [`wide_table`](tests/wide_table.rs) | **Layer 3's own examples and rejections.** The data and results from `wide_table_semantics.md` (§1.3, §3.4, §5.2, §6.1, Appendix B), every row of §8 and the order between them. |
 | [`query_compliance`](tests/query_compliance.rs) | **Ossie's own query suite.** Every vendored `compliance/query` case returns its expected result on DuckDB, compared by the suite's rules. |
 | [`requests`](tests/requests.rs) | **Good failures.** Error messages, refusals, all 11 engines (including window requests; native `FILTER` only where supported), determinism. |
-| [`sql_front`](tests/sql_front.rs) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a derived join on one of several independent facts, which narrows them all; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including joins on one fact narrowing the others), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM\|COUNT\|AVG\|MIN\|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
+| [`sql_front`](tests/sql_front/) | **Layer 2 AGG.** A.1, A.2/A.3 (derived tables, executed on DuckDB, including a derived join on one of several independent facts, which narrows them all; refusals; 11-engine compile matrix), A.4 (multi-fact + `AGG` arithmetic, including joins on one fact narrowing the others), A.5 (unused joins + fan-out), A.6 (`INNER`/`LEFT`), §7.6 (`RIGHT`/`FULL`/`CROSS`), §7.7 pass-through and query-local `TO MEASURE` (AGG compositions and base `SUM\|COUNT\|AVG\|MIN\|MAX`), role-playing dimensions, `includeUnmatched` (flat, derived onto the unmatched grain, and role-played attach), A.7 `CREATE VIEW` (AGG compositions and base `SUM(...) TO MEASURE`) and `persist_layer2_view` into the model. Spec appendix A.2/A.3/A.7 shapes are pinned. The shop forms (A.2/A.3, §7.7, base `TO MEASURE`, unmatched+derived, A.7 script) also run in the engine tier (`layer2_nested_*`). |
 
 ## Known issues
 
