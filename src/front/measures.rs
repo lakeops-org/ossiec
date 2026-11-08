@@ -38,6 +38,29 @@ pub(super) fn aggregated_measure(what: &str) -> Error {
     ))
 }
 
+/// The next `__l2_bmN` that no measure of dataset `ds` already answers to, by
+/// the identifier rules [`super::resolve::dataset_measure`] resolves with: a
+/// model may declare a metric of that name, and a query-local one must not
+/// shadow it.
+pub(super) fn fresh_measure_name(graph: &SemanticGraph, ds: usize, seq: &mut usize) -> String {
+    loop {
+        let bare = format!("__l2_bm{seq}");
+        *seq += 1;
+        let taken = graph::lookup(
+            graph
+                .metrics
+                .iter()
+                .filter(|m| m.owner == Some(ds))
+                .map(|m| m.name.rsplit('.').next().unwrap_or(&m.name)),
+            &bare,
+            false,
+        );
+        if matches!(taken, Ok(None)) {
+            return bare;
+        }
+    }
+}
+
 /// `Some` when `e` is one base aggregate to install as a dataset metric.
 /// `None` when it is a composition of `AGG(measure)` (the caller parses that).
 pub(super) fn classify_to_measure(
@@ -60,8 +83,7 @@ pub(super) fn classify_to_measure(
             ));
         }
         let (owner, body) = base_measure_body(graph, scope, e)?;
-        let bare = format!("__l2_bm{base_seq}");
-        *base_seq += 1;
+        let bare = fresh_measure_name(graph, owner, base_seq);
         let dataset = graph.datasets[owner].name.clone();
         let name = format!("{dataset}.{bare}");
         return Ok(Some(EphemeralMetric {
@@ -304,8 +326,7 @@ impl RawAggs<'_> {
             Some(b) if get_columns(e).is_empty() => (b.dataset, e.clone()),
             _ => base_measure_body(graph, scope, e)?,
         };
-        let bare = format!("__l2_bm{}", *self.seq);
-        *self.seq += 1;
+        let bare = fresh_measure_name(graph, owner, self.seq);
         let dataset = graph.datasets[owner].name.clone();
         let metric = format!("{dataset}.{bare}");
         self.made.push(EphemeralMetric {
