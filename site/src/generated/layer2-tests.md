@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 142 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 148 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -31,7 +31,7 @@ Model-qualified relations, measure names, aliases and output labels, and what is
 
 Every kind, from either side, fan-out, and G2.
 
-[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 19 tests
+[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 23 tests
 
 | Test | What it shows |
 |---|---|
@@ -41,6 +41,9 @@ Every kind, from either side, fan-out, and G2.
 | `full_join_keeps_both_sides_without_inflating_orders` |  |
 | `cross_join_does_not_multiply_the_measure` |  |
 | `cross_join_grouped_by_the_other_side_counts_each_order_once_per_group` |  |
+| `comma_from_is_a_cross_join` | `FROM orders o, customers c` is `orders o CROSS JOIN customers c` (§7.6): the same SQL, and each order counted once per region. |
+| `comma_from_before_a_left_join_keeps_its_meaning` | A comma binds looser than `JOIN`: `FROM c, o LEFT JOIN p ON …` is `c × (o LEFT JOIN p)`, which flattening to `c CROSS JOIN o LEFT JOIN p` keeps. |
+| `comma_from_with_a_right_or_full_join_is_refused` | With a `RIGHT` or `FULL` join, `a, b RIGHT JOIN c` pairs `c`'s padded rows with every `a` row, which flattening can't express: refused, by name. |
 | `cross_join_with_on_is_refused` |  |
 | `derived_cross_join_does_not_multiply_the_measure` |  |
 | `shell_right_and_cross_join_match_plain_sql` |  |
@@ -54,6 +57,7 @@ Every kind, from either side, fan-out, and G2.
 | `right_joins_along_a_chain_without_a_fact_key` | orders -> customers -> regions, `orders` without a primary key. |
 | `left_join_from_the_one_side_drops_unmatched_fact_rows` | §7.6, §8.1: `customers LEFT JOIN orders` keeps every customer and the orders that match one. |
 | `join_kind_changes_the_request_hash` | The join kind is part of a query's identity: an `INNER` and a `LEFT` join compile to different SQL, so they must not share a `request_hash`. |
+| `a_repeated_alias_is_refused_in_every_join_form` | One alias names one relation, however the second one is joined: a comma item, a `CROSS JOIN` or a relationship join. |
 
 ## Appendix A.4
 
@@ -64,7 +68,7 @@ Measures from independent facts, and the query as one relation (§7.6, §10.2).
 | Test | What it shows |
 |---|---|
 | `a4_independent_measures_via_joins_agree_with_layer3` | `customers LEFT JOIN orders LEFT JOIN tickets` keeps every customer, so customer 5 (no region, nothing bought) is a NULL-region group with no sales and no tickets. |
-| `a4_comma_from_lists_independent_facts` |  |
+| `a4_comma_from_is_a_cross_join_not_independent_facts` | A comma `FROM` is a cross join, as in SQL (§7.6, §10.2), not a list of independent facts (those are written with joins, as A.4 does). |
 | `a4_refuses_dimension_not_shared_across_facts` |  |
 | `a4_agg_ratio_expression_in_select` |  |
 | `a4_agg_ratio_on_single_fact` |  |
@@ -118,7 +122,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 §7.2 aggregated queries and plain aggregates, §7.7 pass-through, query-local `TO MEASURE`, and the fold of a sole derived table.
 
-[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 31 tests
+[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 33 tests
 
 | Test | What it shows |
 |---|---|
@@ -153,6 +157,8 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 | `fold_refuses_inner_group_by_of_a_measure` |  |
 | `folded_to_measure_formulas_participate_in_request_hash` |  |
 | `aggregated_queries_refuse_unevaluated_measures` | §7.2: an aggregated query reports values, so it can't carry an unevaluated measure out, whether passed through or defined there. |
+| `quoted_measure_names_follow_the_identifier_rules` | A measure name follows the identifier rules, as a field does: a regular name matches whatever its case, a quoted one only exactly as the model normalizes it. |
+| `query_local_measure_names_avoid_model_metrics` | A query-local measure's generated name skips any the model already uses, by the identifier rules: `__L2_BM0` is the regular name `__l2_bm0` is too. |
 
 ## Query operators (§7.3–§7.8)
 

@@ -47,22 +47,29 @@ fn a4_independent_measures_via_joins_agree_with_layer3() {
     assert_eq!(l3_rows, shared);
 }
 
+/// A comma `FROM` is a cross join, as in SQL (§7.6, §10.2), not a list of
+/// independent facts (those are written with joins, as A.4 does). A cross join
+/// spanning two facts isn't supported yet, so the comma form is refused with the
+/// same message as the explicit `CROSS JOIN`, rather than answered per region.
 #[test]
-fn a4_comma_from_lists_independent_facts() {
+fn a4_comma_from_is_a_cross_join_not_independent_facts() {
     let g = two_facts_graph();
     let opts = two_facts_opts();
-    let sql = "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) \
-               FROM customers c, orders o, tickets t \
-               GROUP BY c.region";
-    let req = ossiec::layer2_to_request(&g, sql).unwrap();
-    assert_eq!(
-        req.metrics,
-        vec!["orders.order_amt", "tickets.ticket_count"]
+    let refusal = |from: &str| {
+        let sql = format!(
+            "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) FROM {from} GROUP BY c.region"
+        );
+        unsupported_msg(ossiec::compile_layer2(&g, &sql, &opts).unwrap_err())
+    };
+    let comma = refusal("customers c, orders o, tickets t");
+    assert!(
+        comma.contains("CROSS JOIN cannot span independent facts"),
+        "{comma}"
     );
-    assert_eq!(req.dimensions, vec!["customers.region"]);
-    let l2 = ossiec::compile_layer2(&g, sql, &opts).unwrap();
-    let l3 = ossiec::compile(&g, &req, &opts).unwrap();
-    assert_eq!(l2.sql, l3.sql);
+    assert_eq!(
+        comma,
+        refusal("customers c CROSS JOIN orders o CROSS JOIN tickets t")
+    );
 }
 
 #[test]

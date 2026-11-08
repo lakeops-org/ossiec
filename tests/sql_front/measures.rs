@@ -850,3 +850,73 @@ fn aggregated_queries_refuse_unevaluated_measures() {
         .to_string();
     assert!(e.contains("§7.2") || e.contains("measure"), "{e}");
 }
+
+/// A measure name follows the identifier rules, as a field does: a regular name
+/// matches whatever its case, a quoted one only exactly as the model normalizes
+/// it. The model's `order_count` is the regular identifier `ORDER_COUNT`.
+#[test]
+fn quoted_measure_names_follow_the_identifier_rules() {
+    let g = graph();
+    let compile = |m: &str| {
+        ossiec::compile_layer2(
+            &g,
+            &format!("SELECT status, AGG({m}) AS n FROM orders GROUP BY status"),
+            &duck(),
+        )
+    };
+    let want = compile("order_count").unwrap().sql;
+    for same in [
+        "ORDER_COUNT",
+        "Order_Count",
+        "\"ORDER_COUNT\"",
+        "orders.\"ORDER_COUNT\"",
+    ] {
+        assert_eq!(compile(same).unwrap().sql, want, "{same}");
+    }
+    for other in ["\"order_count\"", "\"Order_Count\""] {
+        let e = compile(other).unwrap_err().to_string();
+        assert!(e.contains("unknown measure"), "{other}: {e}");
+    }
+    // A pass-through measure column follows the same rule.
+    let pass = |m: &str| {
+        ossiec::compile_layer2(
+            &g,
+            &format!("SELECT status, AGG(order_count) AS n FROM (SELECT status, {m} AS order_count FROM orders) t GROUP BY status"),
+            &duck(),
+        )
+    };
+    assert_eq!(
+        pass("\"ORDER_COUNT\"").unwrap().sql,
+        pass("order_count").unwrap().sql
+    );
+    assert!(pass("\"order_count\"").is_err());
+}
+
+/// A query-local measure's generated name skips any the model already uses, by
+/// the identifier rules: `__L2_BM0` is the regular name `__l2_bm0` is too.
+#[test]
+fn query_local_measure_names_avoid_model_metrics() {
+    let model = common::MODEL.replacen(
+        "      - { name: gross_revenue, expression: { sql: SUM(revenue) } }",
+        "      - { name: gross_revenue, expression: { sql: SUM(revenue) } }\n      - { name: __L2_BM0, expression: { sql: SUM(amount_cents) } }",
+        1,
+    );
+    assert_ne!(model, common::MODEL);
+    let g = ossiec::from_yaml(&model).unwrap();
+    let db = duckdb();
+    let c = ossiec::compile_layer2(
+        &g,
+        "SELECT status, MAX(order_date) AS last, AGG(__L2_BM0) AS cents FROM orders GROUP BY status",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(
+            &db,
+            "SELECT status, MAX(order_date), SUM(amount_cents) FROM orders GROUP BY status"
+        )),
+        "{}",
+        c.sql
+    );
+}

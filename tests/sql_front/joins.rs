@@ -123,6 +123,60 @@ fn cross_join_grouped_by_the_other_side_counts_each_order_once_per_group() {
     assert_join_answer(sql, "CROSS JOIN", reference, naive);
 }
 
+/// `FROM orders o, customers c` is `orders o CROSS JOIN customers c` (§7.6):
+/// the same SQL, and each order counted once per region.
+#[test]
+fn comma_from_is_a_cross_join() {
+    let comma = "SELECT c.region, AGG(o.order_count) AS n \
+        FROM orders o, customers c GROUP BY c.region";
+    let cross = "SELECT c.region, AGG(o.order_count) AS n \
+        FROM orders o CROSS JOIN customers c GROUP BY c.region";
+    let g = graph();
+    assert_eq!(
+        ossiec::compile_layer2(&g, comma, &duck()).unwrap().sql,
+        ossiec::compile_layer2(&g, cross, &duck()).unwrap().sql
+    );
+    let reference = "SELECT region, (SELECT COUNT(*) FROM orders) \
+        FROM {customers} GROUP BY region";
+    let naive = "SELECT c.region, COUNT(*) \
+        FROM orders o, {customers} c GROUP BY c.region";
+    assert_join_answer(comma, "CROSS JOIN", reference, naive);
+}
+
+/// A comma binds looser than `JOIN`: `FROM c, o LEFT JOIN p ON …` is
+/// `c × (o LEFT JOIN p)`, which flattening to `c CROSS JOIN o LEFT JOIN p` keeps.
+#[test]
+fn comma_from_before_a_left_join_keeps_its_meaning() {
+    let sql = "SELECT c.region, p.category, AGG(o.order_count) AS n \
+        FROM customers c, orders o LEFT JOIN products p ON o.product_id = p.id \
+        GROUP BY c.region, p.category";
+    let reference = "SELECT c.region, x.category, x.n \
+        FROM (SELECT DISTINCT region FROM {customers}) c, \
+             (SELECT p.category, COUNT(*) AS n FROM orders o \
+              LEFT JOIN products p ON o.product_id = p.product_id GROUP BY p.category) x";
+    let naive = "SELECT c.region, p.category, COUNT(*) \
+        FROM {customers} c, orders o LEFT JOIN products p ON o.product_id = p.product_id \
+        GROUP BY c.region, p.category";
+    assert_join_answer(sql, "CROSS JOIN", reference, naive);
+}
+
+/// With a `RIGHT` or `FULL` join, `a, b RIGHT JOIN c` pairs `c`'s padded rows
+/// with every `a` row, which flattening can't express: refused, by name.
+#[test]
+fn comma_from_with_a_right_or_full_join_is_refused() {
+    for kind in ["RIGHT", "FULL"] {
+        let sql = format!(
+            "SELECT c.region, AGG(o.order_count) FROM customers c, orders o \
+             {kind} JOIN products p ON o.product_id = p.id GROUP BY c.region"
+        );
+        let m = unsupported_msg(ossiec::compile_layer2(&graph(), &sql, &duck()).unwrap_err());
+        assert!(
+            m.contains("comma-separated FROM") && m.contains("CROSS JOIN"),
+            "{m}"
+        );
+    }
+}
+
 #[test]
 fn cross_join_with_on_is_refused() {
     let m = unsupported_msg(
@@ -532,4 +586,21 @@ fn join_kind_changes_the_request_hash() {
     assert_ne!(inner.sql, left.sql);
     assert_ne!(inner.request_hash, left.request_hash);
     assert_eq!(left.request_hash, compile("LEFT JOIN").request_hash);
+}
+
+/// One alias names one relation, however the second one is joined: a comma
+/// item, a `CROSS JOIN` or a relationship join. Refused, never resolved to one.
+#[test]
+fn a_repeated_alias_is_refused_in_every_join_form() {
+    for from in [
+        "orders o, customers o",
+        "orders o CROSS JOIN customers o",
+        "orders o JOIN customers o ON o.customer_id = o.id",
+    ] {
+        let sql = format!("SELECT AGG(o.order_count) FROM {from}");
+        let e = ossiec::compile_layer2(&graph(), &sql, &duck())
+            .expect_err(&sql)
+            .to_string();
+        assert!(e.contains("duplicate relation alias `o`"), "{from}: {e}");
+    }
 }

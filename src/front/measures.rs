@@ -38,6 +38,29 @@ pub(super) fn aggregated_measure(what: &str) -> Error {
     ))
 }
 
+/// The next `__l2_bmN` that no measure of dataset `ds` already answers to, by
+/// the identifier rules [`super::resolve::dataset_measure`] resolves with: a
+/// model may declare a metric of that name, and a query-local one must not
+/// shadow it.
+pub(super) fn fresh_measure_name(graph: &SemanticGraph, ds: usize, seq: &mut usize) -> String {
+    loop {
+        let bare = format!("__l2_bm{seq}");
+        *seq += 1;
+        let taken = graph::lookup(
+            graph
+                .metrics
+                .iter()
+                .filter(|m| m.owner == Some(ds))
+                .map(|m| m.name.rsplit('.').next().unwrap_or(&m.name)),
+            &bare,
+            false,
+        );
+        if matches!(taken, Ok(None)) {
+            return bare;
+        }
+    }
+}
+
 /// `Some` when `e` is one base aggregate to install as a dataset metric.
 /// `None` when it is a composition of `AGG(measure)` (the caller parses that).
 pub(super) fn classify_to_measure(
@@ -60,8 +83,7 @@ pub(super) fn classify_to_measure(
             ));
         }
         let (owner, body) = base_measure_body(graph, scope, e)?;
-        let bare = format!("__l2_bm{base_seq}");
-        *base_seq += 1;
+        let bare = fresh_measure_name(graph, owner, base_seq);
         let dataset = graph.datasets[owner].name.clone();
         let name = format!("{dataset}.{bare}");
         return Ok(Some(EphemeralMetric {
@@ -216,18 +238,14 @@ pub(super) fn bare_measure(
     scope: &QueryScope,
     col: &Column,
 ) -> Option<usize> {
-    let name = &col.name.name;
     let hit = scope.bindings.iter().find(|b| {
         let ds = &graph.datasets[b.dataset].name;
         let qualified_ok = col.table.as_ref().is_none_or(|t| {
             t.name.eq_ignore_ascii_case(&b.alias) || t.name.eq_ignore_ascii_case(ds)
         });
         qualified_ok
-            && graph.metrics.iter().any(|m| {
-                m.owner == Some(b.dataset)
-                    && (m.name.eq_ignore_ascii_case(name)
-                        || m.name.eq_ignore_ascii_case(&format!("{ds}.{name}")))
-            })
+            && super::resolve::dataset_measure(graph, b.dataset, &col.name.name, col.name.quoted)
+                .is_ok_and(|m| m.is_some())
     })?;
     Some(hit.dataset)
 }

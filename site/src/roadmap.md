@@ -12,8 +12,8 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 - **`WHERE` on one of several independent facts' columns** (§7.3)
 - **A fan-out written from the many side**: `order_items i LEFT JOIN orders o` reading `AGG(o.order_count)`. The same join written `orders o RIGHT JOIN order_items i` works.
 - **`ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins** (§7.6)
-- **Comma `FROM`** *(answers differently, not refused)*: SQL reads it as a cross join; ossiec reads it as independent facts sharing their dimensions
-- **Measure names in quotes**: `AGG("m")` matches `m`, ignoring the quotes
+- **Quoted references to a derived table's columns** *(lenient, not refused)*: `t."order_count"` matches the derived column `order_count` regardless of its quotes. Two columns of a relation can't differ by case alone, so it never finds a different column; a strict reading would refuse it
+- **A `CROSS JOIN` spanning independent facts**, written out or as a comma `FROM`, and a comma `FROM` combined with a `RIGHT` or `FULL` join (§7.6)
 - **Persisting a view** judges its joins by how they're written, so `orders RIGHT JOIN customers` is refused though it means the same as `customers LEFT JOIN orders`, which persists
 
 ## Layer 1
