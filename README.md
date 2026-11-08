@@ -264,7 +264,7 @@ let (graph, added) = ossiec::persist_layer2_view(&graph, &views, "region_metrics
 let yaml = ossiec::to_yaml(graph.model())?;
 ```
 
-Persisting refuses a view with `WHERE`, `LIMIT`/`OFFSET` or a join other than `LEFT JOIN`, including inside a referenced view or derived table, because a metric would not carry them and could answer differently from the view. Composing a dataset's `COUNT(*)` into a model-scoped metric also needs that dataset to declare a primary key.
+Persisting refuses a view with `WHERE`, `LIMIT`/`OFFSET` or a join other than `LEFT JOIN`, including inside a referenced view or derived table, because a metric would not carry them and could answer differently from the view. A `LEFT JOIN` written from the one side (`customers LEFT JOIN orders`, as in A.7) is persisted, but the metric is queried over the model's own `orders -> customers` path: it has no group for a customer with no orders, and puts orders without a customer under NULL. The groups both answers share agree. Composing a dataset's `COUNT(*)` into a model-scoped metric also needs that dataset to declare a primary key.
 
 `to_yaml` and `persist-view` write a re-serialized model, so unknown keys and comments in the source file are not preserved. Write to a new file and review the diff before replacing the original.
 
@@ -462,7 +462,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 1 functions on six engines, each implemented or refused (`functions.rs`)
 - [ ] Exact percentiles on MySQL and Trino, which have no such function
 - [x] Layer 2 `GROUP BY ALL` and `DISTINCT`
-- [ ] Fix: a LEFT JOIN written from the one side (`customers LEFT JOIN orders`) counts fact rows that match nothing
+- [x] Fix: a LEFT JOIN written from the one side (`customers LEFT JOIN orders`) counted fact rows that match nothing
+- [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)

@@ -63,7 +63,7 @@ use crate::graph::{self, SemanticGraph};
 use crate::plan::{
     self, Direction, Filter, JoinKind, JoinStep, LogicalPlan, Nulls, Op, OrderBy, Request, Strategy,
 };
-use crate::sql::{self, transform};
+use crate::sql::{self, transform, Tpl};
 use crate::{Compiled, Error, Options, Result};
 
 mod catalog;
@@ -1067,7 +1067,15 @@ fn apply_consumer_joins(
         for leg in &mut logical.legs {
             for step in &mut leg.joins {
                 if step.rel == Some(rel) {
-                    step.kind = cj.kind;
+                    // The plan joins from its root, which can be the side the
+                    // consumer wrote second: `customers LEFT JOIN orders` is planned
+                    // as `orders -> customers`, and keeps every customer, not every
+                    // order. Then LEFT and RIGHT trade places (§7.6, §8.1).
+                    step.kind = if step.to == cj.other_ds {
+                        cj.kind
+                    } else {
+                        cj.kind.mirrored()
+                    };
                     patched = true;
                 }
             }
@@ -1220,6 +1228,9 @@ pub(super) fn protect_inflating_joins(
     ctx: &mut graph::Ctx,
 ) -> Result<()> {
     for leg_i in 0..logical.legs.len() {
+        if only_null_extends_the_root(graph, logical, leg_i, ctx) {
+            continue;
+        }
         let inflates = logical.legs[leg_i]
             .joins
             .iter()
@@ -1252,6 +1263,69 @@ pub(super) fn protect_inflating_joins(
         }
     }
     Ok(())
+}
+
+/// A `RIGHT JOIN` along a many-to-one relationship, as `customers LEFT JOIN
+/// orders` is planned (`orders RIGHT JOIN customers`). A left-side row matches at
+/// most one row, so none repeats; the join only adds a row for each right-side row
+/// nothing matched, with the left side all NULL. Those rows keep their groups but
+/// derive from no fact row (§8.1), so each inline aggregate skips them with a
+/// filter: every such join's left-side key is NOT NULL, as it is on every row that
+/// matched. No primary key is needed.
+///
+/// `true` when the leg's inflating joins are all of that kind and every inline
+/// term took the filter. Otherwise nothing changes, and the primary-key path
+/// applies: a `FULL` join's unmatched fact rows have a NULL key and do count.
+fn only_null_extends_the_root(
+    graph: &SemanticGraph,
+    logical: &mut LogicalPlan,
+    leg_i: usize,
+    ctx: &mut graph::Ctx,
+) -> bool {
+    let leg = &logical.legs[leg_i];
+    let mut conditions = vec![];
+    for s in &leg.joins {
+        if !s.kind.inflates_inline() {
+            continue;
+        }
+        let Some(r) = s.rel.filter(|_| s.kind == JoinKind::Right && !s.reverse) else {
+            return false;
+        };
+        let rel = &graph.rels[r];
+        for &f in &rel.from_fields {
+            conditions.push(graph.field_sql_as(rel.from, f, &s.from_alias, ctx));
+        }
+    }
+    if conditions.is_empty() || leg.derived.iter().any(|d| d.kind.inflates_inline()) {
+        return false;
+    }
+    let mut t = Tpl::new();
+    let parts: Vec<String> = conditions
+        .into_iter()
+        .map(|c| format!("{} IS NOT NULL", t.e(c)))
+        .collect();
+    t.push(&parts.join(" AND "));
+    let Ok(present) = t.build() else {
+        return false;
+    };
+    let inline: Vec<usize> = logical
+        .terms
+        .iter()
+        .enumerate()
+        .filter(|(_, term)| term.leg == leg_i && term.strategy == Strategy::Inline)
+        .map(|(i, _)| i)
+        .collect();
+    let mut filtered = vec![];
+    for &i in &inline {
+        match graph::with_aggregate_filter(logical.terms[i].term.ast.clone(), present.clone()) {
+            Some(ast) => filtered.push((i, ast)),
+            None => return false,
+        }
+    }
+    for (i, ast) in filtered {
+        logical.terms[i].term.ast = ast;
+    }
+    true
 }
 
 fn consumer_join_leg(

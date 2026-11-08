@@ -114,6 +114,13 @@ pub fn persist_layer2_view(
 /// joins, so a `WHERE`, `LIMIT`/`OFFSET` or any other join kind in the view would
 /// be dropped silently and change the answer. Derived tables are checked too,
 /// which is where the body of a referenced view ends up after expansion.
+///
+/// A `LEFT JOIN` written from a relationship's one side (`customers LEFT JOIN
+/// orders`, as in A.7) is persisted. Which groups appear can differ: the view
+/// keeps a customer with no orders as a group with the empty-input value, while
+/// the model's `orders -> customers` path has no such group and puts orders
+/// without a customer under NULL. The groups both return agree, except that
+/// NULL group when the view's dimension has NULLs of its own.
 fn refuse_narrowed_rows(view: &str, sel: &Select) -> Result<()> {
     let relations = sel
         .from
