@@ -394,12 +394,17 @@ pub(super) fn pragma_include_unmatched(sql: &str) -> bool {
 /// select list. A measure definition's own aggregate doesn't count: it's cut out of
 /// the text as a `TO MEASURE` marker before this runs.
 pub(super) fn is_aggregated(sel: &Select) -> bool {
-    sel.group_by.is_some()
-        || sel.having.is_some()
-        || sel.expressions.iter().any(|e| {
-            let (inner, _) = strip_alias(e);
-            contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
-        })
+    sel.group_by.is_some() || sel.having.is_some() || select_aggregates(sel)
+}
+
+/// The select list holds an aggregate or an `AGG()` read. A `TO MEASURE`
+/// definition is a marker column here, so it doesn't count (§4.2). One rule for
+/// both §7.2's refusal and the `GROUP BY` requirement.
+fn select_aggregates(sel: &Select) -> bool {
+    sel.expressions.iter().any(|e| {
+        let (inner, _) = strip_alias(e);
+        contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
+    })
 }
 
 /// §7.2's refusal of an unevaluated measure in an aggregated query.
@@ -640,10 +645,7 @@ pub(super) fn parse_stage_from(
     // (a dimension listing is one row per combination anyway: Appendix A.3's `d`).
     // A measure definition reads `AGG` without aggregating the query (§4.2), so a
     // relation of fields and definitions needs none either: Appendix A.7's view.
-    let aggregates = sel.expressions.iter().any(|e| {
-        let (inner, _) = strip_alias(e);
-        contains_aggregate(inner) || inner.contains(is_measure_agg_expr)
-    });
+    let aggregates = select_aggregates(sel);
     match &sel.group_by {
         None if aggregates && !dimensions.is_empty() => {
             return Err(Error::Request(
