@@ -118,30 +118,20 @@ pub(super) fn resolve_measure(
     let ds_name = &graph.datasets[dataset].name;
     let measure = &col.name.name;
 
-    let scoped = format!("{ds_name}.{measure}");
-    if let Ok(i) = graph.metric_by_name(&scoped) {
-        if graph.metrics[i].owner == Some(dataset) {
-            return Ok(graph.metrics[i].name.clone());
-        }
+    if let Some(i) = dataset_measure(graph, dataset, measure, col.name.quoted)? {
+        return Ok(graph.metrics[i].name.clone());
     }
-    if let Ok(i) = graph.metric_by_name(measure) {
-        if graph.metrics[i].owner == Some(dataset) {
-            return Ok(graph.metrics[i].name.clone());
-        }
-        if graph.metrics[i].owner.is_none() {
-            return Err(Error::Request(format!(
-                "`{measure}` is a model-scoped metric; Layer 2 only exposes dataset-scoped metrics as measures (relational_semantics §10.3)"
-            )));
-        }
-        return Err(Error::Request(format!(
-            "`{measure}` is not a measure on dataset `{ds_name}`"
-        )));
-    }
-    if graph
-        .metrics
-        .iter()
-        .any(|m| m.name.eq_ignore_ascii_case(measure) && m.owner.is_none())
-    {
+    let model_scoped = graph::lookup(
+        graph
+            .metrics
+            .iter()
+            .filter(|m| m.owner.is_none())
+            .map(|m| m.name.as_str()),
+        measure,
+        col.name.quoted,
+    )
+    .map_err(Error::Request)?;
+    if model_scoped.is_some() {
         return Err(Error::Request(format!(
             "`{measure}` is a model-scoped metric; Layer 2 only exposes dataset-scoped metrics as measures (relational_semantics §10.3)"
         )));
@@ -212,4 +202,26 @@ pub(super) fn as_column(e: &Expression) -> Option<&Column> {
         Expression::Column(c) => Some(c),
         _ => None,
     }
+}
+
+/// The metric of dataset `ds` that `name` names, by the identifier rules: a
+/// regular name matches regardless of case, a quoted one exactly as written
+/// (expression language, "Comparison Table"), as for fields.
+pub(super) fn dataset_measure(
+    graph: &SemanticGraph,
+    ds: usize,
+    name: &str,
+    quoted: bool,
+) -> Result<Option<usize>> {
+    let prefix = format!("{}.", graph.datasets[ds].name);
+    let owned: Vec<usize> = (0..graph.metrics.len())
+        .filter(|&i| graph.metrics[i].owner == Some(ds))
+        .collect();
+    let bare = |i: usize| {
+        let full = graph.metrics[i].name.as_str();
+        full.strip_prefix(prefix.as_str()).unwrap_or(full)
+    };
+    let hit =
+        graph::lookup(owned.iter().map(|&i| bare(i)), name, quoted).map_err(Error::Request)?;
+    Ok(hit.map(|k| owned[k]))
 }

@@ -275,7 +275,7 @@ Persisting refuses a view with `WHERE`, `LIMIT`/`OFFSET` or a join other than `L
 
 `to_yaml` and `persist-view` write a re-serialized model, so unknown keys and comments in the source file are not preserved. Write to a new file and review the diff before replacing the original.
 
-Model-scoped metrics are not measures (§10.3). `AGG(expr)` inside `AGG()` is refused; use `AGG(a) + AGG(b)`. Other join forms (`ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) are not implemented yet. `CROSS JOIN` takes no `ON`.
+Model-scoped metrics are not measures (§10.3). `AGG(expr)` inside `AGG()` is refused; use `AGG(a) + AGG(b)`. Other join forms (`ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, …) are not implemented yet. `CROSS JOIN` takes no `ON`, and a comma `FROM` is a `CROSS JOIN`, as in SQL. A `CROSS JOIN` spanning independent facts, and a comma `FROM` combined with a `RIGHT` or `FULL` join, are refused.
 
 ## Requests
 
@@ -374,7 +374,7 @@ The full rationale is in **[docs/DESIGN.md](docs/DESIGN.md)**.
 | Non-SQL dialects (`DAX`, `MDX`, `TABLEAU`, …) | Ignored (a field needs at least one SQL form) |
 | `FILTER (WHERE …)`, `COUNT(DISTINCT …)`, ratios, `CASE` | ✅ |
 | Scalar and aggregate functions in `expression_language.md` | ✅ DuckDB and ClickHouse. Other engines refuse what they can't express, and [`gaps`](tests/expression_language.rs) is the full list: `MEDIAN`, exact percentiles on MySQL and Trino, `APPROX_PERCENTILE` and `REGEXP_COUNT` on MySQL, `TRY_CAST` on MySQL and Postgres. `NTH_VALUE` fails with an engine error on StarRocks, whose `UPPER` also only changes ASCII letters in a column |
-| Identifier rules (regular names upper-cased, quoted kept, so `"ID"` matches `id` and `"id"` doesn't; 128 characters at most) | ✅ Except Layer 2 measure names, which ignore quotes: `AGG("m")` matches `m` |
+| Identifier rules (regular names upper-cased, quoted kept, so `"ID"` matches `id` and `"id"` doesn't; 128 characters at most) | ✅ |
 | `source.column` in dataset-scoped metrics | ✅ |
 | Reserved `AGG`, and no subqueries, in portable expressions | ✅ Refused when the model loads |
 | Window functions in metrics (`OVER`, `RANK`, `LAG`, running totals) | ✅ Dataset-scoped directly, model-scoped with `deferredMetrics` |
@@ -473,7 +473,9 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [ ] Layer 2 arithmetic on plain aggregates, and plain aggregates in `HAVING`
 - [x] Fix: a LEFT JOIN written from the one side (`customers LEFT JOIN orders`) counted fact rows that match nothing
 - [x] Fix: a join on one of several independent facts left the others unrestricted, and two `COUNT(*)` metrics on different facts shared one answer
-- [ ] Layer 2 comma `FROM` (`FROM customers c, orders o, tickets t`) is a cross join in SQL; ossiec reads it as independent facts sharing `customers`
+- [x] Fix: a Layer 2 comma `FROM` (`FROM customers c, orders o, tickets t`) was read as independent facts; it is a `CROSS JOIN`, as in SQL
+- [x] Fix: a quoted Layer 2 measure name (`AGG("m")`) ignored its quotes; it now follows the identifier rules
+- [ ] Layer 2 `CROSS JOIN` (or comma `FROM`) spanning independent facts: refused today
 - [ ] Layer 2 `WHERE` on one of several independent facts' columns: refused today
 - [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker

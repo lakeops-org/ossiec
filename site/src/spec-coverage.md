@@ -52,7 +52,7 @@ The complete, generated list is [Functions by engine](generated/functions.md).
 | §7.3 `WHERE` | 🟡 | Any row predicate. Subqueries, and a filter on one of several independent facts, are refused |
 | §7.4 `GROUP BY` | 🟡 | `GROUP BY` and `GROUP BY ALL`. `ROLLUP`, `CUBE` and `GROUPING SETS` are refused |
 | §7.5 `HAVING`, `ORDER BY` | 🟡 | `AGG()` and expressions over it, selected or not. Plain aggregates in `HAVING`, and subqueries, are refused |
-| §7.6 `JOIN` | 🟡 | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS` from either side, with filtering, duplication and null-extension handled. `ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL` and a fan-out written from the many side are refused; a comma `FROM` is read as independent facts, not a cross join |
+| §7.6 `JOIN` | 🟡 | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS` from either side, with filtering, duplication and null-extension handled. A comma `FROM` is a `CROSS JOIN`. `ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, a fan-out written from the many side, and a `CROSS JOIN` spanning independent facts are refused |
 | §7.7 Subqueries and CTEs | 🟡 | Derived tables and `WITH`, nested to any depth for pass-through (4 levels, 8 derived tables per query). Scalar subqueries are refused |
 | §7.8 `DISTINCT` | ✅ | Over fields and evaluated measures; refused over an unevaluated measure |
 | §7.8 Set operators | ❌ | Refused, even over fields only |

@@ -216,18 +216,14 @@ pub(super) fn bare_measure(
     scope: &QueryScope,
     col: &Column,
 ) -> Option<usize> {
-    let name = &col.name.name;
     let hit = scope.bindings.iter().find(|b| {
         let ds = &graph.datasets[b.dataset].name;
         let qualified_ok = col.table.as_ref().is_none_or(|t| {
             t.name.eq_ignore_ascii_case(&b.alias) || t.name.eq_ignore_ascii_case(ds)
         });
         qualified_ok
-            && graph.metrics.iter().any(|m| {
-                m.owner == Some(b.dataset)
-                    && (m.name.eq_ignore_ascii_case(name)
-                        || m.name.eq_ignore_ascii_case(&format!("{ds}.{name}")))
-            })
+            && super::resolve::dataset_measure(graph, b.dataset, &col.name.name, col.name.quoted)
+                .is_ok_and(|m| m.is_some())
     })?;
     Some(hit.dataset)
 }

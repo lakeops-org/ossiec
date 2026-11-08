@@ -31,7 +31,7 @@ The result, construct by construct and engine by engine, is on [Functions by eng
 
 | Rule | What ossiec does |
 |---|---|
-| Identifiers | Regular names are upper-cased and quoted ones kept, so `"ID"` matches `id` and `"id"` doesn't. At most 128 characters. |
+| Identifiers | Regular names are upper-cased and quoted ones kept, so `"ID"` matches `id` and `"id"` doesn't, wherever a name is resolved, Layer 2 measure names included. At most 128 characters. |
 | `source.column` | A dataset-scoped metric may read a source column directly. |
 | `AGG` is reserved | A portable expression can't call a function named `AGG`. |
 | No subqueries | A portable expression can't contain one. |

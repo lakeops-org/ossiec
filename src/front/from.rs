@@ -74,7 +74,9 @@ pub(super) fn parse_from_clause(
         outer: outer.to_vec(),
     };
     let mut derived_specs: Vec<DerivedSpec> = Vec::new();
-    for e in &from.expressions {
+    let joins = comma_items_as_cross_joins(&from.expressions[1..], joins)?;
+    let joins = joins.as_slice();
+    for e in &from.expressions[..1] {
         let (dataset, alias) = table_expr(graph, e)?;
         let alias = alias.unwrap_or_else(|| graph.datasets[dataset].name.clone());
         if scope
@@ -351,6 +353,42 @@ pub(super) fn on_pairs_null_safe(on: &Expression) -> Result<Vec<(Column, Column,
         }
         _ => Err(on_must_be_equalities()),
     }
+}
+
+/// SQL reads `FROM a, b` as `a CROSS JOIN b` (§7.6, §10.2), and so does ossiec:
+/// each item after the first becomes a `CROSS JOIN`, ahead of the written joins.
+/// A comma binds looser than `JOIN`, so `FROM a, b JOIN c` is `a × (b JOIN c)`.
+/// Flattening keeps that meaning for inner, left and cross joins, but not for a
+/// `RIGHT` or `FULL` join, whose padded rows would pair with `a` differently;
+/// those are refused.
+fn comma_items_as_cross_joins(items: &[Expression], joins: &[Join]) -> Result<Vec<Join>> {
+    if items.is_empty() {
+        return Ok(joins.to_vec());
+    }
+    if joins
+        .iter()
+        .any(|j| matches!(j.kind, SqlJoinKind::Right | SqlJoinKind::Full))
+    {
+        return Err(unsupported(
+            "Layer 2 comma-separated FROM with a RIGHT or FULL JOIN is not supported; write the comma as CROSS JOIN, with parentheses where needed",
+        ));
+    }
+    let cross = items.iter().map(|e| Join {
+        this: e.clone(),
+        on: None,
+        using: vec![],
+        kind: SqlJoinKind::Cross,
+        use_inner_keyword: false,
+        use_outer_keyword: false,
+        deferred_condition: false,
+        join_hint: None,
+        match_condition: None,
+        pivots: vec![],
+        comments: vec![],
+        nesting_group: 0,
+        directed: false,
+    });
+    Ok(cross.chain(joins.iter().cloned()).collect())
 }
 
 pub(super) fn cross_join_on() -> Error {

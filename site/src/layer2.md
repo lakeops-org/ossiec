@@ -27,7 +27,7 @@ Compile from the CLI with `ossiec compile-sql model.yaml query.sql --dialect tri
 |---|---|---|
 | `AGG()` and arithmetic over it | `AGG(revenue) / AGG(ticket_count)` | §6, §7.2 |
 | Plain aggregates beside measures | `SELECT region, MAX(order_date), AGG(total_revenue) … GROUP BY region` | §7.2 |
-| Any join kind along a model relationship | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, from either side | §7.6, A.5, A.6 |
+| Any join kind along a model relationship | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, from either side; a comma `FROM` is a `CROSS JOIN`, as in SQL | §7.6, A.5, A.6 |
 | `WHERE` as any row predicate | comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT`, across datasets | §7.3 |
 | `GROUP BY`, `GROUP BY ALL` | `GROUP BY ALL` groups by the selected non-aggregates | §7.4 |
 | `HAVING`, `ORDER BY`, `LIMIT` | `ORDER BY AGG(revenue) DESC LIMIT 10`, measure needn't be selected | §7.5 |
@@ -37,6 +37,7 @@ Compile from the CLI with `ossiec compile-sql model.yaml query.sql --dialect tri
 | Views | `CREATE VIEW v AS SELECT … TO MEASURE …` in a session catalog | A.7 |
 | Roles | `departs_from.city`, or the relationship name as the join alias | §11.3 |
 | `MEASURE()` | a synonym for `AGG()` | §6 |
+| Identifiers | `AGG("ORDER_COUNT")` and `AGG(Order_Count)` both name `order_count`; `AGG("order_count")` doesn't, since a quoted name keeps its case | expression language |
 
 Every row is backed by tests that run the query on DuckDB against a plain-SQL reference; see [Layer 2 test evidence](generated/layer2-tests.md).
 
@@ -113,11 +114,8 @@ ossiec refuses these with a clear message rather than answer differently from th
 - Set operators (`UNION`, `INTERSECT`, `EXCEPT`), `ROLLUP`, `CUBE` and `GROUPING SETS`
 - Subqueries in the select list, `WHERE`, `HAVING` and `ORDER BY`
 - `ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins
+- A `CROSS JOIN` (or comma `FROM`) spanning independent facts, and a comma `FROM` combined with a `RIGHT` or `FULL` join
 - Arithmetic on plain aggregates, and plain aggregates in `HAVING`
 - A `WHERE` on one of several independent facts' columns
 - A fan-out written from the many side (`order_items i LEFT JOIN orders o` reading `AGG(o.order_count)`); `orders o RIGHT JOIN order_items i` works
 - A one-side measure on a dataset with no `primary_key` (de-duplication needs one), except where a join only pads with NULLs
-
-## Where ossiec differs from the spec today
-
-- **A comma `FROM`** (`FROM customers c, orders o, tickets t`) is a cross join in SQL. ossiec reads it as independent facts sharing `customers`, which gives per-region answers rather than the cross join's. Write explicit joins.
