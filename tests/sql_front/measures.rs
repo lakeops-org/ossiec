@@ -61,6 +61,34 @@ fn s72_plain_aggregates_beside_measures() {
                        (SELECT product_id FROM orders y WHERE y.status = o.status)) \
              FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY o.status",
         ),
+        (
+            // Arithmetic on plain aggregates is plain SQL over the joined rows.
+            "SELECT status, MAX(id) + 1 AS next_id, SUM(revenue) / COUNT(*) AS avg_rev \
+             FROM orders GROUP BY status",
+            "SELECT status, MAX(order_id) + 1, SUM(amount_cents / 100.0) / COUNT(*) \
+             FROM orders GROUP BY status",
+        ),
+        (
+            // Mixed with AGG(): joined rows minus orders is the customers without
+            // one; NULLIF guards the division as in SQL.
+            "SELECT c.region, COUNT(*) - AGG(o.order_count) AS no_orders, \
+                    AGG(o.order_count) / NULLIF(COUNT(*), 0) AS share \
+             FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.region",
+            "SELECT c.region, COUNT(*) - COUNT(o.order_id), \
+                    COUNT(o.order_id) / NULLIF(COUNT(*), 0) \
+             FROM {customers} c LEFT JOIN orders o ON o.customer_id = c.customer_id \
+             GROUP BY c.region",
+        ),
+        (
+            // Over a fan-out the two leaves differ: the plain one repeats each
+            // product per order, the measure counts it once (G2).
+            "SELECT o.status, SUM(p.stock) - AGG(p.stock_units) AS repeated_stock \
+             FROM orders o JOIN products p ON o.product_id = p.id GROUP BY o.status",
+            "SELECT o.status, SUM(p.stock) - \
+                    (SELECT SUM(stock) FROM products x WHERE x.product_id IN \
+                       (SELECT product_id FROM orders y WHERE y.status = o.status)) \
+             FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY o.status",
+        ),
     ] {
         let c = ossiec::compile_layer2(&g, q, &duck()).unwrap_or_else(|e| panic!("{q}: {e}"));
         assert_eq!(
@@ -124,13 +152,13 @@ fn s72_plain_aggregate_refusals() {
     for (g, q, why) in [
         (
             graph(),
-            "SELECT status, MAX(order_id) + 1, AGG(order_count) FROM orders GROUP BY status",
-            "one SUM|COUNT|AVG|MIN|MAX",
+            "SELECT status, SUM(MAX(id)) AS s FROM orders GROUP BY status",
+            "can't nest",
         ),
         (
             graph(),
-            "SELECT status, AGG(order_count) / COUNT(*) FROM orders GROUP BY status",
-            "not supported",
+            "SELECT status, SUM(id + AGG(order_count)) AS s FROM orders GROUP BY status",
+            "can't nest",
         ),
         (
             two.clone(),

@@ -16,8 +16,8 @@ use crate::sql::{self, transform};
 use crate::{Error, Result};
 
 use super::{
-    as_column, formula_to_expr, is_measure_agg_expr, resolve_agg, resolve_dim, take_agg,
-    unsupported, GroupExpr, L2Formula, OrderExpr, QueryScope, HAVING_MEASURE,
+    as_column, formula_to_expr, is_base_agg_expr, is_measure_agg_expr, resolve_agg, resolve_dim,
+    take_agg, unsupported, GroupExpr, L2Formula, OrderExpr, QueryScope, RawAggs, HAVING_MEASURE,
 };
 
 /// A conjunct of `WHERE`: a structured filter where it fits, so a literal is typed
@@ -70,6 +70,7 @@ pub(super) fn parse_having(
     scope: &QueryScope,
     e: &Expression,
     dimensions: &[String],
+    raw: &mut RawAggs,
 ) -> Result<(Vec<Conjunct>, Option<GroupExpr>)> {
     fn split<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
         match e {
@@ -86,12 +87,13 @@ pub(super) fn parse_having(
     let mut pushed = vec![];
     let mut kept: Vec<Expression> = vec![];
     for c in conjuncts {
-        if contains_aggregate(c) || contains_window_function(c) {
+        if contains_window_function(c) {
             return Err(unsupported(
-                "Layer 2 HAVING takes AGG(measure) and selected columns; a plain aggregate or a window beside AGG is not supported",
+                "Layer 2 HAVING takes aggregates, AGG(measure) and selected columns; a window is not supported",
             ));
         }
-        let has_agg = c.contains(is_measure_agg_expr);
+        // A plain aggregate (§7.2) reads the group, as AGG() does: never pushed to WHERE.
+        let has_agg = c.contains(is_measure_agg_expr) || c.contains(is_base_agg_expr);
         for column in get_columns(c) {
             // With an AGG(), its argument is a column too: the second pass below
             // checks those that aren't one.
@@ -118,7 +120,10 @@ pub(super) fn parse_having(
             "Layer 2 HAVING does not support subqueries yet",
         ));
     }
-    Ok((pushed, Some(group_expr(graph, scope, joined, dimensions)?)))
+    Ok((
+        pushed,
+        Some(group_expr(graph, scope, joined, dimensions, raw)?),
+    ))
 }
 
 /// An `ORDER BY` key that isn't an output column (§7.5). An expression has to read
@@ -128,10 +133,11 @@ pub(super) fn order_key(
     scope: &QueryScope,
     e: &Expression,
     dimensions: &[String],
+    raw: &mut RawAggs,
 ) -> Result<GroupExpr> {
-    if contains_aggregate(e) || contains_window_function(e) {
+    if contains_window_function(e) {
         return Err(unsupported(
-            "Layer 2 ORDER BY takes AGG(measure) and selected columns; a plain aggregate or a window beside AGG is not supported",
+            "Layer 2 ORDER BY takes aggregates, AGG(measure) and selected columns; a window is not supported",
         ));
     }
     if e.contains(|x| is_query(x) || is_subquery(x)) {
@@ -139,7 +145,7 @@ pub(super) fn order_key(
             "Layer 2 ORDER BY does not support subqueries yet",
         ));
     }
-    let key = group_expr(graph, scope, e.clone(), dimensions)?;
+    let key = group_expr(graph, scope, e.clone(), dimensions, raw)?;
     if key.measures.is_empty() && get_columns(&key.expr).is_empty() {
         return Err(unsupported(
             "Layer 2 ORDER BY must name a selected dimension, measure, or AGG(...); a position like `ORDER BY 1` is not supported",
@@ -148,22 +154,31 @@ pub(super) fn order_key(
     Ok(key)
 }
 
-/// `e` over placeholders: each `AGG()` a measure, each column a selected dimension.
+/// `e` over placeholders: each `AGG()` a measure, each plain aggregate a raw
+/// one (§7.2), each column a selected dimension.
 pub(super) fn group_expr(
     graph: &SemanticGraph,
     scope: &QueryScope,
     e: Expression,
     dimensions: &[String],
+    raw: &mut RawAggs,
 ) -> Result<GroupExpr> {
     let failure = RefCell::new(None);
     let measures = RefCell::new(Vec::<L2Formula>::new());
-    // Two passes: an AGG()'s argument is not a column of the group, whichever
+    let raw = RefCell::new(raw);
+    // Two passes: an aggregate's argument is not a column of the group, whichever
     // order the walk visits a node and its children in.
     let without_aggs = transform(e, &|x| {
-        let found = match take_agg(&x) {
-            Ok(Some(arg)) => resolve_agg(graph, scope, arg).map(Some),
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
+        let found = if is_base_agg_expr(&x) {
+            raw.borrow_mut()
+                .metric(graph, scope, &x)
+                .map(|m| Some(L2Formula::Agg(m)))
+        } else {
+            match take_agg(&x) {
+                Ok(Some(arg)) => resolve_agg(graph, scope, arg).map(Some),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
+            }
         };
         Ok(Some(match found {
             Ok(Some(formula)) => {

@@ -12,8 +12,8 @@ use crate::plan::LogicalPlan;
 use crate::{Error, Result};
 
 use super::{
-    as_column, bare_field, literal_json, resolve_measure, take_agg, unsupported, L2Formula,
-    OutKind, QueryScope,
+    as_column, bare_field, is_base_agg_expr, literal_json, resolve_measure, take_agg, unsupported,
+    L2Formula, OutKind, QueryScope, RawAggs,
 };
 
 pub(super) fn apply_select_formulas(
@@ -113,30 +113,74 @@ pub(super) fn parse_formula(
     scope: &QueryScope,
     e: &Expression,
 ) -> Result<L2Formula> {
+    formula_in(graph, scope, e, None)
+}
+
+/// A select item, `HAVING` or `ORDER BY` expression that may also read plain
+/// aggregates (§7.2): each becomes a raw leaf beside the `AGG()` ones.
+pub(super) fn parse_formula_with_plain(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+    raw: &mut RawAggs,
+) -> Result<L2Formula> {
+    formula_or_agg_in(graph, scope, e, Some(raw))
+}
+
+fn formula_or_agg_in(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+    raw: Option<&mut RawAggs>,
+) -> Result<L2Formula> {
     let e = unwrap_paren(e);
+    if let Some(measure) = take_agg(e)? {
+        return resolve_agg(graph, scope, measure);
+    }
+    formula_in(graph, scope, e, raw)
+}
+
+fn formula_in(
+    graph: &SemanticGraph,
+    scope: &QueryScope,
+    e: &Expression,
+    mut raw: Option<&mut RawAggs>,
+) -> Result<L2Formula> {
+    let e = unwrap_paren(e);
+    let side = |x: &Expression, raw: &mut Option<&mut RawAggs>| -> Result<Box<L2Formula>> {
+        Ok(Box::new(formula_or_agg_in(
+            graph,
+            scope,
+            x,
+            raw.as_deref_mut(),
+        )?))
+    };
     match e {
+        e if is_base_agg_expr(e) && raw.is_some() => Ok(L2Formula::Agg(
+            raw.as_deref_mut().unwrap().metric(graph, scope, e)?,
+        )),
         Expression::Add(b) => Ok(L2Formula::Add(
-            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
-            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+            side(&b.left, &mut raw)?,
+            side(&b.right, &mut raw)?,
         )),
         Expression::Sub(b) => Ok(L2Formula::Sub(
-            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
-            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+            side(&b.left, &mut raw)?,
+            side(&b.right, &mut raw)?,
         )),
         Expression::Mul(b) => Ok(L2Formula::Mul(
-            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
-            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+            side(&b.left, &mut raw)?,
+            side(&b.right, &mut raw)?,
         )),
         Expression::Div(b) => Ok(L2Formula::Div(
-            Box::new(parse_formula_or_agg(graph, scope, &b.left)?),
-            Box::new(parse_formula_or_agg(graph, scope, &b.right)?),
+            side(&b.left, &mut raw)?,
+            side(&b.right, &mut raw)?,
         )),
         Expression::Function(f)
             if f.name.eq_ignore_ascii_case("NULLIF") && f.args.len() == 2 =>
         {
             Ok(L2Formula::NullIf(
-                Box::new(parse_formula_or_agg(graph, scope, &f.args[0])?),
-                Box::new(parse_formula_or_agg(graph, scope, &f.args[1])?),
+                side(&f.args[0], &mut raw)?,
+                side(&f.args[1], &mut raw)?,
             ))
         }
         Expression::Literal(l) => {

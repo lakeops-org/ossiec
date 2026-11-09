@@ -2,20 +2,20 @@
 //! `ORDER BY` and `LIMIT`, parsed into a request for the planner.
 
 use polyglot_sql::expressions::Select;
-use polyglot_sql::{contains_aggregate, get_columns, DialectType, Expression, ExpressionWalk};
+use polyglot_sql::{contains_aggregate, DialectType, Expression, ExpressionWalk};
 
 use crate::graph::SemanticGraph;
 use crate::plan::{Direction, Nulls, OrderBy, Request};
 use crate::{Error, Result};
 
 use super::{
-    aggregated_measure, as_column, bare_field, bare_measure, base_measure_body,
-    classify_to_measure, default_measure_name, formula_leaves, is_aggregated, is_base_agg_expr,
-    is_measure_agg_expr, is_model_metric, is_single_base_aggregate, limit_u64, model_scoped,
-    order_field, order_key, parse_formula_or_agg, parse_from_clause, parse_having,
-    parse_measure_formula, resolve_agg, resolve_dim, resolve_measure, strip_alias, take_agg,
-    to_measure, unsupported, unwrap_paren, where_to_filters, Conjunct, EphemeralMetric, L2Formula,
-    Layer2Parsed, OrderCtx, OrderExpr, OutCol, ParsedFrom, StageCfg, UnevaluatedSpec,
+    aggregated_measure, as_column, bare_field, bare_measure, classify_to_measure,
+    default_measure_name, formula_leaves, is_aggregated, is_base_agg_expr, is_measure_agg_expr,
+    is_model_metric, limit_u64, model_scoped, order_field, order_key, parse_formula_or_agg,
+    parse_formula_with_plain, parse_from_clause, parse_having, parse_measure_formula, resolve_agg,
+    resolve_dim, resolve_measure, strip_alias, take_agg, to_measure, unsupported, unwrap_paren,
+    where_to_filters, Conjunct, EphemeralMetric, L2Formula, Layer2Parsed, OrderCtx, OrderExpr,
+    OutCol, ParsedFrom, RawAggs, StageCfg, UnevaluatedSpec,
 };
 
 /// `GROUP BY ALL` (§7.4) as the list it stands for: every selected column that isn't
@@ -153,45 +153,31 @@ pub(super) fn parse_stage_from(
                 continue;
             }
         }
-        if inner.contains(is_base_agg_expr) && !inner.contains(is_measure_agg_expr) {
-            // §7.2: an ordinary aggregate over fields, beside the measures. An
-            // ephemeral metric marked raw: evaluated over the joined rows as written.
-            if !is_single_base_aggregate(inner) {
-                return Err(unsupported(
-                    "Layer 2 plain aggregates are one SUM|COUNT|AVG|MIN|MAX(...) per select item for now; arithmetic on them, or with AGG(), is not implemented yet",
-                ));
-            }
+        if inner.contains(is_base_agg_expr) {
+            // §7.2: ordinary aggregates over fields, beside the measures, alone or
+            // in arithmetic with each other and with AGG(). Each is a raw leaf:
+            // evaluated over the joined rows as written.
             if cfg.derived && alias.is_none() {
                 return Err(unsupported(
                     "Layer 2 derived table: every aggregate needs an explicit alias so the outer query can name it (e.g. MAX(order_date) AS last_order)",
                 ));
             }
-            // `COUNT(*)` reads no field: it counts the joined rows whichever
-            // dataset holds it, so it sits on the first one in FROM.
-            let (owner, body) = match scope.bindings.first() {
-                Some(b) if get_columns(inner).is_empty() => {
-                    (b.dataset, unwrap_paren(inner).clone())
-                }
-                _ => base_measure_body(graph, scope, inner)?,
+            let mut raw = RawAggs {
+                seq: &mut *base_seq,
+                made: &mut ephemeral,
             };
-            let bare = super::measures::fresh_measure_name(graph, owner, base_seq);
-            let dataset = graph.datasets[owner].name.clone();
-            let metric = format!("{dataset}.{bare}");
-            ephemeral.push(EphemeralMetric {
-                name: metric.clone(),
-                owner,
-                body,
-                dataset,
-                bare,
-                raw: true,
-            });
-            metrics.push(metric.clone());
+            let formula = parse_formula_with_plain(graph, scope, inner, &mut raw)?;
+            for leaf in formula_leaves(&formula) {
+                if !metrics.contains(&leaf) {
+                    metrics.push(leaf);
+                }
+            }
             let out_name = match alias.clone() {
                 Some(a) => a,
                 None => polyglot_sql::generate(inner, DialectType::Generic)
                     .map_err(|e| Error::Internal(e.to_string()))?,
             };
-            measure_outputs.push((out_name.clone(), L2Formula::Agg(metric)));
+            measure_outputs.push((out_name.clone(), formula));
             outputs.push((out_name.clone(), out_name));
             continue;
         }
@@ -358,7 +344,11 @@ pub(super) fn parse_stage_from(
                     "Layer 2 HAVING makes a query aggregated, so its selected columns need GROUP BY".into(),
                 ));
             }
-            let (pushed, parsed) = parse_having(graph, scope, &h.this, &dimensions)?;
+            let mut raw = RawAggs {
+                seq: &mut *base_seq,
+                made: &mut ephemeral,
+            };
+            let (pushed, parsed) = parse_having(graph, scope, &h.this, &dimensions, &mut raw)?;
             for conjunct in pushed {
                 match conjunct {
                     Conjunct::Filter(f) => filters.push(f),
@@ -425,7 +415,16 @@ pub(super) fn parse_stage_from(
         } else {
             order_exprs.push(OrderExpr {
                 position,
-                key: order_key(graph, scope, &o.this, &dimensions)?,
+                key: order_key(
+                    graph,
+                    scope,
+                    &o.this,
+                    &dimensions,
+                    &mut RawAggs {
+                        seq: &mut *base_seq,
+                        made: &mut ephemeral,
+                    },
+                )?,
                 direction,
                 nulls,
             });
