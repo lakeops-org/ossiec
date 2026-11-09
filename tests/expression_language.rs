@@ -71,6 +71,12 @@ fn gaps(e: Engine) -> &'static [&'static str] {
         ],
         // Athena's SQL runs on Trino (see `Engine::host`).
         Engine::Athena => gaps(Engine::Trino),
+        // Spark, and Databricks, have no TIME type.
+        Engine::Databricks => &[
+            "CURRENT_TIME IS NOT NULL",
+            "CURRENT_TIME() IS NOT NULL",
+            "TIME '10:30:00' IS NOT NULL",
+        ],
         Engine::StarRocks => &[
             // A known limit, and the one wrong answer on this list: `UPPER` on a column
             // only changes ASCII letters on StarRocks, which has no Unicode form.
@@ -109,6 +115,7 @@ fn seed(e: Engine) -> String {
                 (Engine::Postgres, "DOUBLE") => "DOUBLE PRECISION",
                 (Engine::MySql | Engine::StarRocks, "TEXT") => "VARCHAR(64)",
                 (Engine::MySql | Engine::StarRocks, "TS") => "DATETIME",
+                (Engine::Databricks, "TEXT") => "STRING",
                 (_, "TEXT") => "VARCHAR",
                 (_, "TS") => "TIMESTAMP",
                 (_, "BOOL") => "BOOLEAN",
@@ -621,7 +628,7 @@ fn check_engine(e: Engine) {
         // Once per host: Athena and Trino share a container, and seeding again would
         // drop the tables under the other's running probes.
         static SEEDED: std::sync::Mutex<Vec<Engine>> = std::sync::Mutex::new(Vec::new());
-        let mut done = SEEDED.lock().unwrap();
+        let mut done = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
         if !done.contains(&e.host()) {
             let sql = seed(e);
             let sql = if e.host() == Engine::Trino {
@@ -695,6 +702,13 @@ fn every_construct_on_trino() {
 #[ignore]
 fn every_construct_on_athena() {
     check_engine(Engine::Athena);
+}
+
+/// Databricks' SQL, run on Apache Spark.
+#[test]
+#[ignore]
+fn every_construct_on_databricks() {
+    check_engine(Engine::Databricks);
 }
 
 #[test]
@@ -1475,6 +1489,42 @@ fn athena_compiles_every_construct_as_trino_does() {
     assert!(differ.is_empty(), "{}", differ.join("\n"));
 }
 
+/// Databricks' forms, which the engine tier checks on Spark; held here without
+/// Docker. Each is one polyglot would otherwise render with another answer.
+#[test]
+fn databricks_uses_spark_forms_that_answer_the_same() {
+    let on = |sql: &str| sql_on(&field(sql), Some(ossiec::DialectType::Databricks), None).unwrap();
+    // Boundaries crossed, not whole units.
+    let s = on("DATEDIFF(month, a, b)");
+    assert!(s.contains("TIMESTAMPDIFF(MONTH, DATE_TRUNC('MONTH'"), "{s}");
+    // Sunday is 0, not 1.
+    assert!(
+        on("EXTRACT(DAYOFWEEK FROM a)").contains("DAYOFWEEK("),
+        "DAYOFWEEK"
+    );
+    // Java format codes, with a literal letter quoted.
+    let s = on("TO_CHAR(a, 'YYYY-MM-DD\"T\"HH24:MI')");
+    assert!(s.contains("yyyy-MM-dd"), "{s}");
+    let s = on("TO_CHAR(a, 'YYYY-MM-DD HH24:MI:SS')");
+    assert!(s.contains("'yyyy-MM-dd HH:mm:ss'"), "{s}");
+    // Exact, not approximate.
+    let g = t("", "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)").unwrap();
+    let s = sql_for(&g, ossiec::DialectType::Databricks);
+    assert!(s.contains("PERCENTILE(") && !s.contains("APPROX"), "{s}");
+    // The whole match, not group 1.
+    assert!(
+        on("REGEXP_EXTRACT(a, 'x+')").contains(", 0)"),
+        "REGEXP_EXTRACT"
+    );
+    assert!(sql_on(
+        &field("CURRENT_TIME"),
+        Some(ossiec::DialectType::Databricks),
+        None
+    )
+    .unwrap_err()
+    .contains("no equivalent on Databricks"));
+}
+
 /// Where an engine can't give the same answer, the compile says so.
 #[test]
 fn an_engine_without_a_faithful_form_refuses() {
@@ -1627,6 +1677,7 @@ const SITE_ENGINES: &[(Engine, &str)] = &[
     (Engine::ClickHouse, "ClickHouse"),
     (Engine::Trino, "Trino"),
     (Engine::Athena, "Athena"),
+    (Engine::Databricks, "Databricks"),
     (Engine::StarRocks, "StarRocks"),
 ];
 
@@ -1710,7 +1761,7 @@ fn site_function_matrix_is_current() {
         "Every construct of `expression_language.md` that ossiec tests: {} in all. Each is compiled for each engine and run on fixed data, against a value worked out by hand. **Verified** means it returned that value. Anything else is listed under [Gaps](#gaps): a refusal (ossiec won't compile what the engine can't express faithfully), an engine error, or the one known wrong answer. The page is written from each engine's list of gaps, and CI holds that list exact: on every commit it runs every construct on every engine, and fails if one off the list doesn't return its value or one on the list does.\n\n",
         probes.len()
     ));
-    out.push_str("Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) is built on, so a function that Trino has and Athena lacks wouldn't show up here.\n\n");
+    out.push_str("Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) is built on, so a function that Trino has and Athena lacks wouldn't show up here. Databricks' column is ossiec's Databricks SQL run on Apache Spark 4.0, whose SQL Databricks runs, with ANSI mode on as in Databricks SQL.\n\n");
     out.push_str("## Summary\n\n| Section |");
     for (_, n) in SITE_ENGINES {
         out.push_str(&format!(" {n} |"));

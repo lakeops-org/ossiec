@@ -1,9 +1,11 @@
-//! The Docker engines (Trino, StarRocks, ClickHouse, Postgres, MySQL): which
-//! one, running SQL on it, and comparing its rows. Athena has no container:
+//! The Docker engines (Trino, StarRocks, ClickHouse, Postgres, MySQL, Spark):
+//! which one, running SQL on it, and comparing its rows. Athena has no container:
 //! its engine (v3) is Trino, so ossiec's Athena SQL runs on the Trino one.
+//! Databricks' SQL is Spark SQL, so it runs on the Spark container.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 
 use super::*;
 
@@ -17,6 +19,8 @@ pub enum Engine {
     MySql,
     /// ossiec's Athena dialect, run on the Trino container.
     Athena,
+    /// ossiec's Databricks dialect, run on Apache Spark.
+    Databricks,
 }
 
 impl Engine {
@@ -30,6 +34,7 @@ impl Engine {
             Engine::ClickHouse => D::ClickHouse,
             Engine::MySql => D::MySQL,
             Engine::Athena => D::Athena,
+            Engine::Databricks => D::Databricks,
         }
     }
 
@@ -49,7 +54,8 @@ impl Engine {
 pub fn seed_shop(engine: Engine) {
     static SEEDED: std::sync::Mutex<Vec<Engine>> = std::sync::Mutex::new(Vec::new());
     let host = engine.host();
-    let mut done = SEEDED.lock().unwrap();
+    // One engine failing to seed mustn't fail the others with a poisoned lock.
+    let mut done = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
     if done.contains(&host) {
         return;
     }
@@ -76,6 +82,9 @@ pub fn run(engine: Engine, sql: &str) -> Result<Vec<Vec<String>>, String> {
 
 /// [`run`], with Trino's catalog and schema for unqualified names.
 pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<String>>, String> {
+    if engine == Engine::Databricks {
+        return run_on_spark(sql);
+    }
     let (container, args, stdin): (&str, Vec<&str>, Option<String>) = match engine.host() {
         Engine::Postgres => (
             "ossiec-postgres",
@@ -142,6 +151,7 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
         ),
         Engine::DuckDb => unreachable!("DuckDB runs in-process"),
         Engine::Athena => unreachable!("Athena runs on its host, Trino"),
+        Engine::Databricks => unreachable!("Databricks runs on the Spark server"),
     };
     let mut cmd = Command::new("docker");
     cmd.arg("exec").arg("-i").arg(container).args(&args);
@@ -180,6 +190,98 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
                 .collect())
         })
         .collect()
+}
+
+/// `scripts/spark_sql_server.py`, running in the Spark container for as long as
+/// this test binary does, so the JVM starts once.
+struct Spark {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+const SPARK_MARK: &str = "\x1eOSSIEC ";
+
+impl Spark {
+    fn start() -> Result<Spark, String> {
+        let mut child = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                "ossiec-spark",
+                "python3",
+                "/ossiec/spark_sql_server.py",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("docker: {e}"))?;
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut spark = Spark {
+            _child: child,
+            stdin,
+            stdout,
+        };
+        spark.answer()?;
+        Ok(spark)
+    }
+
+    /// The next marked line, skipping whatever else Spark printed.
+    fn answer(&mut self) -> Result<serde_json::Value, String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err(
+                    "the Spark SQL server exited (is `scripts/engines.sh up` running?)".into(),
+                );
+            }
+            if let Some(json) = line.strip_prefix(SPARK_MARK) {
+                return serde_json::from_str(json).map_err(|e| format!("spark JSON: {e}: {json}"));
+            }
+        }
+    }
+
+    fn run(&mut self, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        let request = serde_json::json!({ "sql": sql }).to_string();
+        writeln!(self.stdin, "{request}").map_err(|e| e.to_string())?;
+        self.stdin.flush().map_err(|e| e.to_string())?;
+        let answer = self.answer()?;
+        if let Some(e) = answer.get("error") {
+            return Err(e.as_str().unwrap_or_default().to_string());
+        }
+        let rows = answer["rows"].as_array().cloned().unwrap_or_default();
+        Ok(rows
+            .iter()
+            .map(|r| {
+                r.as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_str().map_or_else(|| "NULL".to_string(), norm_text))
+                    .collect()
+            })
+            .collect())
+    }
+}
+
+fn run_on_spark(sql: &str) -> Result<Vec<Vec<String>>, String> {
+    static SPARK: Mutex<Option<Spark>> = Mutex::new(None);
+    let mut spark = SPARK.lock().unwrap_or_else(|e| e.into_inner());
+    if spark.is_none() {
+        *spark = Some(Spark::start()?);
+    }
+    let result = spark.as_mut().unwrap().run(sql);
+    if result.as_ref().is_err_and(|e| e.contains("server exited")) {
+        *spark = None;
+    }
+    result
 }
 
 /// Rows equal, with numbers compared to a relative tolerance: a DOUBLE ratio and

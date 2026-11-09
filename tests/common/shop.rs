@@ -116,6 +116,7 @@ pub fn seed_sql(engine: Engine) -> String {
                         );
                     }
                     (Engine::StarRocks | Engine::MySql, Ty::Text) => "VARCHAR(64)",
+                    (Engine::Databricks, Ty::Text) => "STRING",
                     (_, Ty::Int) => "INTEGER",
                     (_, Ty::Text) => "VARCHAR",
                     (_, Ty::Date) => "DATE",
@@ -144,14 +145,23 @@ pub fn seed_sql(engine: Engine) -> String {
                             format!("'{d}'")
                         }
                         (Ty::Date, d) => format!("DATE '{d}'"),
-                        // MySQL-family engines and ClickHouse treat `\\` in literals as an escape.
+                        // MySQL-family engines, ClickHouse and Spark treat `\\` in literals as an escape.
                         (Ty::Text, v)
                             if matches!(
                                 engine,
-                                Engine::StarRocks | Engine::ClickHouse | Engine::MySql
+                                Engine::StarRocks
+                                    | Engine::ClickHouse
+                                    | Engine::MySql
+                                    | Engine::Databricks
                             ) =>
                         {
-                            v.replace('\\', "\\\\")
+                            let v = v.replace('\\', "\\\\");
+                            // Spark reads `'O''Brien'` as two literals, `'O'` and `'Brien'`.
+                            if engine == Engine::Databricks {
+                                format!("'{}'", v[1..v.len() - 1].replace("''", "\\'"))
+                            } else {
+                                v
+                            }
                         }
                         (_, v) => v.to_string(),
                     })

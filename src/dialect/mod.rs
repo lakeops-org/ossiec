@@ -84,6 +84,8 @@ pub(crate) fn adapt(
     match target {
         DialectType::BigQuery => bigquery::adapt(ast, plan),
         DialectType::ClickHouse => clickhouse::adapt(ast, plan),
+        // Spark SQL, which Databricks runs: only the LIKE escape differs here.
+        DialectType::Databricks => literal_backslashes_in_like(ast),
         DialectType::MySQL => mysql::adapt(ast, plan),
         DialectType::PostgreSQL => postgres::adapt(ast, plan),
         DialectType::StarRocks => starrocks::adapt(ast, plan),
@@ -117,7 +119,7 @@ fn internal(e: polyglot_sql::Error) -> Error {
 }
 
 /// Engines that treat `\` as a `LIKE` escape by default (Postgres, ClickHouse,
-/// StarRocks, MySQL) would read `'C:\%'` as `C:%`. SQL declares escapes with
+/// StarRocks, MySQL, Databricks' Spark SQL) would read `'C:\%'` as `C:%`. SQL declares escapes with
 /// `ESCAPE`, so without one a backslash is an ordinary character (Trino, DuckDB).
 /// Doubling it in the pattern keeps it literal. Evidence: `like_with_a_backslash`.
 fn literal_backslashes_in_like(ast: Expression) -> Result<Expression> {

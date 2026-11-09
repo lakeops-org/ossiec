@@ -266,7 +266,7 @@ const CONCAT_BY_OPERATOR: &str = "__concat_by_operator";
 
 /// Where an engine needs its own form.
 fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
-    use DialectType::{ClickHouse, DuckDB, MySQL, PostgreSQL, StarRocks, Trino};
+    use DialectType::{ClickHouse, Databricks, DuckDB, MySQL, PostgreSQL, StarRocks, Trino};
     Some(match (target, key) {
         // DuckDB
         (DuckDB, "CURRENT_TIMESTAMP") => Sql("CURRENT_TIMESTAMP"),
@@ -401,6 +401,35 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
         (Trino, "TO_DATE:2") => Sql("CAST(__ossiec_exact_DATE_PARSE({0}, {1}) AS DATE)"),
         (Trino, "TO_TIMESTAMP:2") => Sql("__ossiec_exact_DATE_PARSE({0}, {1})"),
 
+        // Databricks (Spark SQL). Its `TRUNC` truncates dates only, to a week or
+        // longer, so polyglot's `TRUNC(ts, 'DAY')` is NULL; `DATE_TRUNC` takes every
+        // unit. Its `DATEDIFF`/`TIMESTAMPDIFF` count whole units, so both ends are
+        // truncated first, as on Trino. Sunday is 1. polyglot renders a numeric
+        // `TRUNC` as a cast to BIGINT, and `PERCENTILE_CONT` as the approximate one.
+        (Databricks, "EXTRACT:DAYOFWEEK") => Sql("__ossiec_exact_DAYOFWEEK({0}) - 1"),
+        (Databricks, "DATE_TRUNC:DAY") => Sql("__ossiec_exact_DATE_TRUNC('DAY', {0})"),
+        (Databricks, "DATE_TRUNC:HOUR") => Sql("__ossiec_exact_DATE_TRUNC('HOUR', {0})"),
+        (Databricks, "DATE_TRUNC:MINUTE") => Sql("__ossiec_exact_DATE_TRUNC('MINUTE', {0})"),
+        (Databricks, "DATE_TRUNC:SECOND") => Sql("__ossiec_exact_DATE_TRUNC('SECOND', {0})"),
+        (Databricks, "DATEDIFF:YEAR") => Sql("__ossiec_exact_TIMESTAMPDIFF(YEAR, __ossiec_exact_DATE_TRUNC('YEAR', {0}), __ossiec_exact_DATE_TRUNC('YEAR', {1}))"),
+        (Databricks, "DATEDIFF:QUARTER") => Sql("__ossiec_exact_TIMESTAMPDIFF(QUARTER, __ossiec_exact_DATE_TRUNC('QUARTER', {0}), __ossiec_exact_DATE_TRUNC('QUARTER', {1}))"),
+        (Databricks, "DATEDIFF:MONTH") => Sql("__ossiec_exact_TIMESTAMPDIFF(MONTH, __ossiec_exact_DATE_TRUNC('MONTH', {0}), __ossiec_exact_DATE_TRUNC('MONTH', {1}))"),
+        (Databricks, "DATEDIFF:WEEK") => Sql("__ossiec_exact_TIMESTAMPDIFF(WEEK, __ossiec_exact_DATE_TRUNC('WEEK', {0}), __ossiec_exact_DATE_TRUNC('WEEK', {1}))"),
+        (Databricks, "DATEDIFF:DAY") => Sql("__ossiec_exact_TIMESTAMPDIFF(DAY, __ossiec_exact_DATE_TRUNC('DAY', {0}), __ossiec_exact_DATE_TRUNC('DAY', {1}))"),
+        (Databricks, "DATEDIFF:HOUR") => Sql("__ossiec_exact_TIMESTAMPDIFF(HOUR, __ossiec_exact_DATE_TRUNC('HOUR', {0}), __ossiec_exact_DATE_TRUNC('HOUR', {1}))"),
+        (Databricks, "DATEDIFF:MINUTE") => Sql("__ossiec_exact_TIMESTAMPDIFF(MINUTE, __ossiec_exact_DATE_TRUNC('MINUTE', {0}), __ossiec_exact_DATE_TRUNC('MINUTE', {1}))"),
+        (Databricks, "DATEDIFF:SECOND") => Sql("__ossiec_exact_TIMESTAMPDIFF(SECOND, __ossiec_exact_DATE_TRUNC('SECOND', {0}), __ossiec_exact_DATE_TRUNC('SECOND', {1}))"),
+        (Databricks, "TRUNC") => Sql("CASE WHEN {0} >= 0 THEN __ossiec_exact_FLOOR({0}, {1}) ELSE __ossiec_exact_CEIL({0}, {1}) END"),
+        (Databricks, "PERCENTILE_CONT") => Sql("__ossiec_exact_PERCENTILE({1}, {0})"),
+        (Databricks, "REGEXP_EXTRACT") => Sql("__ossiec_exact_REGEXP_EXTRACT({0}, {1}, 0)"),
+        (Databricks, "EXTRACT:MILLISECOND") => Sql("CAST(__ossiec_exact_DATE_PART('SECOND', {0}) * 1000 AS BIGINT)"),
+        // Format codes are Java's (`translate_format`).
+        (Databricks, "TO_CHAR:2") => Sql("__ossiec_exact_DATE_FORMAT({0}, {1})"),
+        (Databricks, "TO_DATE:2") => Sql("__ossiec_exact_TO_DATE({0}, {1})"),
+        (Databricks, "TO_TIMESTAMP:2") => Sql("__ossiec_exact_TO_TIMESTAMP({0}, {1})"),
+        // No TIME type.
+        (Databricks, "CURRENT_TIME" | "TIME_LITERAL") => Refuse,
+
         // ClickHouse: function names are case-sensitive, and the plain string functions
         // count and change bytes, so non-ASCII text needs the UTF-8 ones.
         (ClickHouse, "UPPER") => Sql("upperUTF8({0})"),
@@ -441,37 +470,59 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
 
 /// Format tokens (expression language, "Date Formatting"), longest first so that
 /// `MONTH` isn't read as `MON`, with what each engine calls them.
-const FORMAT_TOKENS: &[(&str, &str, &str)] = &[
-    // token, strftime (DuckDB), MySQL and ClickHouse
-    ("YYYY", "%Y", "%Y"),
-    ("MONTH", "%B", "%M"),
-    ("HH24", "%H", "%H"),
-    ("HH12", "%I", "%I"),
-    ("MON", "%b", "%b"),
-    ("DAY", "%A", "%W"),
-    ("YY", "%y", "%y"),
-    ("MM", "%m", "%m"),
-    ("DD", "%d", "%d"),
-    ("DY", "%a", "%a"),
-    ("HH", "%I", "%I"),
-    ("MI", "%M", "%i"),
-    ("SS", "%S", "%S"),
-    ("AM", "%p", "%p"),
-    ("PM", "%p", "%p"),
+const FORMAT_TOKENS: &[(&str, &str, &str, &str)] = &[
+    // token, strftime (DuckDB), MySQL and ClickHouse, Java (Spark)
+    ("YYYY", "%Y", "%Y", "yyyy"),
+    ("MONTH", "%B", "%M", "MMMM"),
+    ("HH24", "%H", "%H", "HH"),
+    ("HH12", "%I", "%I", "hh"),
+    ("MON", "%b", "%b", "MMM"),
+    ("DAY", "%A", "%W", "EEEE"),
+    ("YY", "%y", "%y", "yy"),
+    ("MM", "%m", "%m", "MM"),
+    ("DD", "%d", "%d", "dd"),
+    ("DY", "%a", "%a", "EEE"),
+    ("HH", "%I", "%I", "hh"),
+    ("MI", "%M", "%i", "mm"),
+    ("SS", "%S", "%S", "ss"),
+    ("AM", "%p", "%p", "a"),
+    ("PM", "%p", "%p", "a"),
 ];
 
-fn translate_format(format: &str, strftime: bool) -> String {
+/// Which family of format codes an engine reads.
+#[derive(Clone, Copy, PartialEq)]
+enum FormatCodes {
+    Strftime,
+    MySql,
+    /// Java's `DateTimeFormatter` letters, where every other letter is a code
+    /// too, so literal letters are quoted (`'T'`) and a quote is doubled.
+    Java,
+}
+
+fn translate_format(format: &str, codes: FormatCodes) -> String {
     let mut out = String::with_capacity(format.len());
     let mut rest = format;
     'scan: while let Some(c) = rest.chars().next() {
-        for (token, s, m) in FORMAT_TOKENS {
+        for (token, s, m, j) in FORMAT_TOKENS {
             if let Some(after) = rest.strip_prefix(token) {
-                out.push_str(if strftime { s } else { m });
+                out.push_str(match codes {
+                    FormatCodes::Strftime => s,
+                    FormatCodes::MySql => m,
+                    FormatCodes::Java => j,
+                });
                 rest = after;
                 continue 'scan;
             }
         }
-        out.push(c);
+        match (codes, c) {
+            (FormatCodes::Java, '\'') => out.push_str("''"),
+            (FormatCodes::Java, c) if c.is_ascii_alphabetic() => {
+                out.push('\'');
+                out.push(c);
+                out.push('\'');
+            }
+            _ => out.push(c),
+        }
         rest = &rest[c.len_utf8()..];
     }
     out
@@ -487,7 +538,7 @@ fn engine_name(target: DialectType) -> String {
 
 /// Give every Ossie function its implementation for `target`.
 pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> {
-    use DialectType::{ClickHouse, DuckDB, MySQL, StarRocks, Trino};
+    use DialectType::{ClickHouse, Databricks, DuckDB, MySQL, StarRocks, Trino};
     // Athena takes Trino's forms and refusals; errors still name `target`.
     let engine = crate::dialect::runs_as(target);
     let failure = RefCell::new(None);
@@ -511,8 +562,10 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
             None => return Ok(Some(e)),
         };
         // A format string is Ossie's, and only a constant one can be translated.
-        if matches!(engine, DuckDB | MySQL | ClickHouse | StarRocks | Trino)
-            && matches!(c.key.as_str(), "TO_CHAR:2" | "TO_DATE:2" | "TO_TIMESTAMP:2")
+        if matches!(
+            engine,
+            DuckDB | MySQL | ClickHouse | StarRocks | Trino | Databricks
+        ) && matches!(c.key.as_str(), "TO_CHAR:2" | "TO_DATE:2" | "TO_TIMESTAMP:2")
         {
             let Some(format) = text(&c.args[1]).map(str::to_string) else {
                 failure
@@ -524,7 +577,12 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
                     )));
                 return Ok(Some(e));
             };
-            let format = translate_format(&format, engine == DuckDB);
+            let codes = match engine {
+                DuckDB => FormatCodes::Strftime,
+                Databricks => FormatCodes::Java,
+                _ => FormatCodes::MySql,
+            };
+            let format = translate_format(&format, codes);
             let format = if matches!(engine, MySQL | StarRocks | Trino) {
                 format.replace("%S", "%s")
             } else {

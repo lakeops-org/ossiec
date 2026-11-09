@@ -120,6 +120,12 @@ fn layer2_nested_athena() {
 
 #[test]
 #[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_databricks() {
+    sweep_layer2_nested(Engine::Databricks);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
 fn layer2_nested_starrocks() {
     sweep_layer2_nested(Engine::StarRocks);
 }
@@ -153,6 +159,13 @@ fn trino() {
 #[ignore = "needs Docker: scripts/engines.sh up"]
 fn athena() {
     sweep(Engine::Athena);
+}
+
+/// Databricks' SQL is Spark SQL, so it runs on Apache Spark.
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn databricks() {
+    sweep(Engine::Databricks);
 }
 
 #[test]
