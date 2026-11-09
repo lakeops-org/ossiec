@@ -49,7 +49,8 @@ impl Engine {
 pub fn seed_shop(engine: Engine) {
     static SEEDED: std::sync::Mutex<Vec<Engine>> = std::sync::Mutex::new(Vec::new());
     let host = engine.host();
-    let mut done = SEEDED.lock().unwrap();
+    // One engine failing to seed mustn't fail the others with a poisoned lock.
+    let mut done = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
     if done.contains(&host) {
         return;
     }
