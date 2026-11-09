@@ -621,7 +621,7 @@ fn check_engine(e: Engine) {
         // Once per host: Athena and Trino share a container, and seeding again would
         // drop the tables under the other's running probes.
         static SEEDED: std::sync::Mutex<Vec<Engine>> = std::sync::Mutex::new(Vec::new());
-        let mut done = SEEDED.lock().unwrap();
+        let mut done = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
         if !done.contains(&e.host()) {
             let sql = seed(e);
             let sql = if e.host() == Engine::Trino {

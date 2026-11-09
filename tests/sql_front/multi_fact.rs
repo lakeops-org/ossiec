@@ -322,6 +322,53 @@ fn a4_where_on_one_fact_narrows_the_other() {
     assert_eq!(got, vec![vec!["EU", "50.000000", "3.000000"]], "{sql}");
 }
 
+/// §7.3: `IN`, `NOT IN`, `BETWEEN` and `LIKE` on a plain column are never true on
+/// NULL, so like a comparison they go on the one fact and narrow the other.
+/// Orders: customer 1 has 10 ('web') and 20 ('store'), customer 2 has 30 ('web'),
+/// customer 3 has 5 ('webshop'). Tickets: customer 1 has one, 2 has two, 3 has three.
+#[test]
+fn a4_where_in_between_like_on_one_fact_narrow_the_other() {
+    let g = ossiec::from_yaml(&TWO_FACTS.replace(
+        "      - { name: amount, expression: { sql: amount } }\n",
+        "      - { name: amount, expression: { sql: amount } }\n      \
+         - { name: channel, expression: { sql: channel } }\n",
+    ))
+    .unwrap();
+    let db = two_facts_db();
+    db.execute_batch(
+        "ALTER TABLE orders ADD COLUMN channel VARCHAR;
+         UPDATE orders SET channel = CASE amount WHEN 10 THEN 'web' WHEN 20 THEN 'store'
+           WHEN 30 THEN 'web' ELSE 'webshop' END;",
+    )
+    .unwrap();
+    let run = |predicate: &str| {
+        let sql = format!(
+            "SELECT c.region, AGG(o.order_amt) AS amt, AGG(t.ticket_count) AS n FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             LEFT JOIN tickets t ON t.customer_id = c.id \
+             WHERE {predicate} GROUP BY c.region"
+        );
+        let c = ossiec::compile_layer2(&g, &sql, &two_facts_opts())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        (sorted(duckdb_rows(&db, &c.sql)), c.sql)
+    };
+    let eu_us = |eu: &'static str, eu_n: &'static str| {
+        vec![vec!["EU", eu, eu_n], vec!["US", "5.000000", "3.000000"]]
+    };
+    // 10 and 30: customers 1 and 2, both EU, with three tickets between them.
+    let (got, sql) = run("o.amount IN (10, 30)");
+    assert_eq!(got, vec![vec!["EU", "40.000000", "3.000000"]], "{sql}");
+    // 20 and 5: customer 1 (one ticket) and customer 3.
+    let (got, sql) = run("o.amount NOT IN (10, 30)");
+    assert_eq!(got, eu_us("20.000000", "1.000000"), "{sql}");
+    // 10, 20 and 5: customer 1 and customer 3.
+    let (got, sql) = run("o.amount BETWEEN 5 AND 20");
+    assert_eq!(got, eu_us("30.000000", "1.000000"), "{sql}");
+    // 'web', 'web' and 'webshop': 10 and 30 in EU (three tickets), 5 in US.
+    let (got, sql) = run("o.channel LIKE 'web%'");
+    assert_eq!(got, eu_us("40.000000", "3.000000"), "{sql}");
+}
+
 /// A predicate a padded row can pass, on one fact, keeps rows no leg has; and a
 /// predicate across both facts has no one leg to go on. Both refused, by name.
 #[test]
@@ -336,8 +383,20 @@ fn a4_where_on_one_fact_refusals() {
         );
         unsupported_msg(ossiec::compile_layer2(&g, &sql, &two_facts_opts()).unwrap_err())
     };
-    let m = refusal("o.amount IS NULL");
-    assert!(m.contains("one of several independent facts"), "{m}");
+    for predicate in [
+        "o.amount IS NULL",
+        // Not structured yet: each stays a free-form predicate.
+        "o.amount NOT BETWEEN 10 AND 20",
+        "NOT o.amount IN (10, 30)",
+        // SQL's NULL in a list: `NOT IN (10, NULL)` keeps no row.
+        "o.amount NOT IN (10, NULL)",
+    ] {
+        let m = refusal(predicate);
+        assert!(
+            m.contains("one of several independent facts"),
+            "{predicate}: {m}"
+        );
+    }
     let m = refusal("o.amount > t.id");
     assert!(m.contains("independent facts"), "{m}");
 }
