@@ -392,10 +392,15 @@ fn a4_where_on_one_fact_refusals() {
         "o.amount NOT IN (10, NULL)",
     ] {
         let m = refusal(predicate);
-        assert!(
-            m.contains("one of several independent facts"),
-            "{predicate}: {m}"
-        );
+        // It names what works, and tells NULL-passing tests from forms not yet handled.
+        for part in [
+            "one of several independent facts",
+            "IN, NOT IN, BETWEEN and LIKE",
+            "IS NULL",
+            "aren't implemented yet",
+        ] {
+            assert!(m.contains(part), "{predicate}: {m}");
+        }
     }
     let m = refusal("o.amount > t.id");
     assert!(m.contains("independent facts"), "{m}");
