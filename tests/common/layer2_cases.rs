@@ -389,6 +389,28 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.4: every level of a ROLLUP, stacked: subtotal rows carry NULLs.
+        name: "rollup_reports_every_level",
+        sql: "SELECT c.region, o.status, AGG(o.order_count) AS n FROM orders o \
+              JOIN customers c ON o.customer_id = c.id GROUP BY ROLLUP(c.region, o.status)",
+        reference: "SELECT c.region, o.status, COUNT(*) AS n FROM orders o \
+                    JOIN {customers} c ON o.customer_id = c.customer_id \
+                    GROUP BY ROLLUP(c.region, o.status)",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.4: no set has both columns, so a branch with no rows types them
+        // first (Postgres types UNION pairwise). A one-side measure, per level.
+        name: "grouping_sets_without_the_full_set",
+        sql: "SELECT o.status, c.segment, AGG(c.known_customers) AS k FROM customers c \
+              JOIN orders o ON o.customer_id = c.id \
+              GROUP BY GROUPING SETS ((o.status), (c.segment), ())",
+        reference: "SELECT o.status, c.segment, COUNT(DISTINCT c.customer_id) AS k \
+                    FROM {customers} c JOIN orders o ON o.customer_id = c.customer_id \
+                    GROUP BY GROUPING SETS ((o.status), (c.segment), ())",
+        script: false,
+    },
+    Layer2NestedCase {
         name: "one_side_average_dedup",
         sql: shop_joins!("SELECT c.region, AGG(p.average_stock) ", " GROUP BY c.region"),
         reference: "SELECT g.region, s.a

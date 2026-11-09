@@ -5,7 +5,7 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 ## Layer 2
 
 - **Set operators** (`UNION`, `INTERSECT`, `EXCEPT`), even over fields only (§7.8)
-- **`ROLLUP`, `CUBE`, `GROUPING SETS`** (§7.4)
+- **`GROUPING()`, and `ROLLUP`/`CUBE`/`GROUPING SETS` over derived tables or expressions** (§7.4)
 - **`SELECT *`** (§7.1)
 - **Subqueries in the select list, `WHERE`, `HAVING` and `ORDER BY`**, including scalar subqueries that read `AGG()` (§7.3, §7.7)
 - **`WHERE` on one of several independent facts' columns**, beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column: `IS NULL`, `NOT BETWEEN`, `NOT LIKE` and other predicates there, one on a field defined as an expression (`COALESCE(amount, 0)`), and one that reads two facts (§7.3)

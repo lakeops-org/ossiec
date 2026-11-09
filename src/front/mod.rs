@@ -64,6 +64,7 @@ mod cte;
 mod fold;
 mod formula;
 mod from;
+mod grouping;
 mod joins;
 mod measures;
 mod nested;

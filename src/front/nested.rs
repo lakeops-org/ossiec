@@ -25,7 +25,7 @@
 //! measure's input rows. [`Node::unique_key`] tracks this; the outer shell
 //! evaluates no `AGG()`, so it needs no such rule.
 
-use polyglot_sql::expressions::Select;
+use polyglot_sql::expressions::{Column, Select};
 use polyglot_sql::{generate, DialectType, Expression, ExpressionWalk};
 
 use super::catalog::{self, Layer2Catalog};
@@ -301,6 +301,9 @@ impl Compiler<'_> {
             )));
         }
         refuse_unsupported_items(sel)?;
+        if let Some(sets) = super::grouping::grouping_sets(sel)? {
+            return self.grouping(sel, &sets, depth, derived_mode, outer);
+        }
         match classify(sel)? {
             Kind::Agg => self.agg_stage(sel, depth, derived_mode, outer),
             Kind::Fold => self.fold(sel, depth, derived_mode, outer),
@@ -581,6 +584,182 @@ impl Compiler<'_> {
             pending,
         })
     }
+}
+
+impl Compiler<'_> {
+    /// §7.4: one stage per grouping set ([`super::grouping`]), stacked with
+    /// `UNION ALL` in the select list's column order, NULL where a set leaves a
+    /// grouping column out. The set with every grouping column goes first, so
+    /// each column has its type before a branch's NULL meets it (Postgres types
+    /// `UNION` pairwise, and two bare NULLs would become text). When no set has
+    /// them all, a branch that returns no rows types them. `ORDER BY` and
+    /// `LIMIT` apply to the stacked whole.
+    fn grouping(
+        &mut self,
+        sel: &Select,
+        sets: &[Vec<Column>],
+        depth: usize,
+        derived_mode: bool,
+        outer: &[String],
+    ) -> Result<Node> {
+        use super::grouping::{all_columns, branch, order_key, same};
+        if !matches!(classify(sel)?, Kind::Agg) {
+            return Err(unsupported(
+                "Layer 2 ROLLUP, CUBE and GROUPING SETS over derived tables are not supported yet",
+            ));
+        }
+        if sel.distinct || sel.offset.is_some() {
+            return Err(unsupported(
+                "Layer 2 ROLLUP, CUBE and GROUPING SETS with DISTINCT or OFFSET are not supported yet",
+            ));
+        }
+        let grouping_fn = |e: &Expression| {
+            matches!(e, Expression::Function(f) if f.name.eq_ignore_ascii_case("GROUPING"))
+                || matches!(e, Expression::Grouping(_))
+        };
+        if sel.expressions.iter().any(|e| e.contains(grouping_fn))
+            || sel
+                .having
+                .as_ref()
+                .is_some_and(|h| h.this.contains(grouping_fn))
+        {
+            return Err(unsupported(
+                "Layer 2 GROUPING() is not supported yet: a subtotal row's grouping columns are NULL",
+            ));
+        }
+        let all = all_columns(sets);
+        let covers = |s: &[Column]| all.iter().all(|c| s.iter().any(|x| same(x, c)));
+        let mut plan: Vec<(&[Column], bool)> = vec![];
+        match sets.iter().position(|s| covers(s)) {
+            Some(i) => {
+                plan.push((&sets[i], false));
+                plan.extend(
+                    sets.iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, s)| (s.as_slice(), false)),
+                );
+            }
+            None => {
+                plan.push((&all, true));
+                plan.extend(sets.iter().map(|s| (s.as_slice(), false)));
+            }
+        }
+        let mut pending = vec![];
+        let mut branch_names: Vec<Vec<String>> = vec![];
+        let mut first_outputs: Vec<OutCol> = vec![];
+        for (set, empty) in plan {
+            if self.derived_count >= MAX_DERIVED {
+                return Err(unsupported(format!(
+                    "Layer 2 allows at most {MAX_DERIVED} derived tables and grouping sets in one query"
+                )));
+            }
+            let placeholder = format!("__ossiec_deriv{}", self.derived_count);
+            self.derived_count += 1;
+            let b = branch(sel, &all, set, empty)?;
+            let node = self.agg_stage(&b, depth, derived_mode, outer)?;
+            branch_names.push(output_names(&node.ast)?);
+            if first_outputs.is_empty() {
+                first_outputs = node.outputs.clone();
+            }
+            pending.push((placeholder, node));
+        }
+        let names = branch_names[0].clone();
+        for (i, n) in names.iter().enumerate() {
+            if names[..i].iter().any(|p| p.eq_ignore_ascii_case(n)) {
+                return Err(Error::Request(format!(
+                    "Layer 2 with ROLLUP, CUBE or GROUPING SETS: two output columns are named `{n}`; give one an alias"
+                )));
+            }
+        }
+        let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+        let parts: Vec<String> = pending
+            .iter()
+            .zip(&branch_names)
+            .enumerate()
+            .map(|(i, ((placeholder, _), have))| {
+                let cols: Vec<String> = names
+                    .iter()
+                    .map(|n| {
+                        if have.iter().any(|h| h.eq_ignore_ascii_case(n)) {
+                            format!("__ossiec_g{i}.{} AS {}", q(n), q(n))
+                        } else {
+                            format!("NULL AS {}", q(n))
+                        }
+                    })
+                    .collect();
+                format!(
+                    "SELECT {} FROM {placeholder} AS __ossiec_g{i}",
+                    cols.join(", ")
+                )
+            })
+            .collect();
+        let mut text = format!(
+            "SELECT * FROM ({}) AS __ossiec_grouping",
+            parts.join(" UNION ALL ")
+        );
+        if let Some(ob) = &sel.order_by {
+            let keys: Vec<String> = ob
+                .expressions
+                .iter()
+                .map(|o| {
+                    let k = order_key(&o.this, &names, sel)?;
+                    let dir = if o.desc { "DESC" } else { "ASC" };
+                    let nulls = match o.nulls_first {
+                        Some(true) => " NULLS FIRST",
+                        Some(false) => " NULLS LAST",
+                        None => "",
+                    };
+                    Ok(format!("__ossiec_grouping.{} {dir}{nulls}", q(&names[k])))
+                })
+                .collect::<Result<_>>()?;
+            text.push_str(&format!(" ORDER BY {}", keys.join(", ")));
+        }
+        if let Some(l) = &sel.limit {
+            if l.percent {
+                return Err(unsupported("Layer 2 LIMIT PERCENT is not supported"));
+            }
+            text.push_str(&format!(" LIMIT {}", super::clauses::limit_u64(&l.this)?));
+        }
+        let ast = sql::parse(&text, DialectType::Generic).map_err(Error::Internal)?;
+        let outputs = names
+            .iter()
+            .map(|n| OutCol {
+                name: n.clone(),
+                kind: first_outputs
+                    .iter()
+                    .find(|o| o.name.eq_ignore_ascii_case(n))
+                    .map_or(OutKind::EvaluatedMeasure, |o| o.kind.clone()),
+            })
+            .collect();
+        Ok(Node {
+            ast,
+            outputs,
+            // Subtotal rows repeat the dimensions' NULLs.
+            unique_key: None,
+            pending,
+        })
+    }
+}
+
+/// The column names a compiled stage's statement returns, in order.
+fn output_names(ast: &Expression) -> Result<Vec<String>> {
+    let shape = || {
+        unsupported(
+            "Layer 2 ROLLUP, CUBE and GROUPING SETS with this query shape are not supported yet",
+        )
+    };
+    let Expression::Select(s) = ast else {
+        return Err(shape());
+    };
+    s.expressions
+        .iter()
+        .map(|e| match e {
+            Expression::Alias(a) => Ok(a.alias.name.clone()),
+            Expression::Column(c) => Ok(c.name.name.clone()),
+            _ => Err(shape()),
+        })
+        .collect()
 }
 
 /// A derived table's columns are addressed by name: duplicates are ambiguous.

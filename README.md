@@ -194,7 +194,7 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **Measure relations** (§7.2, §4.2) are written without `GROUP BY`, as in Appendix A.7: a query that aggregates can't return an unevaluated measure, whether it passes one through or defines it with `TO MEASURE`.
 
-**`GROUP BY ALL`** (§7.4) groups by every selected column that isn't an aggregate, and refuses a bare measure. **`DISTINCT`** (§7.8) works over fields and evaluated measures, and refuses an unevaluated one.
+**`GROUP BY ALL`** (§7.4) groups by every selected column that isn't an aggregate, and refuses a bare measure. **`ROLLUP`**, **`CUBE`** and **`GROUPING SETS`** report each measure at every level they name, with NULL in a subtotal row's grouping columns, as SQL does. **`DISTINCT`** (§7.8) works over fields and evaluated measures, and refuses an unevaluated one.
 
 **`WITH`** (§7.7) is a named derived table, so a measure passes through a CTE as it does through a subquery. `WITH RECURSIVE`, a column list and a set operator in a CTE are refused.
 
@@ -481,7 +481,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 2 `WHERE` comparison, `IN`, `NOT IN`, `BETWEEN` or `LIKE` on one of several independent facts' plain-column fields, narrowing the others
 - [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column (`IS NULL`, `NOT BETWEEN`, `NOT LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
 - [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
-- [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
+- [x] Layer 2 `ROLLUP`, `CUBE` and `GROUPING SETS` over columns, each grouping set compiled at its own level
+- [ ] Layer 2 subqueries in `WHERE`, the `GROUPING()` function, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
 - [ ] Publish to crates.io
