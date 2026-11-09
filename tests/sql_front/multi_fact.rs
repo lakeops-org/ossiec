@@ -341,3 +341,41 @@ fn a4_where_on_one_fact_refusals() {
     let m = refusal("o.amount > t.id");
     assert!(m.contains("independent facts"), "{m}");
 }
+
+/// A field that is an expression can map NULL to a value, so a comparison on it
+/// can keep the NULL-padded rows of a fact the other facts don't share:
+/// `COALESCE(amount, 0) = 0` holds for a customer without orders. Scoping it to
+/// the orders leg would drop that customer from the tickets leg, so it's refused.
+/// A comparison on a plain column is never true on NULL, and is scoped.
+#[test]
+fn a4_where_on_an_expression_field_is_refused() {
+    let yaml = TWO_FACTS.replace(
+        "      - { name: amount, expression: { sql: amount } }\n",
+        "      - { name: amount, expression: { sql: amount } }\n      \
+         - { name: amount_or_zero, expression: { sql: \"COALESCE(amount, 0)\" } }\n      \
+         - { name: always_one, expression: { sql: \"1\" } }\n",
+    );
+    assert_ne!(yaml, TWO_FACTS, "fixture changed: update the replacement");
+    let g = ossiec::from_yaml(&yaml).unwrap();
+    let compile = |predicate: &str| {
+        let sql = format!(
+            "SELECT c.region, AGG(o.order_amt), AGG(t.ticket_count) FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             LEFT JOIN tickets t ON t.customer_id = c.id \
+             WHERE {predicate} GROUP BY c.region"
+        );
+        ossiec::compile_layer2(&g, &sql, &two_facts_opts())
+    };
+    for predicate in [
+        "o.amount_or_zero = 0",
+        "o.amount_or_zero >= 0",
+        "o.always_one = 1",
+    ] {
+        let m = unsupported_msg(compile(predicate).unwrap_err());
+        assert!(
+            m.contains("one of several independent facts"),
+            "{predicate}: {m}"
+        );
+    }
+    compile("o.amount >= 0").expect("a comparison on a plain column is scoped");
+}

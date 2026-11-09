@@ -382,7 +382,9 @@ pub(crate) fn plan(
         .map(|(_, (_, e))| e.clone())
         .collect();
     // Each filter's datasets, and whether it rejects NULLs: a row a join pads with
-    // NULLs fails it, so it can't keep a row the facts don't share.
+    // NULLs fails it, so it can't keep a row the facts don't share. That holds for a
+    // comparison on a plain column, never true on NULL. A field that is an expression
+    // can map NULL to a value (`COALESCE(amount, 0) = 0`), so it doesn't count.
     let base_required = required.clone();
     let mut filter_nodes: Vec<BTreeSet<Node>> = vec![];
     let mut filter_strict: Vec<bool> = vec![];
@@ -390,8 +392,8 @@ pub(crate) fn plan(
         let (ds, fi, role) = g.field_by_name(&f.field)?;
         required.insert((ds, role));
         filter_nodes.push(BTreeSet::from([(ds, role)]));
-        filter_strict.push(f.op != Op::IsNull);
         let lhs = g.field_sql_as(ds, fi, &alias(g, (ds, role)), ctx);
+        filter_strict.push(f.op != Op::IsNull && matches!(lhs, Expression::Column(_)));
         if is_string(ds, fi) && !string_exprs.contains(&lhs) {
             string_exprs.push(lhs.clone());
         }
