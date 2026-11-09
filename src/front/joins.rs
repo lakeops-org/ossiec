@@ -43,6 +43,8 @@ pub(super) fn apply_consumer_joins(
         if patched {
             continue;
         }
+        let swapped = written_from_the_other_side(graph, logical, cj);
+        let cj = swapped.as_ref().unwrap_or(cj);
         let leg_i = consumer_join_leg(graph, logical, cj, rel)?;
         // ON must use the same aliases `tree_sql` uses for the leg (dataset
         // name for the root, `to_alias` for prior joins)—not the consumer SQL
@@ -105,6 +107,39 @@ pub(super) fn apply_consumer_joins(
         }
     }
     Ok(())
+}
+
+/// The same join seen from its other side, when no leg holds the side written
+/// first but one holds the other. `order_items i LEFT JOIN orders o` measuring
+/// `AGG(o.order_count)` has a leg rooted at `orders` and none with `order_items`;
+/// it is the relation `orders o RIGHT JOIN order_items i`, which attaches the
+/// lines to that leg as a fan-out, so the kind is mirrored (§7.6, §8.1).
+fn written_from_the_other_side(
+    graph: &SemanticGraph,
+    logical: &LogicalPlan,
+    cj: &ConsumerJoin,
+) -> Option<ConsumerJoin> {
+    let hosts = |ds, role| {
+        logical
+            .legs
+            .iter()
+            .any(|l| leg_hosts_attach(graph, l, ds, role))
+    };
+    // A role on the attach columns names how the first side is reached; the
+    // other side has no such role to take over.
+    if cj.attach_role.is_some() || hosts(cj.attach_ds, None) || !hosts(cj.other_ds, None) {
+        return None;
+    }
+    Some(ConsumerJoin {
+        rel: cj.rel,
+        kind: cj.kind.mirrored(),
+        reverse: !cj.reverse,
+        attach_ds: cj.other_ds,
+        attach_alias: cj.other_alias.clone(),
+        other_ds: cj.attach_ds,
+        other_alias: cj.attach_alias.clone(),
+        attach_role: None,
+    })
 }
 
 /// `CROSS JOIN` has no relationship. One measure leg: either replace the planned

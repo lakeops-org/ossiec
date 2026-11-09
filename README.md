@@ -480,7 +480,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [ ] Layer 2 quoted references to a derived table's columns follow the identifier rules (today they match regardless of quotes)
 - [x] Layer 2 `WHERE` comparison on one of several independent facts' plain-column fields, narrowing the others
 - [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison on a plain column (`IS NULL`, `IN`, `LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
-- [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
+- [x] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`), as `orders o RIGHT JOIN order_items i` is
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)

@@ -328,6 +328,85 @@ fn a5_right_join_to_the_many_side_of_a_fanout_dedups() {
     );
 }
 
+/// A fan-out written from the many side (§7.6): `order_items i LEFT JOIN orders o`
+/// is the relation `orders o RIGHT JOIN order_items i`, so it counts orders as
+/// that form does, de-duplicated by primary key. Grouped by the line's order id,
+/// line 4's order 9 doesn't exist: `LEFT` keeps its group with no orders, `INNER`
+/// drops it, and `FULL` also keeps order 3, which has no lines.
+#[test]
+fn a5_fanout_written_from_the_many_side_dedups() {
+    let g = ossiec::from_yaml(FANOUT).unwrap();
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE orders (order_id INTEGER);
+         INSERT INTO orders VALUES (1), (2), (3);
+         CREATE TABLE order_items (line_id INTEGER, order_id INTEGER);
+         INSERT INTO order_items VALUES (1, 1), (2, 1), (3, 2), (4, 9);",
+    )
+    .unwrap();
+    for (join, want) in [
+        (
+            "LEFT JOIN",
+            vec![vec!["1", "1"], vec!["2", "1"], vec!["9", "0"]],
+        ),
+        ("JOIN", vec![vec!["1", "1"], vec!["2", "1"]]),
+        (
+            "FULL JOIN",
+            vec![
+                vec!["1", "1"],
+                vec!["2", "1"],
+                vec!["9", "0"],
+                vec!["NULL", "1"],
+            ],
+        ),
+    ] {
+        let sql = format!(
+            "SELECT i.order_id, AGG(o.order_count) FROM order_items i \
+             {join} orders o ON i.order_id = o.id GROUP BY i.order_id"
+        );
+        let c = ossiec::compile_layer2(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let reference = format!(
+            "SELECT i.order_id, COUNT(DISTINCT o.order_id) FROM order_items i \
+             {join} orders o ON i.order_id = o.order_id GROUP BY i.order_id"
+        );
+        let got = sorted(duckdb_rows(&db, &c.sql));
+        assert_eq!(
+            got,
+            sorted(duckdb_rows(&db, &reference)),
+            "{join}\n{}",
+            c.sql
+        );
+        let mut want: Vec<Vec<String>> = want
+            .into_iter()
+            .map(|r| r.into_iter().map(String::from).collect())
+            .collect();
+        want.sort();
+        let got: Vec<Vec<String>> = got
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| v.trim_end_matches(".000000").to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(got, want, "{join}\n{}", c.sql);
+    }
+    // The same relation written either way compiles to the same SQL.
+    let from_lines = ossiec::compile_layer2(
+        &g,
+        "SELECT AGG(o.order_count) FROM order_items i LEFT JOIN orders o ON i.order_id = o.id",
+        &duck(),
+    )
+    .unwrap();
+    let from_orders = ossiec::compile_layer2(
+        &g,
+        "SELECT AGG(o.order_count) FROM orders o RIGHT JOIN order_items i ON i.order_id = o.id",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(from_lines.sql, from_orders.sql);
+}
+
 /// Two-facts `orders` has no primary key, so null-extended customers are kept out
 /// of `SUM` by a FILTER on the join key rather than by de-duplication. `tickets`
 /// has one, and its `COUNT(*)` must not count a customer without tickets.
