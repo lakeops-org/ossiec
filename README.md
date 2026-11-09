@@ -479,8 +479,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Fix: Databricks SQL gave wrong answers for `DATEDIFF`, `DATE_TRUNC` below a week, day of week, `TRUNC(x, n)`, `PERCENTILE_CONT` and a backslash in `LIKE`, and failed on format strings, `REGEXP_EXTRACT` and `EXTRACT(MILLISECOND)`; each has a Spark form, run on Spark in every tier but TPC-DS
 - [ ] Layer 2 `CROSS JOIN` (or comma `FROM`) spanning independent facts: refused today
 - [ ] Layer 2 quoted references to a derived table's columns follow the identifier rules (today they match regardless of quotes)
-- [x] Layer 2 `WHERE` comparison on one of several independent facts' plain-column fields, narrowing the others
-- [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison on a plain column (`IS NULL`, `IN`, `LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
+- [x] Layer 2 `WHERE` comparison, `IN`, `NOT IN`, `BETWEEN` or `LIKE` on one of several independent facts' plain-column fields, narrowing the others
+- [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column (`IS NULL`, `NOT BETWEEN`, `NOT LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
 - [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`

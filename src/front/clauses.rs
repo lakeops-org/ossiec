@@ -53,6 +53,49 @@ pub(super) fn where_to_filters(
             }),
             None => None,
         },
+        // `col LIKE 'pattern'`; with ESCAPE, or `NOT LIKE`, it stays a predicate.
+        Expression::Like(l) if l.escape.is_none() && l.quantifier.is_none() => {
+            match (as_column(&l.left), literal_json(&l.right)) {
+                (Some(col), Some(v @ serde_json::Value::String(_))) => Some(Filter {
+                    field: resolve_dim(graph, scope, col)?,
+                    op: Op::Like,
+                    value: Some(v),
+                    values: vec![],
+                }),
+                _ => None,
+            }
+        }
+        // `col [NOT] IN (literal, ...)`. A NULL in the list stays in the predicate,
+        // where it keeps SQL's meaning (`NOT IN (1, NULL)` keeps no row).
+        Expression::In(i) if i.query.is_none() && i.unnest.is_none() && !i.global => {
+            let values: Option<Vec<serde_json::Value>> = i
+                .expressions
+                .iter()
+                .map(|x| literal_json(x).filter(|v| !v.is_null()))
+                .collect();
+            match (as_column(&i.this), values) {
+                (Some(col), Some(values)) if !values.is_empty() => Some(Filter {
+                    field: resolve_dim(graph, scope, col)?,
+                    op: if i.not { Op::NotIn } else { Op::In },
+                    value: None,
+                    values,
+                }),
+                _ => None,
+            }
+        }
+        // `col BETWEEN lo AND hi`; `NOT BETWEEN` and SYMMETRIC stay predicates.
+        Expression::Between(b) if !b.not && b.symmetric.is_none() => {
+            let bound = |x: &Expression| literal_json(x).filter(|v| !v.is_null());
+            match (as_column(&b.this), bound(&b.low), bound(&b.high)) {
+                (Some(col), Some(lo), Some(hi)) => Some(Filter {
+                    field: resolve_dim(graph, scope, col)?,
+                    op: Op::Between,
+                    value: None,
+                    values: vec![lo, hi],
+                }),
+                _ => None,
+            }
+        }
         _ => None,
     };
     Ok(vec![match structured {

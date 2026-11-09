@@ -132,7 +132,7 @@ pub(super) fn scope_filters(
             }
             [_] => {
                 return Err(Error::Unsupported(
-                    "Layer 2 WHERE on one of several independent facts is supported for a comparison (=, <>, <, <=, >, >=) on a field that is a plain column; an IS NULL test, a field that is an expression such as COALESCE(…), or another predicate there could also keep the rows the other facts' joins pad with NULLs, which isn't implemented yet".into(),
+                    "Layer 2 WHERE on one of several independent facts' columns is supported for =, <>, <, <=, >, >=, IN, NOT IN, BETWEEN and LIKE against literals, on a field that is a plain column. An IS NULL test, or a comparison on a field the model defines as an expression (such as COALESCE(…)), is true on the rows the other facts' joins pad with NULLs, so it would keep rows those facts don't share; other predicates there (NOT BETWEEN, NOT LIKE, an IN list with NULL, one over several columns) aren't implemented yet".into(),
                 ))
             }
             _ => return Ok(None),
