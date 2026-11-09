@@ -340,6 +340,7 @@ impl Compiler<'_> {
             derived: derived_mode,
             outer,
             to_measures: &to_measures,
+            compiled: &[],
         };
         let parsed_from = parse_stage_prep(&self.graph, sel, &cfg)?;
 
@@ -360,6 +361,11 @@ impl Compiler<'_> {
         // a placeholder until `resolve` puts it in place.
         let (sel, subqueries) = self.where_subqueries(sel, depth, &inner_outer)?;
         let sel = &sel;
+        let where_placeholders: Vec<String> = subqueries.iter().map(|(p, _)| p.clone()).collect();
+        let cfg = StageCfg {
+            compiled: &where_placeholders,
+            ..cfg
+        };
         let mut base_seq = self.base_seq;
         let mut parsed =
             parse_stage_from(&self.graph, sel, &cfg, parsed_from, &schemas, &mut base_seq)?;

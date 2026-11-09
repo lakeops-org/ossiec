@@ -27,14 +27,17 @@ pub(super) enum Conjunct {
     Predicate(String),
 }
 
+/// `compiled` names the placeholders of the `WHERE` subqueries compiled for this
+/// stage; any other subquery is refused.
 pub(super) fn where_to_filters(
     graph: &SemanticGraph,
     scope: &QueryScope,
     e: &Expression,
+    compiled: &[String],
 ) -> Result<Vec<Conjunct>> {
     if let Expression::And(a) = e {
-        let mut out = where_to_filters(graph, scope, &a.left)?;
-        out.extend(where_to_filters(graph, scope, &a.right)?);
+        let mut out = where_to_filters(graph, scope, &a.left, compiled)?;
+        out.extend(where_to_filters(graph, scope, &a.right, compiled)?);
         return Ok(out);
     }
     let structured = match e {
@@ -100,7 +103,7 @@ pub(super) fn where_to_filters(
     };
     Ok(vec![match structured {
         Some(f) => Conjunct::Filter(f),
-        None => Conjunct::Predicate(where_predicate(graph, scope, e)?),
+        None => Conjunct::Predicate(where_predicate(graph, scope, e, compiled)?),
     }])
 }
 
@@ -130,6 +133,12 @@ pub(super) fn parse_having(
     let mut pushed = vec![];
     let mut kept: Vec<Expression> = vec![];
     for c in conjuncts {
+        // Before any conjunct goes to WHERE: no subquery here was compiled.
+        if c.contains(|x| is_query(x) || is_subquery(x)) {
+            return Err(unsupported(
+                "Layer 2 HAVING does not support subqueries yet",
+            ));
+        }
         if contains_window_function(c) {
             return Err(unsupported(
                 "Layer 2 HAVING takes aggregates, AGG(measure) and selected columns; a window is not supported",
@@ -147,7 +156,7 @@ pub(super) fn parse_having(
             }
         }
         if !has_agg && !get_columns(c).is_empty() {
-            pushed.extend(where_to_filters(graph, scope, c)?);
+            pushed.extend(where_to_filters(graph, scope, c, &[])?);
         } else {
             kept.push(c.clone());
         }
@@ -340,23 +349,24 @@ pub(super) fn where_predicate(
     graph: &SemanticGraph,
     scope: &QueryScope,
     e: &Expression,
+    compiled: &[String],
 ) -> Result<String> {
     if contains_aggregate(e) || contains_window_function(e) || e.contains(is_measure_agg_expr) {
         return Err(Error::Request(
             "Layer 2 WHERE cannot contain an aggregate or a window function; use HAVING, or a measure's FILTER".into(),
         ));
     }
-    // Subqueries were compiled on their own before this (`Compiler::where_subqueries`);
-    // what's left here is their placeholders, or one that couldn't be.
-    let inside_placeholder = |x: &Expression| {
-        e.contains(|p| {
-            sql::is_subquery_placeholder(p)
-                && (std::ptr::eq(p, x) || p.contains(|y| std::ptr::eq(y, x)))
-        })
+    // Subqueries were compiled on their own before this (`Compiler::where_subqueries`),
+    // and what's left is their placeholders: only those, by name, stand here.
+    let ours = |p: &Expression| {
+        sql::subquery_placeholder(p).is_some_and(|name| compiled.iter().any(|c| c == name))
     };
-    if e.contains(|x| (is_query(x) || is_subquery(x)) && !inside_placeholder(x)) {
+    let inside_ours = |x: &Expression| {
+        e.contains(|p| ours(p) && (std::ptr::eq(p, x) || p.contains(|y| std::ptr::eq(y, x))))
+    };
+    if e.contains(|x| (is_query(x) || is_subquery(x)) && !inside_ours(x)) {
         return Err(unsupported(
-            "Layer 2 subquery in WHERE could not be compiled on its own",
+            "Layer 2 subqueries in WHERE are compiled by compile_sql; sql_to_request returns one request and takes none",
         ));
     }
     let failure = RefCell::new(None);

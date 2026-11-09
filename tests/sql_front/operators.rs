@@ -163,6 +163,39 @@ fn where_reads_subqueries() {
             .to_string();
         assert!(e.contains(want), "{predicate}: {e}");
     }
+    // A subquery shaped like ossiec's stand-in for a compiled one is nothing of
+    // the kind when the consumer writes it: in WHERE it is compiled as a query
+    // (and has no such dataset), and HAVING and sql_to_request take none.
+    let stand_in = "status IN (SELECT * FROM __ossiec_deriv0 AS x)";
+    for sql in [
+        format!("SELECT status, AGG(order_count) FROM orders WHERE {stand_in} GROUP BY status"),
+        format!("SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING {stand_in}"),
+    ] {
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(&sql)
+            .to_string();
+        assert!(!e.contains("internal"), "{sql}: {e}");
+    }
+    let e = ossiec::compile_sql(
+        &g,
+        &format!("SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING {stand_in}"),
+        &duck(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("HAVING does not support subqueries"), "{e}");
+    for predicate in [
+        stand_in,
+        "customer_id IN (SELECT c.id FROM customers c WHERE c.segment = 'smb')",
+    ] {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let e = ossiec::sql_to_request(&g, &sql)
+            .expect_err(predicate)
+            .to_string();
+        assert!(e.contains("compiled by compile_sql"), "{predicate}: {e}");
+    }
 }
 
 /// §7.5: `HAVING` may contain `AGG()` and scalar expressions over it.
