@@ -498,6 +498,14 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 
 New planner behaviour needs a **correctness** case (a seed row that would expose the bug, plus reference SQL), not just a golden file.
 
+**PR titles** follow [Conventional Commits](https://www.conventionalcommits.org): `type(scope): summary`, lower case, saying what changes for the user. A workflow checks the title against [.github/pr-title-checker-config.json](.github/pr-title-checker-config.json).
+
+- **Types:** `feat` (new behaviour), `fix` (wrong results or a bug), `docs`, `test`, `refactor`, `perf`, `ci`, `chore` (dependencies, tooling). Add `!` for a breaking change: `feat(layer2)!: …`.
+- **Scopes** (optional): `layer1`, `layer2`, `layer3`, `engines`, `cli`, `site`, `deps`.
+- **Branches** match the title: `feat/layer2-plain-aggregate-arithmetic`, `fix/duplicate-join-alias`.
+
+For example: `feat(layer2): arithmetic on plain aggregates`, `fix(layer2): refuse a repeated alias in every join form`.
+
 ## Acknowledgements
 
 - [Apache Ossie](https://github.com/apache/ossie): the spec and the example models vendored in `tests/fixtures/ossie` (Apache-2.0).
