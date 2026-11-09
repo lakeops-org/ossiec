@@ -255,7 +255,7 @@ pub(crate) fn render_compiled(
 ) -> Result<Compiled> {
     let (source_name, source) = ctx.source_dialect()?;
     let target = opts.target.unwrap_or(source);
-    let mut sql = sql::render(&ast, source, target, opts.pretty)?;
+    let mut sql = sql::render(&ast, source, dialect::runs_as(target), opts.pretty)?;
     if let Some(target) = opts.target {
         sql = dialect::finish(sql, target, opts.pretty)?;
     }

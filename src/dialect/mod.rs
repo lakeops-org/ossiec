@@ -63,6 +63,18 @@ pub(crate) fn supports_null_safe_eq(target: Option<DialectType>) -> bool {
     }
 }
 
+/// The engine whose SQL `target` runs. Athena's engine (v3) is Trino, and its
+/// queries are Trino's: same functions, same type names (polyglot's Athena dialect
+/// writes Hive's DDL types such as `STRING`, which an Athena query rejects). So an
+/// Athena query is rendered, and its functions lowered, as Trino's. Evidence: the
+/// engine tier runs every Athena case on Trino.
+pub(crate) fn runs_as(target: DialectType) -> DialectType {
+    match target {
+        DialectType::Athena => DialectType::Trino,
+        t => t,
+    }
+}
+
 /// Hook 1: rewrite the dialect-neutral AST for `target`. Runs before rendering.
 pub(crate) fn adapt(
     ast: Expression,

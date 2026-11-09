@@ -387,7 +387,7 @@ One leniency: Ossie requires `dataset.field` in model-scoped metrics, but the co
 
 ```console
 cargo test                        # everything (the first run downloads DuckDB's prebuilt library)
-scripts/engines.sh up && cargo test --test engines -- --ignored   # same cases on Postgres, Trino, StarRocks, ClickHouse, MySQL
+scripts/engines.sh up && cargo test --test engines -- --ignored   # same cases on Postgres, Trino, StarRocks, ClickHouse, MySQL, and Athena's SQL on Trino
 cargo test --test tpcds -- --include-ignored                      # TPC-DS on all six engines (DuckDB alone needs no Docker)
 cargo test --test correctness     # answers vs hand-written SQL on DuckDB
 UPDATE_GOLDEN=1 cargo test --test golden   # re-snapshot SQL after an intended change
@@ -425,7 +425,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 
 **Spec leniency:** bare names in model-scoped metrics are accepted with a warning.
 
-**Engine coverage:** answers are verified on DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL, on the shop cases, TPC-DS and fuzzing. Athena, Snowflake, BigQuery, Databricks and Redshift are compile-checked only. See [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md) to move an engine up.
+**Engine coverage:** answers are verified on DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL, on the shop cases, TPC-DS and fuzzing. Athena's SQL is Trino's (its engine v3 is Trino), and it runs on the Trino container for every tier except TPC-DS. Snowflake, BigQuery, Databricks and Redshift are compile-checked only. See [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md) to move an engine up.
 
 **Downstream translators:** if you emit `generic` SQL (no `--dialect`) and translate it elsewhere, ossiec's [dialect rules](src/dialect/) don't apply. For example, a translator that maps `LAG` to ClickHouse's `lag` gets `0` instead of NULL for the first row. Compile for the engine instead.
 
@@ -452,7 +452,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Join-root planning, inline and primary-key de-duplicated terms, `UNION ALL` stacking
 - [x] `FILTER` kept where supported / CASE elsewhere, time grains, metric filters, vendor-dialect preference
 - [x] CLI: `validate`, `describe`, `compile`, `compile-sql`
-- [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse, MySQL
+- [x] Cross-engine test tier: Postgres, Trino, StarRocks, ClickHouse, MySQL, and Athena's SQL on Trino
 - [x] TPC-DS: Ossie's example model on real data, plus official queries q3, q7, q26, q42, q48, q52, q55, q98
 - [x] Official TPC-DS queries q3, q7, q12, q26, q42, q43, q48, q52, q55, q96, q98
 - [ ] More official TPC-DS queries (many of the 99 need constructs no semantic request expresses: correlated subqueries, cross-channel set operations, ROLLUP)
@@ -475,6 +475,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Fix: a join on one of several independent facts left the others unrestricted, and two `COUNT(*)` metrics on different facts shared one answer
 - [x] Fix: a Layer 2 comma `FROM` (`FROM customers c, orders o, tickets t`) was read as independent facts; it is a `CROSS JOIN`, as in SQL
 - [x] Fix: a quoted Layer 2 measure name (`AGG("m")`) ignored its quotes; it now follows the identifier rules
+- [x] Fix: Athena SQL used polyglot's Athena dialect and gave wrong answers (`DATEDIFF`, `TO_CHAR`, day of week, `SPLIT_PART`, exact percentiles as `APPROX_PERCENTILE`, `CAST(… AS STRING)`); it is now Trino's, run on Trino in every tier but TPC-DS
 - [ ] Layer 2 `CROSS JOIN` (or comma `FROM`) spanning independent facts: refused today
 - [ ] Layer 2 quoted references to a derived table's columns follow the identifier rules (today they match regardless of quotes)
 - [x] Layer 2 `WHERE` comparison on one of several independent facts' plain-column fields, narrowing the others
