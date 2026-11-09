@@ -79,6 +79,133 @@ fn where_accepts_any_row_predicate() {
     }
 }
 
+/// §7.4: `ROLLUP`, `CUBE` and `GROUPING SETS` report each measure at every level
+/// they name. Each answer is DuckDB's own grouping over the same rows, so a
+/// subtotal row's NULLs, `HAVING` on a grouping column, and a one-side measure
+/// counted once per level all follow SQL.
+#[test]
+fn grouping_sets_report_every_level() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let from = "FROM orders o JOIN customers c ON o.customer_id = c.id";
+    let raw = "FROM orders o JOIN (SELECT * FROM raw_customers WHERE NOT deleted) c \
+               ON o.customer_id = c.customer_id";
+    for (select, plain, rest) in [
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status)",
+        ),
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY CUBE(c.region, o.status)",
+        ),
+        // No set has both columns: a branch with no rows types them first.
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY GROUPING SETS ((c.region), (o.status))",
+        ),
+        (
+            "o.status, c.region, AGG(o.order_count) AS n",
+            "o.status, c.region, COUNT(*) AS n",
+            "GROUP BY o.status, ROLLUP(c.region)",
+        ),
+        (
+            "c.region, AGG(o.order_count) AS n",
+            "c.region, COUNT(*) AS n",
+            "GROUP BY GROUPING SETS ((c.region), ())",
+        ),
+        // HAVING reads a subtotal row's grouping column as NULL: these drop it.
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) HAVING c.region = 'EU'",
+        ),
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) HAVING AGG(o.order_count) > 1",
+        ),
+    ] {
+        let sql = format!("SELECT {select} {from} {rest}");
+        let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{rest}: {e}"));
+        let reference = format!(
+            "SELECT {plain} {raw} {}",
+            rest.replace("AGG(o.order_count)", "COUNT(*)")
+        );
+        let want = sorted(duckdb_rows(&db, &reference));
+        assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{rest}\n{}", c.sql);
+        assert!(want.len() > 1, "{rest}: proves nothing");
+    }
+    // A one-side measure counts each customer once at every level, the grand
+    // total included.
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT o.status, AGG(c.known_customers) AS k FROM customers c \
+         JOIN orders o ON o.customer_id = c.id GROUP BY ROLLUP(o.status)",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(
+            &db,
+            &format!("SELECT o.status, COUNT(DISTINCT c.customer_id) AS k {raw} GROUP BY ROLLUP(o.status)")
+        )),
+        "{}",
+        c.sql
+    );
+    // ORDER BY and LIMIT apply to the stacked whole, by output name or position.
+    let c = ossiec::compile_sql(
+        &g,
+        &format!(
+            "SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY ROLLUP(c.region) \
+             ORDER BY n DESC, 1 NULLS FIRST LIMIT 2"
+        ),
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(
+            &db,
+            &format!(
+                "SELECT c.region, COUNT(*) AS n {raw} GROUP BY ROLLUP(c.region) \
+                 ORDER BY n DESC, 1 NULLS FIRST LIMIT 2"
+            )
+        ),
+        "{}",
+        c.sql
+    );
+    for (rest, want) in [
+        ("GROUP BY ROLLUP(UPPER(c.region))", "take columns"),
+        (
+            "GROUP BY ROLLUP(c.region, ROLLUP(o.status))",
+            "take columns",
+        ),
+        (
+            "GROUP BY CUBE(c.region, o.status, c.segment, c.name, o.id)",
+            "at most 4",
+        ),
+        (
+            "GROUP BY ROLLUP(c.region) ORDER BY AGG(o.order_count)",
+            "output column",
+        ),
+        (
+            "GROUP BY ROLLUP(c.region) HAVING GROUPING(c.region) = 0",
+            "GROUPING()",
+        ),
+    ] {
+        let sql = format!("SELECT c.region, AGG(o.order_count) AS n {from} {rest}");
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(rest)
+            .to_string();
+        assert!(e.contains(want), "{rest}: {e}");
+    }
+}
+
 /// §7.5: `HAVING` may contain `AGG()` and scalar expressions over it.
 #[test]
 fn having_keeps_or_drops_finished_groups() {

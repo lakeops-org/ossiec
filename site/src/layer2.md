@@ -29,7 +29,7 @@ Compile from the CLI with `ossiec compile-sql model.yaml query.sql --dialect tri
 | Plain aggregates beside measures, and arithmetic on them | `MAX(order_date)`, `SUM(revenue) / COUNT(*)`, `COUNT(*) - AGG(order_count)` | §7.2 |
 | Any join kind along a model relationship | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, from either side; a comma `FROM` is a `CROSS JOIN`, as in SQL | §7.6, A.5, A.6 |
 | `WHERE` as any row predicate | comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT`, across datasets | §7.3 |
-| `GROUP BY`, `GROUP BY ALL` | `GROUP BY ALL` groups by the selected non-aggregates | §7.4 |
+| `GROUP BY`, `GROUP BY ALL`, `ROLLUP`, `CUBE`, `GROUPING SETS` | `GROUP BY ALL` groups by the selected non-aggregates. Each grouping set reports every measure at its own level, as SQL does: a subtotal row's grouping columns are NULL, `HAVING` reads them as NULL, and a one-side measure counts each row once per level | §7.4 |
 | `HAVING`, `ORDER BY`, `LIMIT` | `ORDER BY AGG(revenue) DESC LIMIT 10`, `HAVING COUNT(*) > 5`; neither needs to be selected | §7.5 |
 | Derived tables and CTEs | a measure passes through any number of levels to the outer `AGG()` | §7.7, A.2, A.3 |
 | `DISTINCT` | over fields and evaluated measures | §7.8 |
@@ -111,7 +111,8 @@ A customer without orders is one joined row, so `COUNT(*)` counts it, while `ord
 ossiec refuses these with a clear message rather than answer differently from the spec. Each is on the [roadmap](roadmap.md).
 
 - `SELECT *`
-- Set operators (`UNION`, `INTERSECT`, `EXCEPT`), `ROLLUP`, `CUBE` and `GROUPING SETS`
+- Set operators (`UNION`, `INTERSECT`, `EXCEPT`)
+- With `ROLLUP`, `CUBE` or `GROUPING SETS`: grouping by an expression or a nested grouping, `CUBE` over more than 4 columns, more than 16 grouping sets, the `GROUPING()` function, grouping over derived tables, `DISTINCT` and `OFFSET`, and an `ORDER BY` key that isn't an output column
 - Subqueries in the select list, `WHERE`, `HAVING` and `ORDER BY`
 - `ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins
 - A `CROSS JOIN` (or comma `FROM`) spanning independent facts, and a comma `FROM` combined with a `RIGHT` or `FULL` join
