@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 153 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 154 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -64,7 +64,7 @@ Every kind, from either side, fan-out, and G2.
 
 Measures from independent facts, and the query as one relation (§7.6, §10.2).
 
-[`tests/sql_front/multi_fact.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/multi_fact.rs) · 13 tests
+[`tests/sql_front/multi_fact.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/multi_fact.rs) · 14 tests
 
 | Test | What it shows |
 |---|---|
@@ -79,6 +79,7 @@ Measures from independent facts, and the query as one relation (§7.6, §10.2).
 | `a2_derived_join_narrows_every_fact` | The query is one relation (§7.6, §10.2): the inner join to `d` keeps only the top two customers' rows (1 and 2, both EU), for every measure. |
 | `a4_ratio_with_a_derived_join_on_one_fact` | The ratio over a relation the derived join narrows: only EU's top customers are in it, for orders and tickets alike (§7.6, §10.2): 60 / 3. |
 | `a4_where_on_one_fact_narrows_the_other` | §7.3, §10.2: a `WHERE` on one fact's columns filters the one relation, so it keeps that fact's rows that pass and the customers that still have one; the other fact keeps only those customers' rows. |
+| `a4_where_in_between_like_on_one_fact_narrow_the_other` | §7.3: `IN`, `NOT IN`, `BETWEEN` and `LIKE` on a plain column are never true on NULL, so like a comparison they go on the one fact and narrow the other. |
 | `a4_where_on_one_fact_refusals` | A predicate a padded row can pass, on one fact, keeps rows no leg has; and a predicate across both facts has no one leg to go on. |
 | `a4_where_on_an_expression_field_is_refused` | A field that is an expression can map NULL to a value, so a comparison on it can keep the NULL-padded rows of a fact the other facts don't share: `COALESCE(amount, 0) = 0` holds for a customer without orders. |
 

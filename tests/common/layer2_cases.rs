@@ -131,6 +131,7 @@ datasets:
     fields:
       - { name: id, expression: { sql: order_id }, datatype: Integer }
       - { name: customer_id, expression: { sql: customer_id }, datatype: Integer }
+      - { name: status, expression: { sql: status }, datatype: String }
     metrics:
       - { name: order_count, expression: { sql: COUNT(*) } }
   - name: completed
@@ -196,6 +197,25 @@ pub const LAYER2_TWO_FACT_CASES: &[Layer2NestedCase] = &[
                     LEFT JOIN (SELECT * FROM orders WHERE status = 'completed') k \
                       ON k.customer_id = c.customer_id \
                     WHERE o.order_id > 3 \
+                    GROUP BY c.region",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.3: BETWEEN, NOT IN and LIKE on one fact's columns narrow the other
+        // fact too, as a comparison does.
+        name: "where_in_between_like_on_one_fact",
+        sql: "SELECT c.region, AGG(o.order_count) AS n, AGG(k.completed_count) AS k \
+              FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
+              LEFT JOIN completed k ON k.customer_id = c.id \
+              WHERE o.id BETWEEN 100 AND 105 AND o.id NOT IN (101, 104) \
+                AND o.status LIKE 'c%' GROUP BY c.region",
+        reference:
+            "SELECT c.region, COUNT(DISTINCT o.order_id) AS n, COUNT(DISTINCT k.order_id) AS k \
+                    FROM {customers} c LEFT JOIN orders o ON o.customer_id = c.customer_id \
+                    LEFT JOIN (SELECT * FROM orders WHERE status = 'completed') k \
+                      ON k.customer_id = c.customer_id \
+                    WHERE o.order_id BETWEEN 100 AND 105 AND o.order_id NOT IN (101, 104) \
+                      AND o.status LIKE 'c%' \
                     GROUP BY c.region",
         script: false,
     },

@@ -478,8 +478,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Fix: Athena SQL used polyglot's Athena dialect and gave wrong answers (`DATEDIFF`, `TO_CHAR`, day of week, `SPLIT_PART`, exact percentiles as `APPROX_PERCENTILE`, `CAST(… AS STRING)`); it is now Trino's, run on Trino in every tier but TPC-DS
 - [ ] Layer 2 `CROSS JOIN` (or comma `FROM`) spanning independent facts: refused today
 - [ ] Layer 2 quoted references to a derived table's columns follow the identifier rules (today they match regardless of quotes)
-- [x] Layer 2 `WHERE` comparison on one of several independent facts' plain-column fields, narrowing the others
-- [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison on a plain column (`IS NULL`, `IN`, `LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
+- [x] Layer 2 `WHERE` comparison, `IN`, `NOT IN`, `BETWEEN` or `LIKE` on one of several independent facts' plain-column fields, narrowing the others
+- [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column (`IS NULL`, `NOT BETWEEN`, `NOT LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
 - [x] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`), as `orders o RIGHT JOIN order_items i` is
 - [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
