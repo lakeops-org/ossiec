@@ -220,7 +220,9 @@ pub(super) fn mark_narrowing_legs(
             !matches!(d.kind, JoinKind::Left | JoinKind::Full)
                 && !others().all(|(_, o)| o.derived.iter().any(|x| x.rel_alias == d.rel_alias))
         });
-        if !(own_step || own_derived) {
+        // A `WHERE` on this leg's fact alone drops the shared rows it fails.
+        let own_filter = logical.filter_legs.contains(&Some(i));
+        if !(own_step || own_derived || own_filter) {
             marks.push(None);
             continue;
         }

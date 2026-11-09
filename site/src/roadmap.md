@@ -8,7 +8,7 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 - **`ROLLUP`, `CUBE`, `GROUPING SETS`** (§7.4)
 - **`SELECT *`** (§7.1)
 - **Subqueries in the select list, `WHERE`, `HAVING` and `ORDER BY`**, including scalar subqueries that read `AGG()` (§7.3, §7.7)
-- **`WHERE` on one of several independent facts' columns** (§7.3)
+- **`WHERE` on one of several independent facts' columns**, beyond a comparison on a plain column: `IS NULL`, `IN`, `LIKE` and other predicates there, a comparison on a field defined as an expression (`COALESCE(amount, 0)`), and one that reads two facts (§7.3)
 - **A fan-out written from the many side**: `order_items i LEFT JOIN orders o` reading `AGG(o.order_count)`. The same join written `orders o RIGHT JOIN order_items i` works.
 - **`ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins** (§7.6)
 - **Quoted references to a derived table's columns** *(lenient, not refused)*: `t."order_count"` matches the derived column `order_count` regardless of its quotes. Two columns of a relation can't differ by case alone, so it never finds a different column; a strict reading would refuse it

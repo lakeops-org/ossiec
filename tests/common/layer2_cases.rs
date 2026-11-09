@@ -182,6 +182,23 @@ pub const LAYER2_TWO_FACT_CASES: &[Layer2NestedCase] = &[
                     GROUP BY c.region",
         script: false,
     },
+    Layer2NestedCase {
+        // §7.3: a WHERE on one fact's columns drops the joined rows it fails, so
+        // the other fact keeps only the customers that still have such an order.
+        name: "where_on_one_fact_narrows_the_other",
+        sql: "SELECT c.region, AGG(o.order_count) AS n, AGG(k.completed_count) AS k \
+              FROM customers c LEFT JOIN orders o ON o.customer_id = c.id \
+              LEFT JOIN completed k ON k.customer_id = c.id \
+              WHERE o.id > 3 GROUP BY c.region",
+        reference:
+            "SELECT c.region, COUNT(DISTINCT o.order_id) AS n, COUNT(DISTINCT k.order_id) AS k \
+                    FROM {customers} c LEFT JOIN orders o ON o.customer_id = c.customer_id \
+                    LEFT JOIN (SELECT * FROM orders WHERE status = 'completed') k \
+                      ON k.customer_id = c.customer_id \
+                    WHERE o.order_id > 3 \
+                    GROUP BY c.region",
+        script: false,
+    },
 ];
 
 /// One shop Layer 2 nested case for the DuckDB parity check and the engine tier.
