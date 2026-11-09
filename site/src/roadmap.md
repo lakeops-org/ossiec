@@ -7,7 +7,7 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 - **Set operators** (`UNION`, `INTERSECT`, `EXCEPT`), even over fields only (§7.8)
 - **`ROLLUP`, `CUBE`, `GROUPING SETS`** (§7.4)
 - **`SELECT *`** (§7.1)
-- **Subqueries in the select list, `WHERE`, `HAVING` and `ORDER BY`**, including scalar subqueries that read `AGG()` (§7.3, §7.7)
+- **Subqueries in the select list, `HAVING` and `ORDER BY`**, including scalar subqueries that read `AGG()`, and **correlated subqueries** anywhere (§7.3, §7.7)
 - **`WHERE` on one of several independent facts' columns**, beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column: `IS NULL`, `NOT BETWEEN`, `NOT LIKE` and other predicates there, one on a field defined as an expression (`COALESCE(amount, 0)`), and one that reads two facts (§7.3)
 - **A fan-out written from the many side**: `order_items i LEFT JOIN orders o` reading `AGG(o.order_count)`. The same join written `orders o RIGHT JOIN order_items i` works.
 - **`ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins** (§7.6)

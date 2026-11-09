@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 153 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 154 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -168,11 +168,12 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY ALL`, `DISTINCT` and `WITH`.
 
-[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 10 tests
+[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 11 tests
 
 | Test | What it shows |
 |---|---|
 | `where_accepts_any_row_predicate` | §7.3: `WHERE` is an ordinary row predicate, on any column the query can read. |
+| `where_reads_subqueries` | §7.3: a subquery in `WHERE` is a Layer 2 query of its own, compiled as one and read by the predicate as SQL reads it: `IN`, `NOT IN`, `EXISTS` and a scalar. |
 | `having_keeps_or_drops_finished_groups` | §7.5: `HAVING` may contain `AGG()` and scalar expressions over it. |
 | `with_names_derived_tables` | §7.7: a CTE is a derived table with a name. |
 | `having_keeps_each_engines_rules` | What a target's SQL has to carry, which DuckDB's answers can't show. |

@@ -389,6 +389,24 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.3: subqueries in WHERE, each a Layer 2 query of its own: IN over one
+        // that evaluates a measure, a scalar plain aggregate, and EXISTS.
+        name: "where_subqueries",
+        sql: "SELECT o.status, AGG(o.order_count) AS n FROM orders o \
+              WHERE o.customer_id IN (SELECT o2.customer_id FROM orders o2 \
+                GROUP BY o2.customer_id HAVING AGG(o2.order_count) > 1) \
+              AND o.id > (SELECT MIN(o3.id) FROM orders o3 WHERE o3.status = 'returned') \
+              AND EXISTS (SELECT c.id FROM customers c WHERE c.region = 'APAC') \
+              GROUP BY o.status",
+        reference: "SELECT o.status, COUNT(*) AS n FROM orders o \
+                    WHERE o.customer_id IN (SELECT customer_id FROM orders \
+                      GROUP BY customer_id HAVING COUNT(*) > 1) \
+                    AND o.order_id > (SELECT MIN(order_id) FROM orders WHERE status = 'returned') \
+                    AND EXISTS (SELECT 1 FROM {customers} c WHERE c.region = 'APAC') \
+                    GROUP BY o.status",
+        script: false,
+    },
+    Layer2NestedCase {
         name: "one_side_average_dedup",
         sql: shop_joins!("SELECT c.region, AGG(p.average_stock) ", " GROUP BY c.region"),
         reference: "SELECT g.region, s.a

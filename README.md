@@ -198,7 +198,7 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **`WITH`** (§7.7) is a named derived table, so a measure passes through a CTE as it does through a subquery. `WITH RECURSIVE`, a column list and a set operator in a CTE are refused.
 
-**`WHERE`** is any row predicate over the query's columns (§7.3): comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT` and expressions, across datasets. Aggregates and windows are refused, and subqueries aren't supported yet.
+**`WHERE`** is any row predicate over the query's columns (§7.3): comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT` and expressions, across datasets. A subquery (`IN (SELECT …)`, `EXISTS`, a scalar) is a Layer 2 query of its own, so it can evaluate `AGG()`: `WHERE o.customer_id IN (SELECT customer_id FROM orders GROUP BY customer_id HAVING AGG(order_count) > 1)`. Aggregates and windows are refused, and so is a correlated subquery.
 
 **`includeUnmatched`.** One-side rows no fact reaches are off unless `Options { include_unmatched: true, .. }` or a comment `-- ossiec: includeUnmatched` (or `compile-l2 --include-unmatched`). It applies to the outermost `AGG` stage, including one that joins a derived table onto the unmatched grain. Layer 3 has no such rows to add, since each metric reads all of its home dataset, so it raises `E_INVALID_QUERY` for the request field and ignores the option.
 
@@ -481,7 +481,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 2 `WHERE` comparison, `IN`, `NOT IN`, `BETWEEN` or `LIKE` on one of several independent facts' plain-column fields, narrowing the others
 - [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column (`IS NULL`, `NOT BETWEEN`, `NOT LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
 - [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
-- [ ] Layer 2 subqueries in `WHERE`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
+- [x] Layer 2 subqueries in `WHERE` (`IN`, `NOT IN`, `EXISTS`, scalar), each compiled as a Layer 2 query
+- [ ] Layer 2 correlated subqueries, subqueries in the select list, `HAVING` and `ORDER BY`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
 - [ ] Publish to crates.io

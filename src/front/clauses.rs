@@ -346,8 +346,18 @@ pub(super) fn where_predicate(
             "Layer 2 WHERE cannot contain an aggregate or a window function; use HAVING, or a measure's FILTER".into(),
         ));
     }
-    if e.contains(|x| is_query(x) || is_subquery(x)) {
-        return Err(unsupported("Layer 2 WHERE does not support subqueries yet"));
+    // Subqueries were compiled on their own before this (`Compiler::where_subqueries`);
+    // what's left here is their placeholders, or one that couldn't be.
+    let inside_placeholder = |x: &Expression| {
+        e.contains(|p| {
+            sql::is_subquery_placeholder(p)
+                && (std::ptr::eq(p, x) || p.contains(|y| std::ptr::eq(y, x)))
+        })
+    };
+    if e.contains(|x| (is_query(x) || is_subquery(x)) && !inside_placeholder(x)) {
+        return Err(unsupported(
+            "Layer 2 subquery in WHERE could not be compiled on its own",
+        ));
     }
     let failure = RefCell::new(None);
     let resolved = transform(e.clone(), &|x| {
