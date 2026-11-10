@@ -6,7 +6,7 @@ ossiec renders SQL with [polyglot-sql](https://github.com/tobilg/polyglot), so c
 
 | Level | Meaning | Engines today |
 |---|---|---|
-| **Executed** | Every correctness case runs on the engine in `tests/engines.rs` and returns DuckDB's reference rows: values compared as printed text, numbers rounded to six decimals, and NULL distinct from `''` | DuckDB, Postgres, Trino, StarRocks, ClickHouse, MySQL; Athena on Trino and Databricks on Spark, the engines they're built on |
+| **Executed** | Every correctness case runs on the engine in `tests/engines.rs` and returns DuckDB's reference rows: values compared as printed text, numbers rounded to six decimals, and NULL distinct from `''` | DuckDB, Postgres, Trino, StarRocks, ClickHouse, MySQL, Spark; Athena and Databricks, rendered as the engines they're built on (Trino, Spark) and run there |
 | **Compiled** | Requests compile and contain no constructs the engine lacks (`tests/requests.rs`), but nothing has run there | Snowflake, BigQuery, Redshift |
 | **Renderable** | polyglot has the dialect; nothing in ossiec checks it | about 25 more |
 
@@ -48,7 +48,7 @@ This takes roughly half a day to a day, mostly spent on the test harness.
 
 ## Case B: cloud-only engines
 
-Snowflake, BigQuery and Redshift have no container. (Athena and Databricks run on the open-source engine each is built on: Trino through `Engine::host`, and Spark through `scripts/spark_sql_server.py`, one Spark session per test binary. Look for such an engine before reaching for the cloud.) The steps are the same, except:
+Snowflake, BigQuery and Redshift have no container. (Athena and Databricks run on the open-source engine each is built on: Trino through `Engine::host`, and Spark, which `scripts/spark_sql_server.py` serves with one session per test binary; `dialect::runs_as` renders each as its host, so what's run is what ships. Look for such an engine before reaching for the cloud.) The steps are the same, except:
 
 - The runner uses the engine's CLI or HTTP API, with credentials from environment variables (for example `OSSIEC_SNOWFLAKE_ACCOUNT`). The test skips with a clear message when they're missing.
 - The seed creates tables in a scratch schema and drops them afterwards.

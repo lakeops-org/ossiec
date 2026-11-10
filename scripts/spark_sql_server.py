@@ -1,4 +1,4 @@
-"""Run SQL on Spark for the engine test tier (Databricks' SQL runs on Spark).
+"""Run SQL on Spark for the engine test tier (ossiec writes Databricks' SQL as Spark's).
 
 One process serves a whole test binary, so the JVM starts once. It reads one JSON
 request per line, {"sql": "<statements separated by ;\\n>"}, runs each statement

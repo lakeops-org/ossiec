@@ -266,7 +266,7 @@ const CONCAT_BY_OPERATOR: &str = "__concat_by_operator";
 
 /// Where an engine needs its own form.
 fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
-    use DialectType::{ClickHouse, Databricks, DuckDB, MySQL, PostgreSQL, StarRocks, Trino};
+    use DialectType::{ClickHouse, DuckDB, MySQL, PostgreSQL, Spark, StarRocks, Trino};
     Some(match (target, key) {
         // DuckDB
         (DuckDB, "CURRENT_TIMESTAMP") => Sql("CURRENT_TIMESTAMP"),
@@ -401,34 +401,34 @@ fn on_engine(target: DialectType, key: &str) -> Option<Rule> {
         (Trino, "TO_DATE:2") => Sql("CAST(__ossiec_exact_DATE_PARSE({0}, {1}) AS DATE)"),
         (Trino, "TO_TIMESTAMP:2") => Sql("__ossiec_exact_DATE_PARSE({0}, {1})"),
 
-        // Databricks (Spark SQL). Its `TRUNC` truncates dates only, to a week or
+        // Spark SQL, which Databricks also runs. Its `TRUNC` truncates dates only, to a week or
         // longer, so polyglot's `TRUNC(ts, 'DAY')` is NULL; `DATE_TRUNC` takes every
         // unit. Its `DATEDIFF`/`TIMESTAMPDIFF` count whole units, so both ends are
         // truncated first, as on Trino. Sunday is 1. polyglot renders a numeric
         // `TRUNC` as a cast to BIGINT, and `PERCENTILE_CONT` as the approximate one.
-        (Databricks, "EXTRACT:DAYOFWEEK") => Sql("__ossiec_exact_DAYOFWEEK({0}) - 1"),
-        (Databricks, "DATE_TRUNC:DAY") => Sql("__ossiec_exact_DATE_TRUNC('DAY', {0})"),
-        (Databricks, "DATE_TRUNC:HOUR") => Sql("__ossiec_exact_DATE_TRUNC('HOUR', {0})"),
-        (Databricks, "DATE_TRUNC:MINUTE") => Sql("__ossiec_exact_DATE_TRUNC('MINUTE', {0})"),
-        (Databricks, "DATE_TRUNC:SECOND") => Sql("__ossiec_exact_DATE_TRUNC('SECOND', {0})"),
-        (Databricks, "DATEDIFF:YEAR") => Sql("__ossiec_exact_TIMESTAMPDIFF(YEAR, __ossiec_exact_DATE_TRUNC('YEAR', {0}), __ossiec_exact_DATE_TRUNC('YEAR', {1}))"),
-        (Databricks, "DATEDIFF:QUARTER") => Sql("__ossiec_exact_TIMESTAMPDIFF(QUARTER, __ossiec_exact_DATE_TRUNC('QUARTER', {0}), __ossiec_exact_DATE_TRUNC('QUARTER', {1}))"),
-        (Databricks, "DATEDIFF:MONTH") => Sql("__ossiec_exact_TIMESTAMPDIFF(MONTH, __ossiec_exact_DATE_TRUNC('MONTH', {0}), __ossiec_exact_DATE_TRUNC('MONTH', {1}))"),
-        (Databricks, "DATEDIFF:WEEK") => Sql("__ossiec_exact_TIMESTAMPDIFF(WEEK, __ossiec_exact_DATE_TRUNC('WEEK', {0}), __ossiec_exact_DATE_TRUNC('WEEK', {1}))"),
-        (Databricks, "DATEDIFF:DAY") => Sql("__ossiec_exact_TIMESTAMPDIFF(DAY, __ossiec_exact_DATE_TRUNC('DAY', {0}), __ossiec_exact_DATE_TRUNC('DAY', {1}))"),
-        (Databricks, "DATEDIFF:HOUR") => Sql("__ossiec_exact_TIMESTAMPDIFF(HOUR, __ossiec_exact_DATE_TRUNC('HOUR', {0}), __ossiec_exact_DATE_TRUNC('HOUR', {1}))"),
-        (Databricks, "DATEDIFF:MINUTE") => Sql("__ossiec_exact_TIMESTAMPDIFF(MINUTE, __ossiec_exact_DATE_TRUNC('MINUTE', {0}), __ossiec_exact_DATE_TRUNC('MINUTE', {1}))"),
-        (Databricks, "DATEDIFF:SECOND") => Sql("__ossiec_exact_TIMESTAMPDIFF(SECOND, __ossiec_exact_DATE_TRUNC('SECOND', {0}), __ossiec_exact_DATE_TRUNC('SECOND', {1}))"),
-        (Databricks, "TRUNC") => Sql("CASE WHEN {0} >= 0 THEN __ossiec_exact_FLOOR({0}, {1}) ELSE __ossiec_exact_CEIL({0}, {1}) END"),
-        (Databricks, "PERCENTILE_CONT") => Sql("__ossiec_exact_PERCENTILE({1}, {0})"),
-        (Databricks, "REGEXP_EXTRACT") => Sql("__ossiec_exact_REGEXP_EXTRACT({0}, {1}, 0)"),
-        (Databricks, "EXTRACT:MILLISECOND") => Sql("CAST(__ossiec_exact_DATE_PART('SECOND', {0}) * 1000 AS BIGINT)"),
+        (Spark, "EXTRACT:DAYOFWEEK") => Sql("__ossiec_exact_DAYOFWEEK({0}) - 1"),
+        (Spark, "DATE_TRUNC:DAY") => Sql("__ossiec_exact_DATE_TRUNC('DAY', {0})"),
+        (Spark, "DATE_TRUNC:HOUR") => Sql("__ossiec_exact_DATE_TRUNC('HOUR', {0})"),
+        (Spark, "DATE_TRUNC:MINUTE") => Sql("__ossiec_exact_DATE_TRUNC('MINUTE', {0})"),
+        (Spark, "DATE_TRUNC:SECOND") => Sql("__ossiec_exact_DATE_TRUNC('SECOND', {0})"),
+        (Spark, "DATEDIFF:YEAR") => Sql("__ossiec_exact_TIMESTAMPDIFF(YEAR, __ossiec_exact_DATE_TRUNC('YEAR', {0}), __ossiec_exact_DATE_TRUNC('YEAR', {1}))"),
+        (Spark, "DATEDIFF:QUARTER") => Sql("__ossiec_exact_TIMESTAMPDIFF(QUARTER, __ossiec_exact_DATE_TRUNC('QUARTER', {0}), __ossiec_exact_DATE_TRUNC('QUARTER', {1}))"),
+        (Spark, "DATEDIFF:MONTH") => Sql("__ossiec_exact_TIMESTAMPDIFF(MONTH, __ossiec_exact_DATE_TRUNC('MONTH', {0}), __ossiec_exact_DATE_TRUNC('MONTH', {1}))"),
+        (Spark, "DATEDIFF:WEEK") => Sql("__ossiec_exact_TIMESTAMPDIFF(WEEK, __ossiec_exact_DATE_TRUNC('WEEK', {0}), __ossiec_exact_DATE_TRUNC('WEEK', {1}))"),
+        (Spark, "DATEDIFF:DAY") => Sql("__ossiec_exact_TIMESTAMPDIFF(DAY, __ossiec_exact_DATE_TRUNC('DAY', {0}), __ossiec_exact_DATE_TRUNC('DAY', {1}))"),
+        (Spark, "DATEDIFF:HOUR") => Sql("__ossiec_exact_TIMESTAMPDIFF(HOUR, __ossiec_exact_DATE_TRUNC('HOUR', {0}), __ossiec_exact_DATE_TRUNC('HOUR', {1}))"),
+        (Spark, "DATEDIFF:MINUTE") => Sql("__ossiec_exact_TIMESTAMPDIFF(MINUTE, __ossiec_exact_DATE_TRUNC('MINUTE', {0}), __ossiec_exact_DATE_TRUNC('MINUTE', {1}))"),
+        (Spark, "DATEDIFF:SECOND") => Sql("__ossiec_exact_TIMESTAMPDIFF(SECOND, __ossiec_exact_DATE_TRUNC('SECOND', {0}), __ossiec_exact_DATE_TRUNC('SECOND', {1}))"),
+        (Spark, "TRUNC") => Sql("CASE WHEN {0} >= 0 THEN __ossiec_exact_FLOOR({0}, {1}) ELSE __ossiec_exact_CEIL({0}, {1}) END"),
+        (Spark, "PERCENTILE_CONT") => Sql("__ossiec_exact_PERCENTILE({1}, {0})"),
+        (Spark, "REGEXP_EXTRACT") => Sql("__ossiec_exact_REGEXP_EXTRACT({0}, {1}, 0)"),
+        (Spark, "EXTRACT:MILLISECOND") => Sql("CAST(__ossiec_exact_DATE_PART('SECOND', {0}) * 1000 AS BIGINT)"),
         // Format codes are Java's (`translate_format`).
-        (Databricks, "TO_CHAR:2") => Sql("__ossiec_exact_DATE_FORMAT({0}, {1})"),
-        (Databricks, "TO_DATE:2") => Sql("__ossiec_exact_TO_DATE({0}, {1})"),
-        (Databricks, "TO_TIMESTAMP:2") => Sql("__ossiec_exact_TO_TIMESTAMP({0}, {1})"),
+        (Spark, "TO_CHAR:2") => Sql("__ossiec_exact_DATE_FORMAT({0}, {1})"),
+        (Spark, "TO_DATE:2") => Sql("__ossiec_exact_TO_DATE({0}, {1})"),
+        (Spark, "TO_TIMESTAMP:2") => Sql("__ossiec_exact_TO_TIMESTAMP({0}, {1})"),
         // No TIME type.
-        (Databricks, "CURRENT_TIME" | "TIME_LITERAL") => Refuse,
+        (Spark, "CURRENT_TIME" | "TIME_LITERAL") => Refuse,
 
         // ClickHouse: function names are case-sensitive, and the plain string functions
         // count and change bytes, so non-ASCII text needs the UTF-8 ones.
@@ -554,8 +554,8 @@ fn engine_name(target: DialectType) -> String {
 
 /// Give every Ossie function its implementation for `target`.
 pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> {
-    use DialectType::{ClickHouse, Databricks, DuckDB, MySQL, StarRocks, Trino};
-    // Athena takes Trino's forms and refusals; errors still name `target`.
+    use DialectType::{ClickHouse, DuckDB, MySQL, Spark, StarRocks, Trino};
+    // Athena takes Trino's forms and refusals, Databricks Spark's; errors still name `target`.
     let engine = crate::dialect::runs_as(target);
     let failure = RefCell::new(None);
     let out = transform(ast, &|e| {
@@ -580,7 +580,7 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
         // A format string is Ossie's, and only a constant one can be translated.
         if matches!(
             engine,
-            DuckDB | MySQL | ClickHouse | StarRocks | Trino | Databricks
+            DuckDB | MySQL | ClickHouse | StarRocks | Trino | Spark
         ) && matches!(c.key.as_str(), "TO_CHAR:2" | "TO_DATE:2" | "TO_TIMESTAMP:2")
         {
             let Some(format) = text(&c.args[1]).map(str::to_string) else {
@@ -595,7 +595,7 @@ pub(crate) fn lower(ast: Expression, target: DialectType) -> Result<Expression> 
             };
             let codes = match engine {
                 DuckDB => FormatCodes::Strftime,
-                Databricks => FormatCodes::Java,
+                Spark => FormatCodes::Java,
                 _ => FormatCodes::MySql,
             };
             let format = translate_format(&format, codes);

@@ -1,7 +1,7 @@
 //! The Docker engines (Trino, StarRocks, ClickHouse, Postgres, MySQL, Spark):
 //! which one, running SQL on it, and comparing its rows. Athena has no container:
 //! its engine (v3) is Trino, so ossiec's Athena SQL runs on the Trino one.
-//! Databricks' SQL is Spark SQL, so it runs on the Spark container.
+//! Databricks' SQL is Spark SQL, so ossiec's Databricks SQL runs on the Spark one.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -19,7 +19,9 @@ pub enum Engine {
     MySql,
     /// ossiec's Athena dialect, run on the Trino container.
     Athena,
-    /// ossiec's Databricks dialect, run on Apache Spark.
+    /// Apache Spark SQL.
+    Spark,
+    /// ossiec's Databricks dialect, run on the Spark container.
     Databricks,
 }
 
@@ -34,15 +36,17 @@ impl Engine {
             Engine::ClickHouse => D::ClickHouse,
             Engine::MySql => D::MySQL,
             Engine::Athena => D::Athena,
+            Engine::Spark => D::Spark,
             Engine::Databricks => D::Databricks,
         }
     }
 
-    /// The engine whose container runs this one's SQL: Trino for Athena,
-    /// otherwise itself. Seed data and result parsing follow the host.
+    /// The engine whose container runs this one's SQL: Trino for Athena, Spark
+    /// for Databricks, otherwise itself. Seed data and result parsing follow the host.
     pub fn host(self) -> Engine {
         match self {
             Engine::Athena => Engine::Trino,
+            Engine::Databricks => Engine::Spark,
             e => e,
         }
     }
@@ -82,7 +86,7 @@ pub fn run(engine: Engine, sql: &str) -> Result<Vec<Vec<String>>, String> {
 
 /// [`run`], with Trino's catalog and schema for unqualified names.
 pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<String>>, String> {
-    if engine == Engine::Databricks {
+    if engine.host() == Engine::Spark {
         return run_on_spark(sql);
     }
     let (container, args, stdin): (&str, Vec<&str>, Option<String>) = match engine.host() {
@@ -151,7 +155,8 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
         ),
         Engine::DuckDb => unreachable!("DuckDB runs in-process"),
         Engine::Athena => unreachable!("Athena runs on its host, Trino"),
-        Engine::Databricks => unreachable!("Databricks runs on the Spark server"),
+        Engine::Spark => unreachable!("Spark runs on its SQL server"),
+        Engine::Databricks => unreachable!("Databricks runs on its host, Spark"),
     };
     let mut cmd = Command::new("docker");
     cmd.arg("exec").arg("-i").arg(container).args(&args);

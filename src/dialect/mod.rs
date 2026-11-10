@@ -41,6 +41,7 @@ pub(crate) fn supports_aggregate_filter(target: Option<DialectType>) -> bool {
                 | DialectType::Trino
                 | DialectType::Athena
                 | DialectType::Databricks
+                | DialectType::Spark
         )
     )
 }
@@ -59,6 +60,7 @@ pub(crate) fn supports_null_safe_eq(target: Option<DialectType>) -> bool {
                 | DialectType::Trino
                 | DialectType::Athena
                 | DialectType::Databricks
+                | DialectType::Spark
         ),
     }
 }
@@ -68,9 +70,14 @@ pub(crate) fn supports_null_safe_eq(target: Option<DialectType>) -> bool {
 /// writes Hive's DDL types such as `STRING`, which an Athena query rejects). So an
 /// Athena query is rendered, and its functions lowered, as Trino's. Evidence: the
 /// engine tier runs every Athena case on Trino.
+///
+/// Databricks SQL is Spark SQL, and Apache Spark is what the engine tier runs, so a
+/// Databricks query is rendered, and its functions lowered, as Spark's: what ships
+/// for Databricks is what was tested.
 pub(crate) fn runs_as(target: DialectType) -> DialectType {
     match target {
         DialectType::Athena => DialectType::Trino,
+        DialectType::Databricks => DialectType::Spark,
         t => t,
     }
 }
@@ -81,11 +88,11 @@ pub(crate) fn adapt(
     target: DialectType,
     plan: &LogicalPlan,
 ) -> Result<Expression> {
-    match target {
+    match runs_as(target) {
         DialectType::BigQuery => bigquery::adapt(ast, plan),
         DialectType::ClickHouse => clickhouse::adapt(ast, plan),
-        // Spark SQL, which Databricks runs: only the LIKE escape differs here.
-        DialectType::Databricks => literal_backslashes_in_like(ast),
+        // Spark SQL (and Databricks, which runs it): only the LIKE escape differs here.
+        DialectType::Spark => literal_backslashes_in_like(ast),
         DialectType::MySQL => mysql::adapt(ast, plan),
         DialectType::PostgreSQL => postgres::adapt(ast, plan),
         DialectType::StarRocks => starrocks::adapt(ast, plan),
@@ -119,7 +126,7 @@ fn internal(e: polyglot_sql::Error) -> Error {
 }
 
 /// Engines that treat `\` as a `LIKE` escape by default (Postgres, ClickHouse,
-/// StarRocks, MySQL, Databricks' Spark SQL) would read `'C:\%'` as `C:%`. SQL declares escapes with
+/// StarRocks, MySQL, Spark) would read `'C:\%'` as `C:%`. SQL declares escapes with
 /// `ESCAPE`, so without one a backslash is an ordinary character (Trino, DuckDB).
 /// Doubling it in the pattern keeps it literal. Evidence: `like_with_a_backslash`.
 fn literal_backslashes_in_like(ast: Expression) -> Result<Expression> {

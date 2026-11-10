@@ -23,11 +23,11 @@ Athena's engine (v3) is Trino, and its queries are Trino SQL. So ossiec writes a
 
 What this can't catch: a function Trino has and Athena lacks, and Athena's own limits on things like query length. TPC-DS isn't run for Athena, since its SQL is Trino's. Before this tier existed, ossiec's Athena output used polyglot's Athena dialect and gave wrong answers there: `DATEDIFF` counted whole units, `TO_CHAR` kept Ossie's format string, Sunday was day 7, an out-of-range `SPLIT_PART` was NULL, exact percentiles became `APPROX_PERCENTILE`, and `CAST(… AS STRING)` used a type that Athena queries reject.
 
-## Run on Apache Spark: Databricks
+## Apache Spark, and Databricks
 
-Databricks runs Spark SQL, so ossiec's Databricks SQL runs on Apache Spark 4.0 in Docker, with ANSI mode on as in Databricks SQL. The Layer 3 cases, Layer 2 cases, expression language and fuzzing all run there. One Spark session serves a whole test binary (`scripts/spark_sql_server.py`), so the JVM starts once. Its gaps are in [Functions by engine](generated/functions.md#gaps): Spark has no `TIME` type, so `TIME` literals and `CURRENT_TIME` are refused.
+Spark SQL runs on Apache Spark 4.0 in Docker, with ANSI mode on as in Databricks SQL. Databricks SQL is Spark SQL, so ossiec writes Databricks' SQL as Spark's (`dialect::runs_as`), and the Spark tier covers both: what ships for Databricks is what was run. A test holds every construct's Databricks SQL equal to its Spark SQL. The Layer 3 cases, Layer 2 cases, expression language and fuzzing all run there. One Spark session serves a whole test binary (`scripts/spark_sql_server.py`), so the JVM starts once. Its gaps are in [Functions by engine](generated/functions.md#gaps): Spark has no `TIME` type, so `TIME` literals and `CURRENT_TIME` are refused.
 
-What this can't catch: what the Databricks runtime adds to or changes from open-source Spark. TPC-DS isn't run on it yet. Before this tier existed, ossiec's Databricks SQL gave wrong answers there:
+What this can't catch: what the Databricks runtime adds to or changes from open-source Spark. TPC-DS isn't run on it yet. Before this tier existed, ossiec's Databricks SQL (then polyglot's Databricks dialect) gave wrong answers there:
 
 - `DATEDIFF` counted whole units instead of boundaries crossed.
 - `DATE_TRUNC` to a day or shorter returned NULL.
@@ -57,9 +57,10 @@ Each rule exists because an engine test showed polyglot's rendering answering di
 | MySQL | Default collation compares case-insensitively, merging `Ada` and `ada` | `COLLATE utf8mb4_bin` on string dimensions and filters |
 | MySQL | `AVG` of integers is rounded to 4 decimal places | The argument is cast to `DOUBLE` |
 | StarRocks | `\` in a string literal is an escape, and polyglot doesn't double it | Double it |
-| Postgres, ClickHouse, StarRocks, MySQL, Databricks | `\` in a `LIKE` pattern is an escape | Double it, so it matches itself |
+| Postgres, ClickHouse, StarRocks, MySQL, Spark | `\` in a `LIKE` pattern is an escape | Double it, so it matches itself |
 | BigQuery | `DATE_TRUNC(d, WEEK)` starts weeks on Sunday; Ossie's start on Monday | `ISOWEEK` (checked by golden SQL only) |
 | Athena | polyglot's Athena dialect writes Hive's DDL types (`STRING`) and its own function forms, but Athena queries are Trino SQL | Rendered, and its functions lowered, as Trino (`dialect::runs_as`) |
+| Databricks | Databricks SQL is Spark SQL; the Spark tier is what's run | Rendered, and its functions lowered, as Spark (`dialect::runs_as`) |
 | Engines without aggregate `FILTER` | `FILTER (WHERE …)` would be passed through | `CASE WHEN` inside the aggregate; also on every engine for statistical aggregates, whose `FILTER` polyglot drops |
 
 The rules live in [`src/dialect/`](https://github.com/lakeops-org/ossiec/tree/main/src/dialect). The function implementations per engine are in [`src/functions.rs`](https://github.com/lakeops-org/ossiec/blob/main/src/functions.rs).

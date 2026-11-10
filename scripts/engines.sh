@@ -17,7 +17,7 @@ CLICKHOUSE_IMAGE="${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8}"
 # (Alpine/musl sorts by byte), which the string_ordering case depends on.
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"
 MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4}"
-# Databricks' SQL runs on Spark: spark_sql_server.py serves queries from inside it.
+# Spark (and Databricks, whose SQL ossiec writes as Spark's): spark_sql_server.py serves queries from inside it.
 SPARK_IMAGE="${SPARK_IMAGE:-spark:4.0.1-python3}"
 ENGINES=(postgres clickhouse trino starrocks mysql spark)
 

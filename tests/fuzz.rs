@@ -436,8 +436,8 @@ fn athena() {
 
 #[test]
 #[ignore = "needs Docker: scripts/engines.sh up"]
-fn databricks() {
-    fuzz(Engine::Databricks, count(40));
+fn spark() {
+    fuzz(Engine::Spark, count(40));
 }
 
 #[test]

@@ -52,6 +52,7 @@ fn native_null_safe(t: DialectType) -> bool {
             | DialectType::Trino
             | DialectType::Athena
             | DialectType::Databricks
+            | DialectType::Spark
     )
 }
 

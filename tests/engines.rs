@@ -120,8 +120,8 @@ fn layer2_nested_athena() {
 
 #[test]
 #[ignore = "needs Docker: scripts/engines.sh up"]
-fn layer2_nested_databricks() {
-    sweep_layer2_nested(Engine::Databricks);
+fn layer2_nested_spark() {
+    sweep_layer2_nested(Engine::Spark);
 }
 
 #[test]
@@ -161,11 +161,12 @@ fn athena() {
     sweep(Engine::Athena);
 }
 
-/// Databricks' SQL is Spark SQL, so it runs on Apache Spark.
+/// Apache Spark SQL. ossiec renders Databricks as Spark (`dialect::runs_as`), so
+/// this tier covers Databricks' SQL too.
 #[test]
 #[ignore = "needs Docker: scripts/engines.sh up"]
-fn databricks() {
-    sweep(Engine::Databricks);
+fn spark() {
+    sweep(Engine::Spark);
 }
 
 #[test]
