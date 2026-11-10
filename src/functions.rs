@@ -501,10 +501,22 @@ enum FormatCodes {
 
 fn translate_format(format: &str, codes: FormatCodes) -> String {
     let mut out = String::with_capacity(format.len());
+    // Java: a run of literal letters, quoted as one section when it ends. Quoting
+    // each letter would put `''` between them, which Java reads as an apostrophe.
+    let mut letters = String::new();
+    let flush = |out: &mut String, letters: &mut String| {
+        if !letters.is_empty() {
+            out.push('\'');
+            out.push_str(letters);
+            out.push('\'');
+            letters.clear();
+        }
+    };
     let mut rest = format;
     'scan: while let Some(c) = rest.chars().next() {
         for (token, s, m, j) in FORMAT_TOKENS {
             if let Some(after) = rest.strip_prefix(token) {
+                flush(&mut out, &mut letters);
                 out.push_str(match codes {
                     FormatCodes::Strftime => s,
                     FormatCodes::MySql => m,
@@ -515,16 +527,20 @@ fn translate_format(format: &str, codes: FormatCodes) -> String {
             }
         }
         match (codes, c) {
-            (FormatCodes::Java, '\'') => out.push_str("''"),
-            (FormatCodes::Java, c) if c.is_ascii_alphabetic() => {
-                out.push('\'');
+            (FormatCodes::Java, c) if c.is_ascii_alphabetic() => letters.push(c),
+            (FormatCodes::Java, '\'') => {
+                flush(&mut out, &mut letters);
+                out.push_str("''");
+            }
+            (FormatCodes::Java, c) => {
+                flush(&mut out, &mut letters);
                 out.push(c);
-                out.push('\'');
             }
             _ => out.push(c),
         }
         rest = &rest[c.len_utf8()..];
     }
+    flush(&mut out, &mut letters);
     out
 }
 

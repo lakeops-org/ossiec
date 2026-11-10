@@ -6,7 +6,7 @@ ossiec renders SQL with [polyglot-sql](https://github.com/tobilg/polyglot), so c
 
 | Level | Meaning | Engines today |
 |---|---|---|
-| **Executed** | Every correctness case runs on the engine in `tests/engines.rs` and returns exactly DuckDB's reference rows, including types and NULLs | DuckDB, Postgres, Trino, StarRocks, ClickHouse, MySQL; Athena on Trino and Databricks on Spark, the engines they're built on |
+| **Executed** | Every correctness case runs on the engine in `tests/engines.rs` and returns DuckDB's reference rows: values compared as printed text, numbers rounded to six decimals, and NULL distinct from `''` | DuckDB, Postgres, Trino, StarRocks, ClickHouse, MySQL; Athena on Trino and Databricks on Spark, the engines they're built on |
 | **Compiled** | Requests compile and contain no constructs the engine lacks (`tests/requests.rs`), but nothing has run there | Snowflake, BigQuery, Redshift |
 | **Renderable** | polyglot has the dialect; nothing in ossiec checks it | about 25 more |
 

@@ -202,6 +202,9 @@ struct Spark {
 
 const SPARK_MARK: &str = "\x1eOSSIEC ";
 
+/// Starts every error that means the server is gone, so the next query restarts it.
+const SPARK_GONE: &str = "the Spark SQL server exited";
+
 impl Spark {
     fn start() -> Result<Spark, String> {
         let mut child = Command::new("docker")
@@ -236,12 +239,12 @@ impl Spark {
             if self
                 .stdout
                 .read_line(&mut line)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{SPARK_GONE}: {e}"))?
                 == 0
             {
-                return Err(
-                    "the Spark SQL server exited (is `scripts/engines.sh up` running?)".into(),
-                );
+                return Err(format!(
+                    "{SPARK_GONE} (is `scripts/engines.sh up` running?)"
+                ));
             }
             if let Some(json) = line.strip_prefix(SPARK_MARK) {
                 return serde_json::from_str(json).map_err(|e| format!("spark JSON: {e}: {json}"));
@@ -251,8 +254,11 @@ impl Spark {
 
     fn run(&mut self, sql: &str) -> Result<Vec<Vec<String>>, String> {
         let request = serde_json::json!({ "sql": sql }).to_string();
-        writeln!(self.stdin, "{request}").map_err(|e| e.to_string())?;
-        self.stdin.flush().map_err(|e| e.to_string())?;
+        // A server that died between requests fails the write: the same as
+        // its exit, so `run_on_spark` starts a new one.
+        let gone = |e: std::io::Error| format!("{SPARK_GONE}: {e}");
+        writeln!(self.stdin, "{request}").map_err(gone)?;
+        self.stdin.flush().map_err(gone)?;
         let answer = self.answer()?;
         if let Some(e) = answer.get("error") {
             return Err(e.as_str().unwrap_or_default().to_string());
@@ -278,7 +284,7 @@ fn run_on_spark(sql: &str) -> Result<Vec<Vec<String>>, String> {
         *spark = Some(Spark::start()?);
     }
     let result = spark.as_mut().unwrap().run(sql);
-    if result.as_ref().is_err_and(|e| e.contains("server exited")) {
+    if result.as_ref().is_err_and(|e| e.starts_with(SPARK_GONE)) {
         *spark = None;
     }
     result

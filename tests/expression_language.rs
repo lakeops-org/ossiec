@@ -1507,6 +1507,9 @@ fn databricks_uses_spark_forms_that_answer_the_same() {
     assert!(s.contains("yyyy-MM-dd"), "{s}");
     let s = on("TO_CHAR(a, 'YYYY-MM-DD HH24:MI:SS')");
     assert!(s.contains("'yyyy-MM-dd HH:mm:ss'"), "{s}");
+    // Adjacent literal letters are one quoted run: `'x''y'` would read as x'y.
+    let s = on("TO_CHAR(a, 'YYYYxy')");
+    assert!(s.contains(r"'yyyy\'xy\''"), "{s}");
     // Exact, not approximate.
     let g = t("", "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)").unwrap();
     let s = sql_for(&g, ossiec::DialectType::Databricks);
