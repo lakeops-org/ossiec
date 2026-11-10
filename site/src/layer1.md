@@ -36,7 +36,7 @@ The result, construct by construct and engine by engine, is on [Functions by eng
 | `AGG` is reserved | A portable expression can't call a function named `AGG`. |
 | No subqueries | A portable expression can't contain one. |
 | Division | `/` is true division on every engine: `COUNT(a) / COUNT(b)` isn't truncated on Postgres and Trino. |
-| `FILTER (WHERE …)` | Kept on engines that run it (DuckDB, Postgres, Trino, Athena, Databricks), and rewritten to `CASE` elsewhere. |
+| `FILTER (WHERE …)` | Kept on engines that run it (DuckDB, Postgres, Trino, Athena, Spark, Databricks), and rewritten to `CASE` elsewhere. |
 | `STDDEV`, `VARIANCE` | The sample forms, on every engine. |
 | Vendor dialects | A field may carry `SNOWFLAKE`, `TRINO`, … variants beside the portable one; `--prefer SNOWFLAKE` uses the native one. A vendor expression keeps its engine's meaning and isn't rewritten. |
 

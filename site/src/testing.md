@@ -16,7 +16,7 @@ Every claim on this site is a test that executes SQL and compares the rows with 
 
 ```console
 cargo test                                                        # everything on DuckDB
-scripts/engines.sh up                                              # start the other five engines in Docker (Athena's SQL runs on Trino)
+scripts/engines.sh up                                              # start the other engines in Docker (Spark too; Athena's SQL runs on Trino, and Databricks' is Spark's)
 cargo test --test engines -- --ignored                             # Layer 3 and Layer 2 cases on them
 cargo test --test expression_language -- --ignored                 # every function on them
 cargo test --test fuzz -- --ignored                                # random requests on them

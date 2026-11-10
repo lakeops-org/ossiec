@@ -175,6 +175,7 @@ fn compiles_for_every_engine_with_portable_constructs_only() {
         DialectType::Snowflake,
         DialectType::BigQuery,
         DialectType::Databricks,
+        DialectType::Spark,
         DialectType::Redshift,
     ] {
         for r in requests {
@@ -195,6 +196,7 @@ fn compiles_for_every_engine_with_portable_constructs_only() {
                     | DialectType::Trino
                     | DialectType::Athena
                     | DialectType::Databricks
+                    | DialectType::Spark
             );
             for construct in ["QUALIFY", "BY NAME", "GROUP BY ALL"] {
                 assert!(

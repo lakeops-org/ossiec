@@ -436,6 +436,12 @@ fn athena() {
 
 #[test]
 #[ignore = "needs Docker: scripts/engines.sh up"]
+fn spark() {
+    fuzz(Engine::Spark, count(40));
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
 fn starrocks() {
     fuzz(Engine::StarRocks, count(40));
 }

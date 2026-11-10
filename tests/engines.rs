@@ -120,6 +120,12 @@ fn layer2_nested_athena() {
 
 #[test]
 #[ignore = "needs Docker: scripts/engines.sh up"]
+fn layer2_nested_spark() {
+    sweep_layer2_nested(Engine::Spark);
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
 fn layer2_nested_starrocks() {
     sweep_layer2_nested(Engine::StarRocks);
 }
@@ -153,6 +159,14 @@ fn trino() {
 #[ignore = "needs Docker: scripts/engines.sh up"]
 fn athena() {
     sweep(Engine::Athena);
+}
+
+/// Apache Spark SQL. ossiec renders Databricks as Spark (`dialect::runs_as`), so
+/// this tier covers Databricks' SQL too.
+#[test]
+#[ignore = "needs Docker: scripts/engines.sh up"]
+fn spark() {
+    sweep(Engine::Spark);
 }
 
 #[test]
