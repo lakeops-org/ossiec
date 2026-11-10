@@ -52,7 +52,7 @@ The complete, generated list is [Functions by engine](generated/functions.md).
 | §7.3 `WHERE` | 🟡 | Any row predicate; on one of several independent facts' columns, a comparison, `IN`, `NOT IN`, `BETWEEN` or `LIKE` on a field that is a plain column, which narrows the other facts too. Subqueries, and other predicates on one of several facts, are refused |
 | §7.4 `GROUP BY` | 🟡 | `GROUP BY` and `GROUP BY ALL`. `ROLLUP`, `CUBE` and `GROUPING SETS` are refused |
 | §7.5 `HAVING`, `ORDER BY` | 🟡 | `AGG()`, plain aggregates and expressions over them, selected or not. Subqueries are refused |
-| §7.6 `JOIN` | 🟡 | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS` from either side, with filtering, duplication and null-extension handled. A comma `FROM` is a `CROSS JOIN`. `ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, a fan-out written from the many side, and a `CROSS JOIN` spanning independent facts are refused |
+| §7.6 `JOIN` | 🟡 | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS` from either side, with filtering, duplication and null-extension handled. A comma `FROM` is a `CROSS JOIN`. A fan-out works written from either side. `ASOF`, `SEMI`/`ANTI`, `NATURAL`, `LATERAL`, and a `CROSS JOIN` spanning independent facts are refused |
 | §7.7 Subqueries and CTEs | 🟡 | Derived tables and `WITH`, nested to any depth for pass-through (4 levels, 8 derived tables per query). Scalar subqueries are refused |
 | §7.8 `DISTINCT` | ✅ | Over fields and evaluated measures; refused over an unevaluated measure |
 | §7.8 Set operators | ❌ | Refused, even over fields only |

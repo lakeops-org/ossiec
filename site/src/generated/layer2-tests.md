@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 153 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 155 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -31,7 +31,7 @@ Model-qualified relations, measure names, aliases and output labels, and what is
 
 Every kind, from either side, fan-out, and G2.
 
-[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 23 tests
+[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 25 tests
 
 | Test | What it shows |
 |---|---|
@@ -51,6 +51,8 @@ Every kind, from either side, fan-out, and G2.
 | `a5_unused_inner_join_customers_compiles` |  |
 | `a5_reverse_fanout_join_uses_pk_dedup` |  |
 | `a5_right_join_to_the_many_side_of_a_fanout_dedups` | `orders RIGHT JOIN order_items` keeps every line. |
+| `a5_fanout_written_from_the_many_side_dedups` | A fan-out written from the many side (§7.6): `order_items i LEFT JOIN orders o` is the relation `orders o RIGHT JOIN order_items i`, so it counts orders as that form does, de-duplicated by primary key. |
+| `a_join_from_a_dataset_with_two_roles_is_not_turned_around` | A join is turned around only when no leg has its first side at all. |
 | `join_from_either_side_without_a_fact_key` | Two-facts `orders` has no primary key, so null-extended customers are kept out of `SUM` by a FILTER on the join key rather than by de-duplication. |
 | `join_from_the_one_side_filters_each_term_of_a_composite_metric` | A composite metric is planned as one aggregate per term, and each takes the FILTER: `COUNT(*)` counts no orders for a customer that has none, so its ratio is NULL rather than divided by the one null-extended row. |
 | `join_from_the_one_side_filters_every_aggregate_shape` | Aggregates of every shape take the FILTER, ANDed with a FILTER of their own, so a fact without a primary key needs no de-duplication for any of them. |

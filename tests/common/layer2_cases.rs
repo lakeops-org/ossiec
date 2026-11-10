@@ -389,6 +389,17 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.6: a fan-out written from the many side. `orders LEFT JOIN customers`
+        // is `customers RIGHT JOIN orders`: every order is kept, and each customer
+        // counts once per status however many orders they placed.
+        name: "fanout_written_from_the_many_side",
+        sql: "SELECT o.status, AGG(c.known_customers) AS n FROM orders o \
+              LEFT JOIN customers c ON o.customer_id = c.id GROUP BY o.status",
+        reference: "SELECT o.status, COUNT(DISTINCT c.customer_id) AS n FROM orders o \
+                    LEFT JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY o.status",
+        script: false,
+    },
+    Layer2NestedCase {
         name: "one_side_average_dedup",
         sql: shop_joins!("SELECT c.region, AGG(p.average_stock) ", " GROUP BY c.region"),
         reference: "SELECT g.region, s.a
