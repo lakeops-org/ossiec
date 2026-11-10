@@ -125,9 +125,13 @@ fn written_from_the_other_side(
             .iter()
             .any(|l| leg_hosts_attach(graph, l, ds, role))
     };
+    // Only when no leg has the first side at all. A leg can have it under several
+    // aliases (two roles), which no role-less join can choose between: turning
+    // the join around would join a new copy of it to the other side instead.
     // A role on the attach columns names how the first side is reached; the
     // other side has no such role to take over.
-    if cj.attach_role.is_some() || hosts(cj.attach_ds, None) || !hosts(cj.other_ds, None) {
+    let anywhere = |ds: usize| logical.legs.iter().any(|l| leg_has_dataset(graph, l, ds));
+    if cj.attach_role.is_some() || anywhere(cj.attach_ds) || !hosts(cj.other_ds, None) {
         return None;
     }
     Some(ConsumerJoin {
@@ -298,6 +302,19 @@ pub(super) fn consumer_join_leg(
         graph.datasets[cj.attach_ds].name,
         cj.attach_alias
     )))
+}
+
+/// Whether `ds` is on the leg at all, under any alias or role.
+fn leg_has_dataset(graph: &SemanticGraph, leg: &plan::Leg, ds: usize) -> bool {
+    leg.root == ds
+        || leg.joins.iter().any(|s| {
+            let joined = if s.reverse {
+                s.rel.map(|r| graph.rels[r].from)
+            } else {
+                Some(s.to)
+            };
+            joined == Some(ds)
+        })
 }
 
 pub(super) fn leg_hosts_attach(
