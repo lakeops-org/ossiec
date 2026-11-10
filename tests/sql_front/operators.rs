@@ -101,6 +101,12 @@ fn grouping_sets_report_every_level() {
             "c.region, o.status, COUNT(*) AS n",
             "GROUP BY CUBE(c.region, o.status)",
         ),
+        // The largest CUBE: 4 columns, 16 sets.
+        (
+            "c.region, o.status, c.segment, c.name, AGG(o.order_count) AS n",
+            "c.region, o.status, c.segment, c.name, COUNT(*) AS n",
+            "GROUP BY CUBE(c.region, o.status, c.segment, c.name)",
+        ),
         // No set has both columns: a branch with no rows types them first.
         (
             "c.region, o.status, AGG(o.order_count) AS n",
@@ -203,6 +209,74 @@ fn grouping_sets_report_every_level() {
             .expect_err(rest)
             .to_string();
         assert!(e.contains(want), "{rest}: {e}");
+    }
+}
+
+/// An `ORDER BY` without `NULLS` means what the consumer's SQL means, NULL as the
+/// smallest value, even when the model's fields pick a vendor dialect that sorts
+/// NULL last (Postgres): both the grouping-set and the ordinary path write it out.
+#[test]
+fn order_by_keeps_nulls_first_under_a_vendor_source() {
+    let g = ossiec::from_yaml(
+        r#"
+version: "0.2.0.dev0"
+name: sales
+datasets:
+  - name: sales
+    source: sales
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: id } }
+      - name: region
+        expression:
+          sql: region
+          dialects:
+            - { dialect: POSTGRES, expression: region }
+    metrics:
+      - { name: n, expression: { sql: COUNT(*) } }
+"#,
+    )
+    .unwrap();
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE sales (id INTEGER, region VARCHAR);
+         INSERT INTO sales VALUES (1, 'a'), (2, 'b'), (3, 'b'), (4, NULL);",
+    )
+    .unwrap();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        prefer_dialect: Some("POSTGRES".into()),
+        ..Default::default()
+    };
+    for (sql, want) in [
+        // NULL regions sort first: the grand total and the NULL region's own group
+        // (n breaks the tie), before 'a'.
+        (
+            "SELECT region, AGG(n) AS n FROM sales GROUP BY ROLLUP(region) \
+             ORDER BY region, n DESC LIMIT 1",
+            vec![vec!["NULL", "4"]],
+        ),
+        // The NULL region's own group sorts first.
+        (
+            "SELECT region, AGG(n) AS n FROM sales GROUP BY region ORDER BY region LIMIT 1",
+            vec![vec!["NULL", "1"]],
+        ),
+        (
+            "SELECT region, AGG(n) AS n FROM sales GROUP BY region ORDER BY region DESC LIMIT 1",
+            vec![vec!["b", "2"]],
+        ),
+    ] {
+        let c = ossiec::compile_sql(&g, sql, &opts).unwrap();
+        assert_eq!(c.source_dialect, "postgres", "{sql}");
+        let got: Vec<Vec<String>> = duckdb_rows(&db, &c.sql)
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| v.trim_end_matches(".000000").to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(got, want, "{sql}\n{}", c.sql);
     }
 }
 

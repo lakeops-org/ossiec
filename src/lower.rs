@@ -151,10 +151,12 @@ pub(crate) fn lower(g: &SemanticGraph, p: &LogicalPlan, ctx: &mut Ctx) -> Result
                 } else {
                     "ASC"
                 };
-                let nulls = match nulls {
-                    Some(Nulls::First) => " NULLS FIRST",
-                    Some(Nulls::Last) => " NULLS LAST",
-                    None => "",
+                // Unwritten, NULL sorts as the smallest value: the order the
+                // consumer's SQL means. Written out, so a vendor source dialect
+                // (Postgres puts NULL last ascending) can't change it on rendering.
+                let nulls = match (nulls, dir) {
+                    (Some(Nulls::First), _) | (None, "ASC") => " NULLS FIRST",
+                    (Some(Nulls::Last), _) | (None, _) => " NULLS LAST",
                 };
                 format!("{a} {dir}{nulls}")
             })

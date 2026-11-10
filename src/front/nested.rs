@@ -135,6 +135,8 @@ pub(super) struct Compiler<'a> {
     pub opts: &'a Options,
     pub ctx: Ctx,
     pub derived_count: usize,
+    /// Placeholders handed to grouping-set branches, numbered apart from derived tables.
+    pub grouping_count: usize,
     /// Next `__l2_bmN` for a query-local base measure.
     pub(super) base_seq: usize,
     /// Outermost `AGG` stage also returns one-side rows no fact reaches.
@@ -159,6 +161,7 @@ pub(super) fn compile(
             ..Default::default()
         },
         derived_count: 0,
+        grouping_count: 0,
         base_seq: 0,
         include_unmatched: opts.include_unmatched || pragma_include_unmatched(sql_text),
         to_measures,
@@ -203,6 +206,7 @@ pub(super) fn view_outputs(
             ..Default::default()
         },
         derived_count: 0,
+        grouping_count: 0,
         base_seq: 0,
         include_unmatched: false,
         to_measures: to_measures.to_vec(),
@@ -649,13 +653,10 @@ impl Compiler<'_> {
         let mut branch_names: Vec<Vec<String>> = vec![];
         let mut first_outputs: Vec<OutCol> = vec![];
         for (set, empty) in plan {
-            if self.derived_count >= MAX_DERIVED {
-                return Err(unsupported(format!(
-                    "Layer 2 allows at most {MAX_DERIVED} derived tables and grouping sets in one query"
-                )));
-            }
-            let placeholder = format!("__ossiec_deriv{}", self.derived_count);
-            self.derived_count += 1;
+            // Grouping sets have their own bound (`MAX_SETS`, checked when they're
+            // expanded), not the derived tables'. The name only has to be unique.
+            let placeholder = format!("__ossiec_derivg{}", self.grouping_count);
+            self.grouping_count += 1;
             let b = branch(sel, &all, set, empty)?;
             let node = self.agg_stage(&b, depth, derived_mode, outer)?;
             branch_names.push(output_names(&node.ast)?);
@@ -705,10 +706,11 @@ impl Compiler<'_> {
                 .map(|o| {
                     let k = order_key(&o.this, &names, sel)?;
                     let dir = if o.desc { "DESC" } else { "ASC" };
-                    let nulls = match o.nulls_first {
-                        Some(true) => " NULLS FIRST",
-                        Some(false) => " NULLS LAST",
-                        None => "",
+                    // Written out, as in `lower`: NULL is the smallest value
+                    // whatever the source dialect, so subtotal rows sort first.
+                    let nulls = match (o.nulls_first, o.desc) {
+                        (Some(true), _) | (None, false) => " NULLS FIRST",
+                        (Some(false), _) | (None, true) => " NULLS LAST",
                     };
                     Ok(format!("__ossiec_grouping.{} {dir}{nulls}", q(&names[k])))
                 })

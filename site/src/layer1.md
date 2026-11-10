@@ -43,6 +43,6 @@ The result, construct by construct and engine by engine, is on [Functions by eng
 ## Engine behaviours ossiec normalizes
 
 - **Strings compare and sort by byte on every engine.** Postgres string dimensions carry `COLLATE "C"`, and MySQL ones `COLLATE utf8mb4_bin`.
-- **NULLs sort first in ascending order**, as in generic SQL; `NULLS FIRST` is emitted where an engine defaults otherwise.
+- **NULLs sort first in ascending order** and last in descending order, as in generic SQL. The order is written into the SQL, so neither the engine's default nor a vendor source dialect (Postgres sorts NULL last ascending) changes it.
 - **A backslash in a `LIKE` pattern is an ordinary character.** On engines that treat it as an escape (Postgres, ClickHouse, StarRocks, MySQL), ossiec doubles it.
 - **ClickHouse's `lag`** returns 0 instead of NULL for the first row; ossiec's dialect rule restores NULL.
