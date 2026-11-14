@@ -57,7 +57,7 @@ pub(super) fn resolve_column_dataset(
         }
         if scope.outer.iter().any(|a| a.eq_ignore_ascii_case(&t.name)) {
             return Err(unsupported(format!(
-                "Layer 2 correlated subquery: `{}.{}` refers to an enclosing query; derived tables must be self-contained",
+                "Layer 2 correlated subquery: `{}.{}` refers to an enclosing query; a subquery or derived table must be self-contained, since correlated ones aren't supported yet",
                 t.name, col.name.name
             )));
         }
