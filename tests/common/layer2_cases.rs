@@ -407,6 +407,61 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.3: correlated subqueries in WHERE, each reading the outer row through
+        // `=`: EXISTS over a joined dataset, NOT IN (NULL keys keep SQL's
+        // meaning), and EXISTS over a grouped subquery with HAVING on a measure.
+        name: "where_correlated_subqueries",
+        sql: "SELECT o.status, AGG(o.order_count) AS n FROM orders o \
+              WHERE EXISTS (SELECT c.id FROM customers c WHERE c.id = o.customer_id AND c.region <> 'APAC') \
+              AND o.product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+                WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') \
+              AND EXISTS (SELECT o3.customer_id FROM orders o3 WHERE o3.customer_id = o.customer_id \
+                GROUP BY o3.customer_id HAVING AGG(o3.order_count) > 1) \
+              GROUP BY o.status",
+        reference: "SELECT o.status, COUNT(*) AS n FROM orders o \
+                    WHERE EXISTS (SELECT 1 FROM {customers} c WHERE c.customer_id = o.customer_id AND c.region <> 'APAC') \
+                    AND o.product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+                      WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') \
+                    AND EXISTS (SELECT 1 FROM orders o3 WHERE o3.customer_id = o.customer_id \
+                      GROUP BY o3.customer_id HAVING COUNT(*) > 1) \
+                    GROUP BY o.status",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.3: a correlated IN keeps SQL's three values under NOT. Order 108 has
+        // no product and its customer's only completed order is itself, so its IN
+        // is NULL and NOT keeps it out; the guest order 106 matches no customer,
+        // so its IN is FALSE and NOT keeps it. (ClickHouse runs it as EXISTS.)
+        name: "where_correlated_in_nulls",
+        sql: "SELECT o.status, AGG(o.order_count) AS n FROM orders o \
+              WHERE NOT (o.product_id IN (SELECT o2.product_id FROM orders o2 \
+                WHERE o2.customer_id = o.customer_id AND o2.status = 'completed')) \
+              GROUP BY o.status",
+        reference: "SELECT o.status, COUNT(*) AS n FROM orders o \
+                    WHERE NOT (o.product_id IN (SELECT o2.product_id FROM orders o2 \
+                      WHERE o2.customer_id = o.customer_id AND o2.status = 'completed')) \
+                    GROUP BY o.status",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.3: correlated scalar subqueries: a plain aggregate (orders above their
+        // customer's average) and a measure, whose value over no matching rows is
+        // the measure over none (0), not NULL.
+        name: "where_correlated_scalars",
+        sql: "SELECT o.status, AGG(o.order_count) AS n FROM orders o \
+              WHERE o.revenue >= (SELECT AVG(o2.revenue) FROM orders o2 WHERE o2.customer_id = o.customer_id) \
+              OR (SELECT AGG(c.known_customers) FROM customers c \
+                WHERE c.id = o.customer_id AND c.region = 'EU') = 0 \
+              GROUP BY o.status",
+        reference: "SELECT o.status, COUNT(*) AS n FROM orders o \
+                    WHERE o.amount_cents / 100.0 >= (SELECT AVG(o2.amount_cents / 100.0) FROM orders o2 \
+                      WHERE o2.customer_id = o.customer_id) \
+                    OR (SELECT COUNT(c.customer_id) FROM {customers} c \
+                      WHERE c.customer_id = o.customer_id AND c.region = 'EU') = 0 \
+                    GROUP BY o.status",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.6: a fan-out written from the many side. `orders LEFT JOIN customers`
         // is `customers RIGHT JOIN orders`: every order is kept, and each customer
         // counts once per status however many orders they placed.

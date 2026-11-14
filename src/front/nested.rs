@@ -29,6 +29,7 @@ use polyglot_sql::expressions::{Alias, Identifier, Null, Select};
 use polyglot_sql::{generate, DialectType, Expression, ExpressionWalk};
 
 use super::catalog::{self, Layer2Catalog};
+use super::correlate;
 use super::{
     apply_consumer_joins, apply_select_formulas, mark_narrowing_legs, parse_stage_from,
     parse_stage_prep, parse_top_select, planned_alias_on_leg, pragma_include_unmatched,
@@ -345,8 +346,9 @@ impl Compiler<'_> {
         let parsed_from = parse_stage_prep(&self.graph, sel, &cfg)?;
 
         // Nested queries see this stage's aliases as "outer" (correlation check).
+        let stage = stage_aliases(&self.graph, &parsed_from);
         let mut inner_outer = outer.to_vec();
-        inner_outer.extend(stage_aliases(&self.graph, &parsed_from));
+        inner_outer.extend(stage.iter().cloned());
 
         // Compile the derived tables first: the select list may read their
         // unevaluated measures (`AGG(t.m)`, §7.7).
@@ -359,7 +361,7 @@ impl Compiler<'_> {
         }
         // Subqueries in WHERE (§7.3): each a Layer 2 query of its own, read through
         // a placeholder until `resolve` puts it in place.
-        let (sel, subqueries) = self.where_subqueries(sel, depth, &inner_outer)?;
+        let (sel, subqueries) = self.where_subqueries(sel, depth, &inner_outer, &stage)?;
         let sel = &sel;
         let where_placeholders: Vec<String> = subqueries.iter().map(|(p, _)| p.clone()).collect();
         let cfg = StageCfg {
@@ -596,13 +598,15 @@ impl Compiler<'_> {
 impl Compiler<'_> {
     /// §7.3: each subquery in `sel`'s `WHERE`, outermost first, compiled as a Layer 2
     /// query of its own (any nested in it are compiled with it), and replaced by
-    /// `(SELECT * FROM <placeholder> AS …)`. A subquery reading this query's
-    /// columns is correlated, which the inner compile refuses by name.
+    /// `(SELECT * FROM <placeholder> AS …)`. A subquery that reads this stage's
+    /// columns (`stage` names its relations) is correlated: see
+    /// [`super::correlate`]. One that reads a query further out is refused by name.
     fn where_subqueries(
         &mut self,
         sel: &Select,
         depth: usize,
         outer: &[String],
+        stage: &[String],
     ) -> Result<(Select, Vec<(String, Node)>)> {
         let Some(w) = &sel.where_clause else {
             return Ok((sel.clone(), vec![]));
@@ -631,6 +635,18 @@ impl Compiler<'_> {
                 _ => None,
             })
             .collect();
+        // Queries that are the right side of `IN`.
+        let in_bodies: Vec<&Expression> = w
+            .this
+            .dfs()
+            .filter_map(|x| match x {
+                Expression::In(i) => i.query.as_ref().map(|q| match q {
+                    Expression::Subquery(s) => &s.this,
+                    other => other,
+                }),
+                _ => None,
+            })
+            .collect();
         let mut compiled: Vec<(Expression, Expression)> = vec![];
         let mut pending = vec![];
         for top in tops {
@@ -649,6 +665,7 @@ impl Compiler<'_> {
                     )));
                 }
             }
+            let correlation = correlate::correlate(&mut select, stage)?;
             let (placeholder, node) = self.derived(&select, depth + 1, outer)?;
             if let Some(m) = node
                 .outputs
@@ -660,23 +677,92 @@ impl Compiler<'_> {
                     m.name
                 )));
             }
+            // The columns the consumer wrote, without the keys a correlation added.
+            let outputs: Vec<String> = node
+                .outputs
+                .iter()
+                .map(|o| o.name.clone())
+                .filter(|n| correlation.is_none() || !n.starts_with(correlate::KEY))
+                .collect();
             let exists = exists_bodies.iter().any(|b| std::ptr::eq(*b, top));
-            if !exists && node.outputs.len() != 1 {
+            if !exists && outputs.len() != 1 {
                 return Err(Error::Request(format!(
                     "Layer 2 subquery in WHERE must return one column, as SQL requires outside EXISTS; it returns {}",
-                    node.outputs.len()
+                    outputs.len()
                 )));
             }
-            let stand_in = sql::parse(
-                &format!(
-                    "SELECT * FROM {placeholder} AS __ossiec_sq{}",
-                    pending.len()
-                ),
-                DialectType::Generic,
-            )
-            .map_err(Error::Internal)?;
-            compiled.push((top.clone(), stand_in));
-            pending.push((placeholder, node));
+            let sq = format!("{}{}", sql::STAND_IN_PREFIX, pending.len());
+            match correlation {
+                None => {
+                    let stand_in = sql::parse(
+                        &format!("SELECT * FROM {placeholder} AS {sq}"),
+                        DialectType::Generic,
+                    )
+                    .map_err(Error::Internal)?;
+                    compiled.push((top.clone(), stand_in));
+                    pending.push((placeholder, node));
+                }
+                Some(corr) => match &corr.empty {
+                    // `x [NOT] IN (<correlated>)` where the target takes only
+                    // correlated EXISTS: the whole IN becomes EXISTS forms.
+                    None if !crate::dialect::supports_correlated_in(self.opts.target) => {
+                        let in_node = w.this.dfs().find(|x| match x {
+                            Expression::In(i) => i.query.as_ref().is_some_and(|q| match q {
+                                Expression::Subquery(s) => std::ptr::eq(&s.this, top),
+                                other => std::ptr::eq(other, top),
+                            }),
+                            _ => false,
+                        });
+                        let stand_in = match in_node {
+                            Some(Expression::In(i)) => {
+                                let replacement = correlate::in_as_exists(
+                                    &corr,
+                                    &placeholder,
+                                    &sq,
+                                    &outputs[0],
+                                    &i.this,
+                                    i.not,
+                                )?;
+                                compiled.push((in_node.cloned().expect("found"), replacement));
+                                None
+                            }
+                            _ => Some(correlate::stand_in(&corr, &placeholder, &sq, &outputs)?),
+                        };
+                        if let Some(stand_in) = stand_in {
+                            compiled.push((top.clone(), stand_in));
+                        }
+                        pending.push((placeholder, node));
+                    }
+                    None => {
+                        let stand_in = correlate::stand_in(&corr, &placeholder, &sq, &outputs)?;
+                        compiled.push((top.clone(), stand_in));
+                        pending.push((placeholder, node));
+                    }
+                    Some(empty) => {
+                        let scalar = !exists && !in_bodies.iter().any(|b| std::ptr::eq(*b, top));
+                        // The `( … )` around the subquery, which the scalar replaces.
+                        let around = w.this.dfs().find(
+                            |x| matches!(x, Expression::Subquery(s) if std::ptr::eq(&s.this, top)),
+                        );
+                        let (true, Some(around)) = (scalar, around) else {
+                            return Err(unsupported(
+                                "Layer 2 correlated subquery that aggregates without GROUP BY is supported as a scalar value (`x > (SELECT AGG(m) …)`); in EXISTS or IN, group it by the correlated column instead",
+                            ));
+                        };
+                        let (none, none_node) = self.derived(empty, depth + 1, outer)?;
+                        let stand_in = correlate::scalar_with_default(
+                            &corr,
+                            &placeholder,
+                            &sq,
+                            &none,
+                            &outputs[0],
+                        )?;
+                        compiled.push((around.clone(), stand_in));
+                        pending.push((placeholder, node));
+                        pending.push((none, none_node));
+                    }
+                },
+            }
         }
         let this = sql::transform(w.this.clone(), &|x| {
             Ok(Some(

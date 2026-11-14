@@ -37,6 +37,7 @@ Each rule exists because an engine test showed polyglot's rendering answering di
 |---|---|---|
 | ClickHouse | No standard `LAG`/`LEAD`; its `lag` returns 0, not NULL, for the first row | `lagInFrame(toNullable(x), n)` over the whole partition |
 | ClickHouse | An unmatched `LEFT JOIN` column is the type's default (0, `''`), not NULL, so orphan rows merge into real groups | `SETTINGS join_use_nulls = 1` on the query |
+| ClickHouse | A correlated subquery can't be the right side of `IN` ("not supported as IN function arguments yet"), and a correlated `EXISTS` condition that reads only the outer row finds no row | `x [NOT] IN (…)` becomes correlated `EXISTS` forms with `IN`'s TRUE / NULL / FALSE answer, with every outer-only condition outside them (`where_correlated_subqueries`, `where_correlated_in_nulls`) |
 | Postgres | `UNION` branches are typed pairwise, so two bare `NULL`s become `text` and clash with a number | Each `NULL` takes its term's type |
 | Postgres | Locale collation sorts `'ada'` before `'Bob'` | `COLLATE "C"` on string dimensions |
 | MySQL | Default collation compares case-insensitively, merging `Ada` and `ada` | `COLLATE utf8mb4_bin` on string dimensions and filters |

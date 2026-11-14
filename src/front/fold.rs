@@ -217,6 +217,29 @@ impl FoldMap {
     /// inner column of the same name once the derived table is folded away, and
     /// filter on the wrong column without an error. A subquery keeps its own
     /// scope, so it's left untouched; an `AGG()` call goes through its own arm.
+    /// A subquery that reads this derived table's row would read a relation the
+    /// fold removes; the inner expression a column stands for can't be put in the
+    /// subquery's scope either, where its names may mean the subquery's own.
+    fn refuse_correlated(&self, sub: &Expression) -> Result<()> {
+        let reads = sub.dfs().find_map(|y| match y {
+            Expression::Column(c)
+                if c.table
+                    .as_ref()
+                    .is_some_and(|t| t.name.eq_ignore_ascii_case(&self.alias)) =>
+            {
+                Some(c.name.name.clone())
+            }
+            _ => None,
+        });
+        match reads {
+            Some(name) => Err(unsupported(format!(
+                "Layer 2 correlated subquery reads `{}.{name}` of a derived table that AGG() folds into the query (§7.7); correlate it with the dataset instead (FROM orders o … WHERE EXISTS (SELECT … WHERE … = o.customer_id))",
+                self.alias
+            ))),
+            None => Ok(()),
+        }
+    }
+
     fn walk(&self, e: &Expression, skip: &[String]) -> Result<Expression> {
         const STAND_IN: &str = "__ossiec_fold";
         // Outermost subqueries and AGG() calls, set aside behind stand-ins: the
@@ -231,7 +254,10 @@ impl FoldMap {
             };
             if opaque && !kept.iter().any(|(k, _)| k.contains(|y| std::ptr::eq(y, x))) {
                 let replacement = match x {
-                    Expression::Select(_) => x.clone(),
+                    Expression::Select(_) => {
+                        self.refuse_correlated(x)?;
+                        x.clone()
+                    }
                     _ => self.expr(x, skip)?,
                 };
                 kept.push((x, replacement));

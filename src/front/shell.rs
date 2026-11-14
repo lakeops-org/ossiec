@@ -398,7 +398,7 @@ impl Scope<'_> {
             else {
                 if self.outer.iter().any(|a| a.eq_ignore_ascii_case(&t.name)) {
                     return Err(unsupported(format!(
-                        "Layer 2 correlated subquery: `{}.{name}` refers to an enclosing query",
+                        "Layer 2 `{}.{name}` refers to an enclosing query that is not the one directly around it: a correlated subquery reads only that one, with `=` in its own WHERE, and a derived table reads none",
                         t.name
                     )));
                 }
