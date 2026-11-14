@@ -65,7 +65,6 @@ fn where_accepts_any_row_predicate() {
     for (predicate, want) in [
         ("AGG(order_count) > 1", "aggregate"),
         ("SUM(id) > 1", "aggregate"),
-        ("id IN (SELECT 1)", "subqueries"),
         ("nope = 1 OR id = 1", "nope"),
         ("order_count = 1 OR id = 1", "order_count"),
     ] {
@@ -76,6 +75,126 @@ fn where_accepts_any_row_predicate() {
             .expect_err(predicate)
             .to_string();
         assert!(e.contains(want), "{predicate}: {e}");
+    }
+}
+
+/// §7.3: a subquery in `WHERE` is a Layer 2 query of its own, compiled as one and
+/// read by the predicate as SQL reads it: `IN`, `NOT IN`, `EXISTS` and a scalar.
+/// It can evaluate a measure (`HAVING AGG(...)`) and hold a subquery of its own.
+/// Each answer is the same query in plain SQL over the source tables.
+#[test]
+fn where_reads_subqueries() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let customers = "(SELECT * FROM raw_customers WHERE NOT deleted)";
+    for (predicate, reference) in [
+        (
+            "customer_id IN (SELECT c.id FROM customers c WHERE c.segment = 'smb')",
+            format!("customer_id IN (SELECT customer_id FROM {customers} WHERE segment = 'smb')"),
+        ),
+        (
+            "customer_id NOT IN (SELECT c.id FROM customers c WHERE c.region = 'EU')",
+            format!("customer_id NOT IN (SELECT customer_id FROM {customers} WHERE region = 'EU')"),
+        ),
+        (
+            "EXISTS (SELECT c.id FROM customers c WHERE c.region = 'APAC')",
+            format!("EXISTS (SELECT 1 FROM {customers} WHERE region = 'APAC')"),
+        ),
+        (
+            "status = 'completed' OR NOT EXISTS (SELECT c.id FROM customers c WHERE c.region = 'nowhere')",
+            format!("status = 'completed' OR NOT EXISTS (SELECT 1 FROM {customers} WHERE region = 'nowhere')"),
+        ),
+        // A scalar subquery, here a plain aggregate.
+        (
+            "id > (SELECT MIN(o2.id) FROM orders o2 WHERE o2.status = 'returned')",
+            "order_id > (SELECT MIN(order_id) FROM orders WHERE status = 'returned')".to_string(),
+        ),
+        // A subquery that evaluates a measure: customers with more than one order.
+        (
+            "customer_id IN (SELECT o2.customer_id FROM orders o2 GROUP BY o2.customer_id \
+             HAVING AGG(o2.order_count) > 1)",
+            "customer_id IN (SELECT customer_id FROM orders GROUP BY customer_id \
+             HAVING COUNT(*) > 1)"
+                .to_string(),
+        ),
+        // A subquery inside a subquery.
+        (
+            "customer_id IN (SELECT c.id FROM customers c WHERE c.id IN \
+             (SELECT o2.customer_id FROM orders o2 WHERE o2.status = 'returned'))",
+            format!(
+                "customer_id IN (SELECT customer_id FROM {customers} WHERE customer_id IN \
+                 (SELECT customer_id FROM orders WHERE status = 'returned'))"
+            ),
+        ),
+    ] {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let compiled =
+            ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{predicate}: {e}"));
+        let got = sorted(duckdb_rows(&db, &compiled.sql));
+        let want = sorted(duckdb_rows(
+            &db,
+            &format!("SELECT status, COUNT(*) FROM orders WHERE {reference} GROUP BY status"),
+        ));
+        assert_eq!(got, want, "{predicate}\n{}", compiled.sql);
+        assert!(!want.is_empty(), "{predicate}: proves nothing");
+    }
+    for (predicate, want) in [
+        // It reads the outer query's row: correlated, not supported yet.
+        (
+            "EXISTS (SELECT c.id FROM customers c WHERE c.id = orders.customer_id)",
+            "correlated",
+        ),
+        (
+            "customer_id IN (SELECT c.id, c.region FROM customers c)",
+            "one column",
+        ),
+        (
+            "customer_id IN (SELECT o2.customer_id, o2.order_count FROM orders o2)",
+            "unevaluated measure",
+        ),
+    ] {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(predicate)
+            .to_string();
+        assert!(e.contains(want), "{predicate}: {e}");
+    }
+    // A subquery shaped like ossiec's stand-in for a compiled one is nothing of
+    // the kind when the consumer writes it: in WHERE it is compiled as a query
+    // (and has no such dataset), and HAVING and sql_to_request take none.
+    let stand_in = "status IN (SELECT * FROM __ossiec_deriv0 AS x)";
+    for sql in [
+        format!("SELECT status, AGG(order_count) FROM orders WHERE {stand_in} GROUP BY status"),
+        format!("SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING {stand_in}"),
+    ] {
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(&sql)
+            .to_string();
+        assert!(!e.contains("internal"), "{sql}: {e}");
+    }
+    let e = ossiec::compile_sql(
+        &g,
+        &format!("SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING {stand_in}"),
+        &duck(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("HAVING does not support subqueries"), "{e}");
+    for predicate in [
+        stand_in,
+        "customer_id IN (SELECT c.id FROM customers c WHERE c.segment = 'smb')",
+    ] {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let e = ossiec::sql_to_request(&g, &sql)
+            .expect_err(predicate)
+            .to_string();
+        assert!(e.contains("compiled by compile_sql"), "{predicate}: {e}");
     }
 }
 

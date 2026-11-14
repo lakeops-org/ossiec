@@ -118,7 +118,9 @@ fn filter_ref(g: &SemanticGraph, c: &Column) -> FilterRef {
 /// The `filter` expression, or `E_INVALID_QUERY` if it isn't one. It is read as a
 /// `WHERE` clause, which also takes `((a)) AND b`, and nothing but that clause may
 /// come out: `a = 1 ORDER BY 2` and a second statement are not expressions.
-pub(crate) fn parse_filter(text: &str) -> Result<Expression> {
+/// A query in it is refused, except, with `placeholders`, a Layer 2 `WHERE`
+/// subquery that was compiled on its own ([`sql::is_subquery_placeholder`]).
+pub(crate) fn parse_filter(text: &str, placeholders: bool) -> Result<Expression> {
     let not_one = |why: String| {
         reject::<Expression>(
             ErrorCode::InvalidQuery,
@@ -140,7 +142,13 @@ pub(crate) fn parse_filter(text: &str) -> Result<Expression> {
     if rest.as_deref().ok() != Some("SELECT 1") {
         return not_one(format!("`{text}`"));
     }
-    if ast.contains(|e| is_query(e) || is_subquery(e)) {
+    let placeholder = |e: &Expression| placeholders && sql::is_subquery_placeholder(e);
+    let inside_placeholder = |e: &Expression| {
+        ast.contains(|p| {
+            placeholder(p) && (std::ptr::eq(p, e) || p.contains(|x| std::ptr::eq(x, e)))
+        })
+    };
+    if ast.contains(|e| (is_query(e) || is_subquery(e)) && !inside_placeholder(e)) {
         return reject(
             ErrorCode::InvalidQuery,
             format!("`filter` cannot contain a query: `{text}`"),
@@ -209,7 +217,12 @@ pub(crate) fn check(g: &SemanticGraph, req: &Request, ctx: &mut Ctx) -> Result<(
             "`includeUnmatched` has nothing to add in Layer 3: every metric already reads all the rows of its home dataset. For a Layer 2 query, set it there",
         );
     }
-    let filter = req.filter.as_deref().map(parse_filter).transpose()?;
+    // Layer 3: a query in `filter` is refused.
+    let filter = req
+        .filter
+        .as_deref()
+        .map(|f| parse_filter(f, false))
+        .transpose()?;
     for f in &req.filters {
         // The field isn't resolved yet, and the shape of a value doesn't depend on it.
         plan::predicate(sql::col("x"), f.op, f.value.as_ref(), &f.values, None).or_else(|e| {

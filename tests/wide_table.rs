@@ -457,6 +457,12 @@ fn every_row_of_section_8() {
             "E_INVALID_QUERY",
             r#"{"metrics": ["orders.total_revenue"], "filter": "orders.amount IN (SELECT 1)"}"#,
         ),
+        // Layer 2's stand-in for a compiled WHERE subquery is no way in for Layer 3.
+        (
+            InvalidQuery,
+            "E_INVALID_QUERY",
+            r#"{"metrics": ["orders.total_revenue"], "filter": "orders.amount IN (SELECT * FROM __ossiec_deriv0 AS x)"}"#,
+        ),
         (
             InvalidQuery,
             "E_INVALID_QUERY",

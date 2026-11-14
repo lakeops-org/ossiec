@@ -25,7 +25,7 @@
 //! measure's input rows. [`Node::unique_key`] tracks this; the outer shell
 //! evaluates no `AGG()`, so it needs no such rule.
 
-use polyglot_sql::expressions::Select;
+use polyglot_sql::expressions::{Alias, Identifier, Null, Select};
 use polyglot_sql::{generate, DialectType, Expression, ExpressionWalk};
 
 use super::catalog::{self, Layer2Catalog};
@@ -340,6 +340,7 @@ impl Compiler<'_> {
             derived: derived_mode,
             outer,
             to_measures: &to_measures,
+            compiled: &[],
         };
         let parsed_from = parse_stage_prep(&self.graph, sel, &cfg)?;
 
@@ -356,6 +357,15 @@ impl Compiler<'_> {
             schemas.push((spec.alias.clone(), node.outputs.clone()));
             compiled.push((placeholder, node));
         }
+        // Subqueries in WHERE (§7.3): each a Layer 2 query of its own, read through
+        // a placeholder until `resolve` puts it in place.
+        let (sel, subqueries) = self.where_subqueries(sel, depth, &inner_outer)?;
+        let sel = &sel;
+        let where_placeholders: Vec<String> = subqueries.iter().map(|(p, _)| p.clone()).collect();
+        let cfg = StageCfg {
+            compiled: &where_placeholders,
+            ..cfg
+        };
         let mut base_seq = self.base_seq;
         let mut parsed =
             parse_stage_from(&self.graph, sel, &cfg, parsed_from, &schemas, &mut base_seq)?;
@@ -404,7 +414,7 @@ impl Compiler<'_> {
         }
         let graph = &self.graph;
 
-        let mut pending = vec![];
+        let mut pending = subqueries;
         // (placeholder, derived columns as emitted) per derived table.
         let mut prepared: Vec<(String, Vec<String>)> = vec![];
         let aggregates = !parsed.request.metrics.is_empty();
@@ -580,6 +590,122 @@ impl Compiler<'_> {
             unique_key,
             pending,
         })
+    }
+}
+
+impl Compiler<'_> {
+    /// §7.3: each subquery in `sel`'s `WHERE`, outermost first, compiled as a Layer 2
+    /// query of its own (any nested in it are compiled with it), and replaced by
+    /// `(SELECT * FROM <placeholder> AS …)`. A subquery reading this query's
+    /// columns is correlated, which the inner compile refuses by name.
+    fn where_subqueries(
+        &mut self,
+        sel: &Select,
+        depth: usize,
+        outer: &[String],
+    ) -> Result<(Select, Vec<(String, Node)>)> {
+        let Some(w) = &sel.where_clause else {
+            return Ok((sel.clone(), vec![]));
+        };
+        // Outermost queries only: a pre-order walk meets each before those inside it.
+        let mut tops: Vec<&Expression> = vec![];
+        for x in w.this.dfs() {
+            if matches!(x, Expression::Select(_))
+                && !tops.iter().any(|t| t.contains(|y| std::ptr::eq(y, x)))
+            {
+                tops.push(x);
+            }
+        }
+        if tops.is_empty() {
+            return Ok((sel.clone(), vec![]));
+        }
+        // Bodies of EXISTS, which may return any columns; elsewhere, one value.
+        let exists_bodies: Vec<&Expression> = w
+            .this
+            .dfs()
+            .filter_map(|x| match x {
+                Expression::Exists(ex) => Some(match &ex.this {
+                    Expression::Subquery(s) => &s.this,
+                    other => other,
+                }),
+                _ => None,
+            })
+            .collect();
+        let mut compiled: Vec<(Expression, Expression)> = vec![];
+        let mut pending = vec![];
+        for top in tops {
+            let Expression::Select(select) = top else {
+                unreachable!("tops are selects")
+            };
+            // Its columns are read by position, never by name, so an unnamed
+            // aggregate needs none: give it one, as a derived table requires.
+            let mut select = (**select).clone();
+            for (i, item) in select.expressions.iter_mut().enumerate() {
+                if !matches!(item, Expression::Alias(_) | Expression::Column(_)) {
+                    let this = std::mem::replace(item, Expression::Null(Null));
+                    *item = Expression::Alias(Box::new(Alias::new(
+                        this,
+                        Identifier::new(format!("__ossiec_v{i}")),
+                    )));
+                }
+            }
+            let (placeholder, node) = self.derived(&select, depth + 1, outer)?;
+            if let Some(m) = node
+                .outputs
+                .iter()
+                .find(|o| matches!(o.kind, OutKind::UnevaluatedMeasure { .. }))
+            {
+                return Err(unsupported(format!(
+                    "Layer 2 subquery in WHERE returns `{}`, an unevaluated measure: evaluate it with AGG()",
+                    m.name
+                )));
+            }
+            let exists = exists_bodies.iter().any(|b| std::ptr::eq(*b, top));
+            if !exists && node.outputs.len() != 1 {
+                return Err(Error::Request(format!(
+                    "Layer 2 subquery in WHERE must return one column, as SQL requires outside EXISTS; it returns {}",
+                    node.outputs.len()
+                )));
+            }
+            let stand_in = sql::parse(
+                &format!(
+                    "SELECT * FROM {placeholder} AS __ossiec_sq{}",
+                    pending.len()
+                ),
+                DialectType::Generic,
+            )
+            .map_err(Error::Internal)?;
+            compiled.push((top.clone(), stand_in));
+            pending.push((placeholder, node));
+        }
+        let this = sql::transform(w.this.clone(), &|x| {
+            Ok(Some(
+                compiled
+                    .iter()
+                    .find(|(original, _)| *original == x)
+                    .map_or(x, |(_, stand_in)| stand_in.clone()),
+            ))
+        })
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        // A subquery identical to one nested in another would have changed its
+        // parent before the parent was matched.
+        let left = this.contains(|x| {
+            matches!(x, Expression::Select(_))
+                && !sql::is_subquery_placeholder(x)
+                && !this.contains(|p| {
+                    sql::is_subquery_placeholder(p) && p.contains(|y| std::ptr::eq(y, x))
+                })
+        });
+        if left {
+            return Err(unsupported(
+                "Layer 2 WHERE repeats a subquery inside another one; write it once",
+            ));
+        }
+        let mut out = sel.clone();
+        if let Some(w) = out.where_clause.as_mut() {
+            w.this = this;
+        }
+        Ok((out, pending))
     }
 }
 

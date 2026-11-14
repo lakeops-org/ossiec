@@ -197,6 +197,7 @@ fn collect_promotable(
         derived: true,
         outer: &[],
         to_measures,
+        compiled: &[],
     };
     let parsed_from = parse_stage_prep(graph, sel, &cfg)?;
     let schemas: Vec<(String, Vec<OutCol>)> = parsed_from

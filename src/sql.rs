@@ -192,6 +192,36 @@ pub(crate) fn placeholder_relation(placeholder: &str, alias: &str) -> Expression
 
 /// Replace every placeholder relation `placeholder` in `ast` by `(inner) AS alias`.
 /// The alias is the one the placeholder was given.
+/// Placeholder relations start with this; `substitute_relation` fills them in.
+pub(crate) const PLACEHOLDER_PREFIX: &str = "__ossiec_deriv";
+
+/// `SELECT * FROM __ossiec_derivN AS …`, alone or as `( … )`: a Layer 2 `WHERE`
+/// subquery that was compiled on its own, standing in for it until
+/// `substitute_relation` puts the compiled query in its place.
+pub(crate) fn is_subquery_placeholder(e: &Expression) -> bool {
+    subquery_placeholder(e).is_some()
+}
+
+/// The placeholder relation a [`is_subquery_placeholder`] reads.
+pub(crate) fn subquery_placeholder(e: &Expression) -> Option<&str> {
+    match e {
+        Expression::Subquery(s) => subquery_placeholder(&s.this),
+        Expression::Select(s)
+            if matches!(s.expressions.as_slice(), [Expression::Star(_)])
+                && s.joins.is_empty()
+                && s.where_clause.is_none() =>
+        {
+            match s.from.as_ref()?.expressions.as_slice() {
+                [Expression::Table(t)] if t.name.name.starts_with(PLACEHOLDER_PREFIX) => {
+                    Some(t.name.name.as_str())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn substitute_relation(
     ast: Expression,
     placeholder: &str,

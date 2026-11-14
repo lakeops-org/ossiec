@@ -230,6 +230,9 @@ pub(super) struct StageCfg<'a> {
     pub outer: &'a [String],
     /// Expressions of the query's `TO MEASURE` items, by marker index.
     pub to_measures: &'a [Expression],
+    /// Placeholders of the `WHERE` subqueries compiled for this stage
+    /// (`Compiler::where_subqueries`). Only these may stand in `WHERE`.
+    pub compiled: &'a [String],
 }
 
 /// A derived table joined to an `AGG` stage: `JOIN (<select>) alias ON ...`.
@@ -378,6 +381,7 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
         derived: false,
         outer: &[],
         to_measures: &to_measures,
+        compiled: &[],
     };
     let parsed_from = parse_stage_prep(graph, &sel, &cfg)?;
     if !parsed_from.derived.is_empty() {
