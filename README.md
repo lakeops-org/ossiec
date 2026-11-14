@@ -480,7 +480,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [ ] Layer 2 quoted references to a derived table's columns follow the identifier rules (today they match regardless of quotes)
 - [x] Layer 2 `WHERE` comparison, `IN`, `NOT IN`, `BETWEEN` or `LIKE` on one of several independent facts' plain-column fields, narrowing the others
 - [ ] Layer 2 `WHERE` on one of several independent facts' columns beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column (`IS NULL`, `NOT BETWEEN`, `NOT LIKE`, a field defined as an expression such as `COALESCE(amount, 0)`, a predicate over two facts): refused today
-- [ ] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`): refused today; `orders o RIGHT JOIN order_items i` works
+- [x] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`), as `orders o RIGHT JOIN order_items i` is
 - [x] Layer 2 subqueries in `WHERE` (`IN`, `NOT IN`, `EXISTS`, scalar), each compiled as a Layer 2 query
 - [ ] Layer 2 correlated subqueries, subqueries in the select list, `HAVING` and `ORDER BY`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`

@@ -27,7 +27,7 @@ Compile from the CLI with `ossiec compile-sql model.yaml query.sql --dialect tri
 |---|---|---|
 | `AGG()` and arithmetic over it | `AGG(revenue) / AGG(ticket_count)` | §6, §7.2 |
 | Plain aggregates beside measures, and arithmetic on them | `MAX(order_date)`, `SUM(revenue) / COUNT(*)`, `COUNT(*) - AGG(order_count)` | §7.2 |
-| Any join kind along a model relationship | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, from either side; a comma `FROM` is a `CROSS JOIN`, as in SQL | §7.6, A.5, A.6 |
+| Any join kind along a model relationship | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, from either side, including a fan-out written from the many side (`order_items i LEFT JOIN orders o` reading `AGG(o.order_count)` counts each order once); a comma `FROM` is a `CROSS JOIN`, as in SQL | §7.6, A.5, A.6 |
 | `WHERE` as any row predicate | comparisons, `IN`, `LIKE`, `BETWEEN`, `OR`, `NOT`, across datasets, and subqueries (`IN (SELECT …)`, `EXISTS`, a scalar `(SELECT MIN(…) …)`), each a Layer 2 query of its own that can evaluate `AGG()` | §7.3, §7.7 |
 | `GROUP BY`, `GROUP BY ALL` | `GROUP BY ALL` groups by the selected non-aggregates | §7.4 |
 | `HAVING`, `ORDER BY`, `LIMIT` | `ORDER BY AGG(revenue) DESC LIMIT 10`, `HAVING COUNT(*) > 5`; neither needs to be selected | §7.5 |
@@ -116,5 +116,4 @@ ossiec refuses these with a clear message rather than answer differently from th
 - `ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins
 - A `CROSS JOIN` (or comma `FROM`) spanning independent facts, and a comma `FROM` combined with a `RIGHT` or `FULL` join
 - A `WHERE` on one of several independent facts' columns that a NULL can pass (`o.amount IS NULL`), a predicate there that isn't a comparison, `IN`, `NOT IN`, `BETWEEN` or `LIKE` against literals (`NOT BETWEEN`, `NOT LIKE`, an `IN` list with `NULL`), one on a field the model defines as an expression (a field `COALESCE(amount, 0)` compared with `= 0`), or one that reads two facts at once. Those forms on a field that is a plain column (`o.amount > 10`, `o.status IN ('a', 'b')`) work
-- A fan-out written from the many side (`order_items i LEFT JOIN orders o` reading `AGG(o.order_count)`); `orders o RIGHT JOIN order_items i` works
 - A one-side measure on a dataset with no `primary_key` (de-duplication needs one), except where a join only pads with NULLs
