@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 156 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 158 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -128,7 +128,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 §7.2 aggregated queries and plain aggregates, §7.7 pass-through, query-local `TO MEASURE`, and the fold of a sole derived table.
 
-[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 33 tests
+[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 35 tests
 
 | Test | What it shows |
 |---|---|
@@ -140,6 +140,8 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 | `s77_nested_fold_refuses_an_aggregating_innermost` | The innermost query groups, and folding would drop its GROUP BY: refused. |
 | `s77_from_only_folds_filter_and_projection` |  |
 | `s77_from_only_with_renames` |  |
+| `fold_rewrites_columns_in_every_outer_predicate` |  |
+| `fold_refuses_an_outer_predicate_on_a_hidden_column` |  |
 | `s77_from_only_spec_example_on_dataset_scoped_total_revenue` |  |
 | `s77_from_only_as_a_derived_table_of_a_larger_query` |  |
 | `to_measure_defers_a_ratio_to_the_outer_agg` |  |

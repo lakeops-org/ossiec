@@ -35,7 +35,7 @@
 use polyglot_sql::expressions::{
     Alias, BinaryOp, Column, GroupBy, Identifier, OrderBy, Ordered, Select, Where,
 };
-use polyglot_sql::Expression;
+use polyglot_sql::{Expression, ExpressionWalk};
 
 use super::nested::{Compiler, Node};
 use super::to_measure::marker_index;
@@ -207,7 +207,59 @@ impl FoldMap {
                 n.this = rec(&i.this)?;
                 Expression::IsNull(Box::new(n))
             }
-            other => other.clone(),
+            other => self.walk(other, skip)?,
+        })
+    }
+
+    /// Every other expression (`IN`, `OR`, `NOT`, `LIKE`, `BETWEEN`, `CASE`,
+    /// functions, …): each column reference in it is rewritten as [`Self::expr`]
+    /// rewrites a bare one. Left as written, an unqualified name would bind to an
+    /// inner column of the same name once the derived table is folded away, and
+    /// filter on the wrong column without an error. A subquery keeps its own
+    /// scope, so it's left untouched; an `AGG()` call goes through its own arm.
+    fn walk(&self, e: &Expression, skip: &[String]) -> Result<Expression> {
+        const STAND_IN: &str = "__ossiec_fold";
+        // Outermost subqueries and AGG() calls, set aside behind stand-ins: the
+        // rewrite below is bottom-up and must not reach inside them.
+        let mut kept: Vec<(&Expression, Expression)> = vec![];
+        for x in e.dfs() {
+            let opaque = match x {
+                Expression::Select(_) => true,
+                Expression::Function(f) => is_agg_name(&f.name),
+                Expression::AggregateFunction(f) => is_agg_name(&f.name),
+                _ => false,
+            };
+            if opaque && !kept.iter().any(|(k, _)| k.contains(|y| std::ptr::eq(y, x))) {
+                let replacement = match x {
+                    Expression::Select(_) => x.clone(),
+                    _ => self.expr(x, skip)?,
+                };
+                kept.push((x, replacement));
+            }
+        }
+        let stand_in = |i: usize| Expression::column(format!("{STAND_IN}{i}"));
+        let failed = std::cell::RefCell::new(None);
+        let fail = |err: Error| {
+            failed.borrow_mut().get_or_insert(err);
+            polyglot_sql::Error::Internal("fold".into())
+        };
+        let swapped = polyglot_sql::transform_all(e.clone(), &|x| {
+            Ok(kept.iter().position(|(k, _)| **k == x).map_or(x, stand_in))
+        });
+        let rewritten = swapped.and_then(|x| {
+            polyglot_sql::transform_all(x, &|x| match x {
+                Expression::Column(ref c) if c.name.name.starts_with(STAND_IN) => {
+                    let i: usize = c.name.name[STAND_IN.len()..].parse().unwrap_or(usize::MAX);
+                    Ok(kept.get(i).map_or(x, |(_, r)| r.clone()))
+                }
+                Expression::Column(_) => self.expr(&x, skip).map_err(fail),
+                other => Ok(other),
+            })
+        });
+        rewritten.map_err(|e| {
+            failed
+                .take()
+                .unwrap_or_else(|| Error::Internal(e.to_string()))
         })
     }
 

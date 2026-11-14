@@ -311,6 +311,71 @@ fn s77_from_only_with_renames() {
 }
 
 #[test]
+fn fold_rewrites_columns_in_every_outer_predicate() {
+    // `id` is the derived table's name for `customer_id`; `orders` has an `id`
+    // of its own (`order_id`). Each outer predicate must read the renamed
+    // column, never the inner `orders.id`, whatever expression holds it.
+    for (outer, flat) in [
+        (
+            "id IN (SELECT id FROM customers WHERE region = 'EU')",
+            "customer_id IN (SELECT id FROM customers WHERE region = 'EU')",
+        ),
+        ("id IN (1, 2)", "customer_id IN (1, 2)"),
+        ("id NOT IN (1, 2)", "customer_id NOT IN (1, 2)"),
+        ("id = 1 OR id = 2", "customer_id = 1 OR customer_id = 2"),
+        ("NOT (id = 1)", "NOT (customer_id = 1)"),
+        ("id BETWEEN 1 AND 2", "customer_id BETWEEN 1 AND 2"),
+        ("s LIKE 'comp%'", "status LIKE 'comp%'"),
+        (
+            "CASE WHEN id = 1 THEN s = 'completed' ELSE TRUE END",
+            "CASE WHEN customer_id = 1 THEN status = 'completed' ELSE TRUE END",
+        ),
+        ("COALESCE(t.id, 0) = 1", "COALESCE(customer_id, 0) = 1"),
+    ] {
+        let sql = format!(
+            "SELECT s, AGG(order_count) AS n \
+             FROM (SELECT customer_id AS id, status AS s, order_count FROM orders) t \
+             WHERE {outer} GROUP BY s ORDER BY s"
+        );
+        let c = ossiec::compile_layer2(&graph(), &sql, &duck())
+            .unwrap_or_else(|e| panic!("{outer}: {e}"));
+        let want = format!(
+            "SELECT status AS s, AGG(order_count) AS n FROM orders \
+             WHERE {flat} GROUP BY status ORDER BY s"
+        );
+        let f = ossiec::compile_layer2(&graph(), &want, &duck()).unwrap();
+        let db = duckdb();
+        assert_eq!(
+            duckdb_rows(&db, &c.sql),
+            duckdb_rows(&db, &f.sql),
+            "{outer}"
+        );
+    }
+}
+
+#[test]
+fn fold_refuses_an_outer_predicate_on_a_hidden_column() {
+    // `amount_cents` is not in the derived select list: inside OR / IN / a
+    // function, as at the top, it must not reach the inner `orders` through
+    // the fold.
+    for outer in [
+        "amount_cents > 0 OR s = 'completed'",
+        "amount_cents IN (1, 2)",
+        "COALESCE(amount_cents, 0) > 0",
+    ] {
+        let sql = format!(
+            "SELECT s, AGG(order_count) FROM (SELECT status AS s, order_count FROM orders) t \
+             WHERE {outer} GROUP BY s"
+        );
+        let e = ossiec::compile_layer2(&graph(), &sql, &duck()).unwrap_err();
+        assert!(
+            matches!(e, Error::Request(ref m) if m.contains("has no column `amount_cents`")),
+            "{outer}: {e}"
+        );
+    }
+}
+
+#[test]
 fn s77_from_only_spec_example_on_dataset_scoped_total_revenue() {
     let g = nested_graph();
     let sql = "SELECT category, AGG(total_revenue) \
