@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 155 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 160 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -31,7 +31,7 @@ Model-qualified relations, measure names, aliases and output labels, and what is
 
 Every kind, from either side, fan-out, and G2.
 
-[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 23 tests
+[`tests/sql_front/joins.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/joins.rs) · 25 tests
 
 | Test | What it shows |
 |---|---|
@@ -51,6 +51,8 @@ Every kind, from either side, fan-out, and G2.
 | `a5_unused_inner_join_customers_compiles` |  |
 | `a5_reverse_fanout_join_uses_pk_dedup` |  |
 | `a5_right_join_to_the_many_side_of_a_fanout_dedups` | `orders RIGHT JOIN order_items` keeps every line. |
+| `a5_fanout_written_from_the_many_side_dedups` | A fan-out written from the many side (§7.6): `order_items i LEFT JOIN orders o` is the relation `orders o RIGHT JOIN order_items i`, so it counts orders as that form does, de-duplicated by primary key. |
+| `a_join_from_a_dataset_with_two_roles_is_not_turned_around` | A join is turned around only when no leg has its first side at all. |
 | `join_from_either_side_without_a_fact_key` | Two-facts `orders` has no primary key, so null-extended customers are kept out of `SUM` by a FILTER on the join key rather than by de-duplication. |
 | `join_from_the_one_side_filters_each_term_of_a_composite_metric` | A composite metric is planned as one aggregate per term, and each takes the FILTER: `COUNT(*)` counts no orders for a customer that has none, so its ratio is NULL rather than divided by the one null-extended row. |
 | `join_from_the_one_side_filters_every_aggregate_shape` | Aggregates of every shape take the FILTER, ANDed with a FILTER of their own, so a fact without a primary key needs no de-duplication for any of them. |
@@ -126,7 +128,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 §7.2 aggregated queries and plain aggregates, §7.7 pass-through, query-local `TO MEASURE`, and the fold of a sole derived table.
 
-[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 33 tests
+[`tests/sql_front/measures.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/measures.rs) · 35 tests
 
 | Test | What it shows |
 |---|---|
@@ -138,6 +140,8 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 | `s77_nested_fold_refuses_an_aggregating_innermost` | The innermost query groups, and folding would drop its GROUP BY: refused. |
 | `s77_from_only_folds_filter_and_projection` |  |
 | `s77_from_only_with_renames` |  |
+| `fold_rewrites_columns_in_every_outer_predicate` |  |
+| `fold_refuses_an_outer_predicate_on_a_hidden_column` |  |
 | `s77_from_only_spec_example_on_dataset_scoped_total_revenue` |  |
 | `s77_from_only_as_a_derived_table_of_a_larger_query` |  |
 | `to_measure_defers_a_ratio_to_the_outer_agg` |  |
@@ -168,13 +172,14 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY ALL`, `DISTINCT` and `WITH`.
 
-[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 12 tests
+[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 13 tests
 
 | Test | What it shows |
 |---|---|
 | `where_accepts_any_row_predicate` | §7.3: `WHERE` is an ordinary row predicate, on any column the query can read. |
 | `grouping_sets_report_every_level` | §7.4: `ROLLUP`, `CUBE` and `GROUPING SETS` report each measure at every level they name. |
 | `order_by_keeps_nulls_first_under_a_vendor_source` | An `ORDER BY` without `NULLS` means what the consumer's SQL means, NULL as the smallest value, even when the model's fields pick a vendor dialect that sorts NULL last (Postgres): both the grouping-set and the ordinary path write it out. |
+| `where_reads_subqueries` | §7.3: a subquery in `WHERE` is a Layer 2 query of its own, compiled as one and read by the predicate as SQL reads it: `IN`, `NOT IN`, `EXISTS` and a scalar. |
 | `having_keeps_or_drops_finished_groups` | §7.5: `HAVING` may contain `AGG()` and scalar expressions over it. |
 | `with_names_derived_tables` | §7.7: a CTE is a derived table with a name. |
 | `having_keeps_each_engines_rules` | What a target's SQL has to carry, which DuckDB's answers can't show. |

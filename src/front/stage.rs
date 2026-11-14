@@ -329,7 +329,7 @@ pub(super) fn parse_stage_from(
     let mut filters = vec![];
     let mut predicates = vec![];
     if let Some(w) = &sel.where_clause {
-        for conjunct in where_to_filters(graph, scope, &w.this)? {
+        for conjunct in where_to_filters(graph, scope, &w.this, cfg.compiled)? {
             match conjunct {
                 Conjunct::Filter(f) => filters.push(f),
                 Conjunct::Predicate(p) => predicates.push(format!("({p})")),

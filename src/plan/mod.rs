@@ -401,7 +401,7 @@ pub(crate) fn plan(
         filters.push(predicate(lhs, f.op, f.value.as_ref(), &f.values, datatype)?);
     }
     if let Some(text) = &req.filter {
-        let ast = wide_table::parse_filter(text)?;
+        let ast = wide_table::parse_filter(text, interface == Interface::Relational)?;
         let mut nodes = BTreeSet::new();
         for (ds, f, node) in wide_table::filter_fields(g, &ast) {
             required.insert(node);

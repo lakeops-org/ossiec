@@ -328,6 +328,136 @@ fn a5_right_join_to_the_many_side_of_a_fanout_dedups() {
     );
 }
 
+/// A fan-out written from the many side (§7.6): `order_items i LEFT JOIN orders o`
+/// is the relation `orders o RIGHT JOIN order_items i`, so it counts orders as
+/// that form does, de-duplicated by primary key. Grouped by the line's order id,
+/// line 4's order 9 doesn't exist: `LEFT` keeps its group with no orders, `INNER`
+/// drops it, and `FULL` also keeps order 3, which has no lines.
+#[test]
+fn a5_fanout_written_from_the_many_side_dedups() {
+    let g = ossiec::from_yaml(FANOUT).unwrap();
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE orders (order_id INTEGER);
+         INSERT INTO orders VALUES (1), (2), (3);
+         CREATE TABLE order_items (line_id INTEGER, order_id INTEGER);
+         INSERT INTO order_items VALUES (1, 1), (2, 1), (3, 2), (4, 9);",
+    )
+    .unwrap();
+    for (join, want) in [
+        (
+            "LEFT JOIN",
+            vec![vec!["1", "1"], vec!["2", "1"], vec!["9", "0"]],
+        ),
+        ("JOIN", vec![vec!["1", "1"], vec!["2", "1"]]),
+        (
+            "FULL JOIN",
+            vec![
+                vec!["1", "1"],
+                vec!["2", "1"],
+                vec!["9", "0"],
+                vec!["NULL", "1"],
+            ],
+        ),
+    ] {
+        let sql = format!(
+            "SELECT i.order_id, AGG(o.order_count) FROM order_items i \
+             {join} orders o ON i.order_id = o.id GROUP BY i.order_id"
+        );
+        let c = ossiec::compile_layer2(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let reference = format!(
+            "SELECT i.order_id, COUNT(DISTINCT o.order_id) FROM order_items i \
+             {join} orders o ON i.order_id = o.order_id GROUP BY i.order_id"
+        );
+        let got = sorted(duckdb_rows(&db, &c.sql));
+        assert_eq!(
+            got,
+            sorted(duckdb_rows(&db, &reference)),
+            "{join}\n{}",
+            c.sql
+        );
+        let mut want: Vec<Vec<String>> = want
+            .into_iter()
+            .map(|r| r.into_iter().map(String::from).collect())
+            .collect();
+        want.sort();
+        let got: Vec<Vec<String>> = got
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| v.trim_end_matches(".000000").to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(got, want, "{join}\n{}", c.sql);
+    }
+    // The same relation written either way compiles to the same SQL.
+    let from_lines = ossiec::compile_layer2(
+        &g,
+        "SELECT AGG(o.order_count) FROM order_items i LEFT JOIN orders o ON i.order_id = o.id",
+        &duck(),
+    )
+    .unwrap();
+    let from_orders = ossiec::compile_layer2(
+        &g,
+        "SELECT AGG(o.order_count) FROM orders o RIGHT JOIN order_items i ON i.order_id = o.id",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(from_lines.sql, from_orders.sql);
+}
+
+/// A join is turned around only when no leg has its first side at all. Here
+/// `airports` is on the leg twice (departure and arrival) and `countries` once,
+/// so `dep.country = kd.code` can't say which airport it means; turned around, it
+/// would join a new copy of `airports` to the carrier's country. It's refused.
+#[test]
+fn a_join_from_a_dataset_with_two_roles_is_not_turned_around() {
+    let g = ossiec::from_yaml(
+        r#"
+version: "0.2.0.dev0"
+name: flights
+datasets:
+  - name: flights
+    source: flights
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: id } }
+      - { name: origin, expression: { sql: origin } }
+      - { name: dest, expression: { sql: dest } }
+      - { name: carrier, expression: { sql: carrier } }
+      - { name: delay, expression: { sql: delay } }
+    metrics:
+      - { name: total_delay, expression: { sql: SUM(delay) } }
+  - name: airports
+    source: airports
+    primary_key: [code]
+    fields:
+      - { name: code, expression: { sql: code } }
+      - { name: country, expression: { sql: country } }
+  - name: countries
+    source: countries
+    primary_key: [code]
+    fields:
+      - { name: code, expression: { sql: code } }
+      - { name: name, expression: { sql: name } }
+relationships:
+  - { name: departs_from, from: flights, to: airports, from_columns: [origin], to_columns: [code] }
+  - { name: arrives_at, from: flights, to: airports, from_columns: [dest], to_columns: [code] }
+  - { name: registered_in, from: flights, to: countries, from_columns: [carrier], to_columns: [code] }
+  - { name: located_in, from: airports, to: countries, from_columns: [country], to_columns: [code] }
+"#,
+    )
+    .unwrap();
+    let sql = "SELECT k.name, AGG(f.total_delay) FROM flights f \
+               JOIN airports dep ON f.origin = dep.code \
+               JOIN airports arr ON f.dest = arr.code \
+               JOIN countries k ON f.carrier = k.code \
+               JOIN countries kd ON dep.country = kd.code GROUP BY k.name";
+    let m = unsupported_msg(ossiec::compile_layer2(&g, sql, &duck()).unwrap_err());
+    assert!(m.contains("cannot attach"), "{m}");
+}
+
 /// Two-facts `orders` has no primary key, so null-extended customers are kept out
 /// of `SUM` by a FILTER on the join key rather than by de-duplication. `tickets`
 /// has one, and its `COUNT(*)` must not count a customer without tickets.
