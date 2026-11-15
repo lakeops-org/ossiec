@@ -78,6 +78,308 @@ fn where_accepts_any_row_predicate() {
     }
 }
 
+/// §7.4: `ROLLUP`, `CUBE` and `GROUPING SETS` report each measure at every level
+/// they name. Each answer is DuckDB's own grouping over the same rows, so a
+/// subtotal row's NULLs, `HAVING` on a grouping column, and a one-side measure
+/// counted once per level all follow SQL.
+#[test]
+fn grouping_sets_report_every_level() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let from = "FROM orders o JOIN customers c ON o.customer_id = c.id";
+    let raw = "FROM orders o JOIN (SELECT * FROM raw_customers WHERE NOT deleted) c \
+               ON o.customer_id = c.customer_id";
+    for (select, plain, rest) in [
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status)",
+        ),
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY CUBE(c.region, o.status)",
+        ),
+        // The largest CUBE: 4 columns, 16 sets.
+        (
+            "c.region, o.status, c.segment, c.name, AGG(o.order_count) AS n",
+            "c.region, o.status, c.segment, c.name, COUNT(*) AS n",
+            "GROUP BY CUBE(c.region, o.status, c.segment, c.name)",
+        ),
+        // No set has both columns: a branch with no rows types them first.
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY GROUPING SETS ((c.region), (o.status))",
+        ),
+        (
+            "o.status, c.region, AGG(o.order_count) AS n",
+            "o.status, c.region, COUNT(*) AS n",
+            "GROUP BY o.status, ROLLUP(c.region)",
+        ),
+        (
+            "c.region, AGG(o.order_count) AS n",
+            "c.region, COUNT(*) AS n",
+            "GROUP BY GROUPING SETS ((c.region), ())",
+        ),
+        // HAVING reads a subtotal row's grouping column as NULL: these drop it.
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) HAVING c.region = 'EU'",
+        ),
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) HAVING AGG(o.order_count) > 1",
+        ),
+        // An aggregate in HAVING reads the rows' values of a column the set
+        // leaves out: only the bare column is NULL at a subtotal.
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) HAVING COUNT(o.status) > 0",
+        ),
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) \
+             HAVING SUM(CASE WHEN o.status = 'returned' THEN 1 ELSE 0 END) > 0",
+        ),
+        // Unnamed expressions and plain aggregates keep their names in every
+        // set, though a set leaves a column before them out.
+        (
+            "c.region, AGG(o.order_count) + 1, AGG(o.order_count) + 2",
+            "c.region, COUNT(*) + 1, COUNT(*) + 2",
+            "GROUP BY ROLLUP(c.region)",
+        ),
+        (
+            "c.region, COUNT(*), SUM(o.amount_cents)",
+            "c.region, COUNT(*), SUM(o.amount_cents)",
+            "GROUP BY ROLLUP(c.region)",
+        ),
+    ] {
+        let sql = format!("SELECT {select} {from} {rest}");
+        let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{rest}: {e}"));
+        let reference = format!(
+            "SELECT {plain} {raw} {}",
+            rest.replace("AGG(o.order_count)", "COUNT(*)")
+        );
+        let want = sorted(duckdb_rows(&db, &reference));
+        assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{rest}\n{}", c.sql);
+        assert!(want.len() > 1, "{rest}: proves nothing");
+    }
+    // A one-side measure counts each customer once at every level, the grand
+    // total included.
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT o.status, AGG(c.known_customers) AS k FROM customers c \
+         JOIN orders o ON o.customer_id = c.id GROUP BY ROLLUP(o.status)",
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        sorted(duckdb_rows(&db, &c.sql)),
+        sorted(duckdb_rows(
+            &db,
+            &format!("SELECT o.status, COUNT(DISTINCT c.customer_id) AS k {raw} GROUP BY ROLLUP(o.status)")
+        )),
+        "{}",
+        c.sql
+    );
+    // ORDER BY and LIMIT apply to the stacked whole, by output name or position.
+    let c = ossiec::compile_sql(
+        &g,
+        &format!(
+            "SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY ROLLUP(c.region) \
+             ORDER BY n DESC, 1 NULLS FIRST LIMIT 2"
+        ),
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(
+            &db,
+            &format!(
+                "SELECT c.region, COUNT(*) AS n {raw} GROUP BY ROLLUP(c.region) \
+                 ORDER BY n DESC, 1 NULLS FIRST LIMIT 2"
+            )
+        ),
+        "{}",
+        c.sql
+    );
+    // A measure listed before its dimension: position 1 is the measure, so the
+    // grand total (the largest count) wins, not the last status.
+    let c = ossiec::compile_sql(
+        &g,
+        &format!(
+            "SELECT AGG(o.order_count) AS n, o.status {from} GROUP BY ROLLUP(o.status) \
+             ORDER BY 1 DESC LIMIT 1"
+        ),
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n, o.status {raw} GROUP BY ROLLUP(o.status) \
+                 ORDER BY 1 DESC LIMIT 1"
+            )
+        ),
+        "{}",
+        c.sql
+    );
+    // The subtotal selects no measure once `status` is left out. It is still one
+    // NULL row.
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT status FROM orders GROUP BY ROLLUP(status)",
+        &duck(),
+    )
+    .unwrap();
+    let want = sorted(duckdb_rows(
+        &db,
+        "SELECT status FROM orders GROUP BY ROLLUP(status)",
+    ));
+    assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{}", c.sql);
+    assert!(want.iter().any(|r| r[0] == "NULL"), "{want:?}");
+    // The same under includeUnmatched: the grand total is a constant row, not a
+    // plain aggregate, which includeUnmatched refuses.
+    let unmatched = Options {
+        include_unmatched: true,
+        ..duck()
+    };
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT status FROM orders GROUP BY ROLLUP(status)",
+        &unmatched,
+    )
+    .unwrap();
+    assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{}", c.sql);
+    // A grand total that selects nothing still answers to its HAVING.
+    let sql =
+        format!("SELECT c.region {from} GROUP BY ROLLUP(c.region) HAVING AGG(o.order_count) > 3");
+    let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap();
+    let want = sorted(duckdb_rows(
+        &db,
+        &format!("SELECT c.region {raw} GROUP BY ROLLUP(c.region) HAVING COUNT(*) > 3"),
+    ));
+    assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{sql}\n{}", c.sql);
+    assert!(want.iter().any(|r| r[0] == "NULL"), "{want:?}");
+    // An unnamed expression is named as in the same query without ROLLUP.
+    let names = |sql: &str| {
+        let c = ossiec::compile_sql(&g, sql, &duck()).unwrap();
+        c.sql
+            .match_indices("AS \"__l2_")
+            .map(|(i, _)| c.sql[i..].split('"').nth(1).unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(
+        names(&format!(
+            "SELECT c.region, AGG(o.order_count) + 1 {from} GROUP BY ROLLUP(c.region)"
+        )),
+        names(&format!(
+            "SELECT c.region, AGG(o.order_count) + 1 {from} GROUP BY c.region"
+        )),
+    );
+    for (rest, want) in [
+        ("GROUP BY ROLLUP(UPPER(c.region))", "take columns"),
+        (
+            "GROUP BY ROLLUP(c.region, ROLLUP(o.status))",
+            "take columns",
+        ),
+        (
+            "GROUP BY CUBE(c.region, o.status, c.segment, c.name, o.id)",
+            "at most 4",
+        ),
+        (
+            "GROUP BY ROLLUP(c.region) ORDER BY AGG(o.order_count)",
+            "output column",
+        ),
+        (
+            "GROUP BY ROLLUP(c.region) HAVING GROUPING(c.region) = 0",
+            "GROUPING()",
+        ),
+    ] {
+        let sql = format!("SELECT c.region, AGG(o.order_count) AS n {from} {rest}");
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(rest)
+            .to_string();
+        assert!(e.contains(want), "{rest}: {e}");
+    }
+}
+
+/// An `ORDER BY` without `NULLS` means what the consumer's SQL means, NULL as the
+/// smallest value, even when the model's fields pick a vendor dialect that sorts
+/// NULL last (Postgres): both the grouping-set and the ordinary path write it out.
+#[test]
+fn order_by_keeps_nulls_first_under_a_vendor_source() {
+    let g = ossiec::from_yaml(
+        r#"
+version: "0.2.0.dev0"
+name: sales
+datasets:
+  - name: sales
+    source: sales
+    primary_key: [id]
+    fields:
+      - { name: id, expression: { sql: id } }
+      - name: region
+        expression:
+          sql: region
+          dialects:
+            - { dialect: POSTGRES, expression: region }
+    metrics:
+      - { name: n, expression: { sql: COUNT(*) } }
+"#,
+    )
+    .unwrap();
+    let db = duckdb::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE sales (id INTEGER, region VARCHAR);
+         INSERT INTO sales VALUES (1, 'a'), (2, 'b'), (3, 'b'), (4, NULL);",
+    )
+    .unwrap();
+    let opts = Options {
+        target: Some(DialectType::DuckDB),
+        prefer_dialect: Some("POSTGRES".into()),
+        ..Default::default()
+    };
+    for (sql, want) in [
+        // NULL regions sort first: the grand total and the NULL region's own group
+        // (n breaks the tie), before 'a'.
+        (
+            "SELECT region, AGG(n) AS n FROM sales GROUP BY ROLLUP(region) \
+             ORDER BY region, n DESC LIMIT 1",
+            vec![vec!["NULL", "4"]],
+        ),
+        // The NULL region's own group sorts first.
+        (
+            "SELECT region, AGG(n) AS n FROM sales GROUP BY region ORDER BY region LIMIT 1",
+            vec![vec!["NULL", "1"]],
+        ),
+        (
+            "SELECT region, AGG(n) AS n FROM sales GROUP BY region ORDER BY region DESC LIMIT 1",
+            vec![vec!["b", "2"]],
+        ),
+    ] {
+        let c = ossiec::compile_sql(&g, sql, &opts).unwrap();
+        assert_eq!(c.source_dialect, "postgres", "{sql}");
+        let got: Vec<Vec<String>> = duckdb_rows(&db, &c.sql)
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| v.trim_end_matches(".000000").to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(got, want, "{sql}\n{}", c.sql);
+    }
+}
+
 /// §7.3: a correlated subquery in `WHERE` reads the outer row through `=` in its
 /// own `WHERE`. Each answer is the same correlated query in plain SQL over the
 /// source tables, so SQL's own semantics are the reference: NULL keys, `NOT IN`,
@@ -233,6 +535,30 @@ fn where_reads_correlated_subqueries() {
         ),
     ));
     assert!(!want.is_empty());
+    assert_eq!(
+        sorted(duckdb_rows(&db, &compiled.sql)),
+        want,
+        "{}",
+        compiled.sql
+    );
+    // Each grouping set's stage compiles the correlated subquery with it.
+    let compiled = ossiec::compile_sql(
+        &g,
+        "SELECT c.region, o.status, AGG(o.order_count) AS n FROM orders o JOIN customers c ON o.customer_id = c.id \
+         WHERE EXISTS (SELECT o2.id FROM orders o2 WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') \
+         OR o.product_id = 12 GROUP BY ROLLUP(c.region, o.status)",
+        &duck(),
+    )
+    .unwrap();
+    let want = sorted(duckdb_rows(
+        &db,
+        &format!(
+            "SELECT c.region, o.status, COUNT(*) AS n FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id \
+             WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') \
+             OR o.product_id = 12 GROUP BY ROLLUP(c.region, o.status)"
+        ),
+    ));
+    assert!(want.len() > 2);
     assert_eq!(
         sorted(duckdb_rows(&db, &compiled.sql)),
         want,

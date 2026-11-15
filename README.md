@@ -194,7 +194,7 @@ Ossie Layer 2 Appendix A.1–A.6: `AGG` over dataset-scoped measures; arithmetic
 
 **Measure relations** (§7.2, §4.2) are written without `GROUP BY`, as in Appendix A.7: a query that aggregates can't return an unevaluated measure, whether it passes one through or defines it with `TO MEASURE`.
 
-**`GROUP BY ALL`** (§7.4) groups by every selected column that isn't an aggregate, and refuses a bare measure. **`DISTINCT`** (§7.8) works over fields and evaluated measures, and refuses an unevaluated one.
+**`GROUP BY ALL`** (§7.4) groups by every selected column that isn't an aggregate, and refuses a bare measure. **`ROLLUP`**, **`CUBE`** and **`GROUPING SETS`** report each measure at every level they name, with NULL in a subtotal row's grouping columns, as SQL does. **`DISTINCT`** (§7.8) works over fields and evaluated measures, and refuses an unevaluated one.
 
 **`WITH`** (§7.7) is a named derived table, so a measure passes through a CTE as it does through a subquery. `WITH RECURSIVE`, a column list and a set operator in a CTE are refused.
 
@@ -414,7 +414,7 @@ scripts/sync-ossie-fixtures.sh    # re-vendor Apache Ossie examples, then cargo 
 - **De-duplicated groups overlap (Layer 2).** A product sold in two regions counts in both, so per-group values don't sum to a grand total. ossiec warns (`FAN_TRAP_RISK`). Products that never sold aren't in any group unless the query sets `includeUnmatched`.
 - **Window metrics see only the rows in the result.** A running total over a filtered date range starts at the range's first row, and `stock_share` is a share of the groups returned. With windows present, metric filters apply after the window.
 - **Division is always true division.** `/` in portable expressions casts the numerator to `DOUBLE` unless one side is a fractional literal, so `COUNT(a) / COUNT(b)` isn't truncated on Postgres and Trino. Ratios therefore come back as floating point. `amount_cents / 100.0` stays exact.
-- **NULL ordering** follows generic SQL on every engine: NULLs sort first in ascending order (`NULLS FIRST` is emitted where needed).
+- **NULL ordering** follows generic SQL on every engine: NULLs sort first in ascending order and last in descending order. ossiec writes the order out, so a vendor source dialect (Postgres sorts NULL last ascending) doesn't change it.
 - **Strings compare and sort by byte on every engine**, so `'Bob'` comes before `'ada'` and `'ada'` never equals `'Ada'`. Postgres string dimensions carry `COLLATE "C"`, and MySQL string dimensions and filters `COLLATE utf8mb4_bin`, to match.
 - **A backslash in a `LIKE` pattern is an ordinary character**, as in SQL without `ESCAPE`. On engines that escape with it by default (Postgres, ClickHouse, StarRocks, MySQL), ossiec doubles it.
 - **In Layer 3, groups depend on the metrics you ask for** (spec §6.1). Each metric brings its home dataset's groups, and a metric with no rows in a group takes its empty-input value: NULL, or 0 for `COUNT`. In Layer 2 the query's joins decide the groups.
@@ -483,7 +483,8 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 2 fan-out written from the many side (`order_items i LEFT JOIN orders o` with `AGG(o.order_count)`), as `orders o RIGHT JOIN order_items i` is
 - [x] Layer 2 subqueries in `WHERE` (`IN`, `NOT IN`, `EXISTS`, scalar), each compiled as a Layer 2 query
 - [x] Layer 2 correlated subqueries in `WHERE`, reading the enclosing row through `=` in their own `WHERE` (`EXISTS`, `IN`, `NOT IN`, scalar, including a measure over no matching rows)
-- [ ] Layer 2 correlated subqueries beyond an `=` in their own `WHERE`, subqueries in the select list, `HAVING` and `ORDER BY`, `ROLLUP` and friends, set operators, and the `MEASURE` marker
+- [x] Layer 2 `ROLLUP`, `CUBE` and `GROUPING SETS` over columns, each grouping set compiled at its own level
+- [ ] Layer 2 correlated subqueries beyond an `=` in their own `WHERE`, subqueries in the select list, `HAVING` and `ORDER BY`, the `GROUPING()` function, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
 - [ ] Publish to crates.io

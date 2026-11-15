@@ -25,7 +25,7 @@
 //! measure's input rows. [`Node::unique_key`] tracks this; the outer shell
 //! evaluates no `AGG()`, so it needs no such rule.
 
-use polyglot_sql::expressions::{Alias, Identifier, Null, Select};
+use polyglot_sql::expressions::{Alias, Column, Identifier, Null, Select};
 use polyglot_sql::{generate, DialectType, Expression, ExpressionWalk};
 
 use super::catalog::{self, Layer2Catalog};
@@ -136,6 +136,8 @@ pub(super) struct Compiler<'a> {
     pub opts: &'a Options,
     pub ctx: Ctx,
     pub derived_count: usize,
+    /// Placeholders handed to grouping-set branches, numbered apart from derived tables.
+    pub grouping_count: usize,
     /// Next `__l2_bmN` for a query-local base measure.
     pub(super) base_seq: usize,
     /// Outermost `AGG` stage also returns one-side rows no fact reaches.
@@ -160,6 +162,7 @@ pub(super) fn compile(
             ..Default::default()
         },
         derived_count: 0,
+        grouping_count: 0,
         base_seq: 0,
         include_unmatched: opts.include_unmatched || pragma_include_unmatched(sql_text),
         to_measures,
@@ -204,6 +207,7 @@ pub(super) fn view_outputs(
             ..Default::default()
         },
         derived_count: 0,
+        grouping_count: 0,
         base_seq: 0,
         include_unmatched: false,
         to_measures: to_measures.to_vec(),
@@ -302,6 +306,9 @@ impl Compiler<'_> {
             )));
         }
         refuse_unsupported_items(sel)?;
+        if let Some(sets) = super::grouping::grouping_sets(sel)? {
+            return self.grouping(sel, &sets, depth, derived_mode, outer);
+        }
         match classify(sel)? {
             Kind::Agg => self.agg_stage(sel, depth, derived_mode, outer),
             Kind::Fold => self.fold(sel, depth, derived_mode, outer),
@@ -596,6 +603,186 @@ impl Compiler<'_> {
 }
 
 impl Compiler<'_> {
+    /// §7.4: one stage per grouping set ([`super::grouping`]), stacked with
+    /// `UNION ALL` in the select list's column order, NULL where a set leaves a
+    /// grouping column out. The set with every grouping column goes first, so
+    /// each column has its type before a branch's NULL meets it (Postgres types
+    /// `UNION` pairwise, and two bare NULLs would become text). When no set has
+    /// them all, a branch that returns no rows types them. A stage emits
+    /// dimensions before measures; the stack projects them back into the select
+    /// list's order, which is what a positional `ORDER BY` indexes. `ORDER BY`
+    /// and `LIMIT` apply to the stacked whole.
+    fn grouping(
+        &mut self,
+        sel: &Select,
+        sets: &[Vec<Column>],
+        depth: usize,
+        derived_mode: bool,
+        outer: &[String],
+    ) -> Result<Node> {
+        use super::grouping::{all_columns, branch, order_key, same, stable_names};
+        // A branch drops the grouping columns its set leaves out, which would
+        // renumber the unnamed expressions after them (`__l2_N`).
+        let sel = &stable_names(sel);
+        if !matches!(classify(sel)?, Kind::Agg) {
+            return Err(unsupported(
+                "Layer 2 ROLLUP, CUBE and GROUPING SETS over derived tables are not supported yet",
+            ));
+        }
+        if sel.distinct || sel.offset.is_some() {
+            return Err(unsupported(
+                "Layer 2 ROLLUP, CUBE and GROUPING SETS with DISTINCT or OFFSET are not supported yet",
+            ));
+        }
+        let grouping_fn = |e: &Expression| {
+            matches!(e, Expression::Function(f) if f.name.eq_ignore_ascii_case("GROUPING"))
+                || matches!(e, Expression::Grouping(_))
+        };
+        if sel.expressions.iter().any(|e| e.contains(grouping_fn))
+            || sel
+                .having
+                .as_ref()
+                .is_some_and(|h| h.this.contains(grouping_fn))
+        {
+            return Err(unsupported(
+                "Layer 2 GROUPING() is not supported yet: a subtotal row's grouping columns are NULL",
+            ));
+        }
+        let all = all_columns(sets);
+        let covers = |s: &[Column]| all.iter().all(|c| s.iter().any(|x| same(x, c)));
+        let mut plan: Vec<(&[Column], bool)> = vec![];
+        match sets.iter().position(|s| covers(s)) {
+            Some(i) => {
+                plan.push((&sets[i], false));
+                plan.extend(
+                    sets.iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, s)| (s.as_slice(), false)),
+                );
+            }
+            None => {
+                plan.push((&all, true));
+                plan.extend(sets.iter().map(|s| (s.as_slice(), false)));
+            }
+        }
+        let mut pending = vec![];
+        // Each branch: the placeholder it reads (none for a constant row) and
+        // the columns it has.
+        let mut branches: Vec<(Option<String>, Vec<String>)> = vec![];
+        let mut first_outputs: Vec<OutCol> = vec![];
+        for (set, empty) in plan {
+            let b = branch(sel, &all, set, empty)?;
+            if b.expressions.is_empty() && set.is_empty() && b.having.is_none() {
+                // `SELECT status … GROUP BY ROLLUP(status)`: the grand total
+                // selects nothing. It is one row of NULLs, as SQL's empty
+                // grouping set is even over no rows, so no stage reads anything.
+                branches.push((None, vec![]));
+                continue;
+            }
+            let mut b = b;
+            // Every grouping column is selected (GROUP BY matches the selected
+            // dimensions), so only the grand total can select nothing. With a
+            // HAVING to apply, it gets one hidden aggregate (a plain one, so
+            // not with `includeUnmatched`), which the outer list never reads.
+            let hidden = b.expressions.is_empty();
+            if hidden {
+                b.expressions = vec![hidden_count()?];
+            }
+            // Grouping sets have their own bound (`MAX_SETS`, checked when they're
+            // expanded), not the derived tables'. The name only has to be unique.
+            let placeholder = format!("{}g{}", sql::PLACEHOLDER_PREFIX, self.grouping_count);
+            self.grouping_count += 1;
+            let node = self.agg_stage(&b, depth, derived_mode, outer)?;
+            let mut cols = output_names(&node.ast)?;
+            if hidden {
+                cols.retain(|n| !n.starts_with(HIDDEN_GROUPING_COLUMN));
+            }
+            if first_outputs.is_empty() {
+                first_outputs = node.outputs.clone();
+            }
+            branches.push((Some(placeholder.clone()), cols));
+            pending.push((placeholder, node));
+        }
+        // The first branch holds every selected column (it is the full set, or
+        // the branch that types them). Its stage lists dimensions, then measures.
+        let names = names_in_select_order(sel, &first_outputs)?;
+        for (i, n) in names.iter().enumerate() {
+            if names[..i].iter().any(|p| p.eq_ignore_ascii_case(n)) {
+                return Err(Error::Request(format!(
+                    "Layer 2 with ROLLUP, CUBE or GROUPING SETS: two output columns are named `{n}`; give one an alias"
+                )));
+            }
+        }
+        let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+        let parts: Vec<String> = branches
+            .iter()
+            .enumerate()
+            .map(|(i, (placeholder, have))| {
+                let cols: Vec<String> = names
+                    .iter()
+                    .map(|n| {
+                        if have.iter().any(|h| h.eq_ignore_ascii_case(n)) {
+                            format!("__ossiec_g{i}.{} AS {}", q(n), q(n))
+                        } else {
+                            format!("NULL AS {}", q(n))
+                        }
+                    })
+                    .collect();
+                match placeholder {
+                    Some(p) => format!("SELECT {} FROM {p} AS __ossiec_g{i}", cols.join(", ")),
+                    None => format!("SELECT {}", cols.join(", ")),
+                }
+            })
+            .collect();
+        let mut text = format!(
+            "SELECT * FROM ({}) AS __ossiec_grouping",
+            parts.join(" UNION ALL ")
+        );
+        if let Some(ob) = &sel.order_by {
+            let keys: Vec<String> = ob
+                .expressions
+                .iter()
+                .map(|o| {
+                    let k = order_key(&o.this, &names, sel)?;
+                    let dir = if o.desc { "DESC" } else { "ASC" };
+                    // Written out, as in `lower`: NULL is the smallest value
+                    // whatever the source dialect, so subtotal rows sort first.
+                    let nulls = match (o.nulls_first, o.desc) {
+                        (Some(true), _) | (None, false) => " NULLS FIRST",
+                        (Some(false), _) | (None, true) => " NULLS LAST",
+                    };
+                    Ok(format!("__ossiec_grouping.{} {dir}{nulls}", q(&names[k])))
+                })
+                .collect::<Result<_>>()?;
+            text.push_str(&format!(" ORDER BY {}", keys.join(", ")));
+        }
+        if let Some(l) = &sel.limit {
+            if l.percent {
+                return Err(unsupported("Layer 2 LIMIT PERCENT is not supported"));
+            }
+            text.push_str(&format!(" LIMIT {}", super::clauses::limit_u64(&l.this)?));
+        }
+        let ast = sql::parse(&text, DialectType::Generic).map_err(Error::Internal)?;
+        let outputs = names
+            .iter()
+            .map(|n| OutCol {
+                name: n.clone(),
+                kind: first_outputs
+                    .iter()
+                    .find(|o| o.name.eq_ignore_ascii_case(n))
+                    .map_or(OutKind::EvaluatedMeasure, |o| o.kind.clone()),
+            })
+            .collect();
+        Ok(Node {
+            ast,
+            outputs,
+            // Subtotal rows repeat the dimensions' NULLs.
+            unique_key: None,
+            pending,
+        })
+    }
+
     /// §7.3: each subquery in `sel`'s `WHERE`, outermost first, compiled as a Layer 2
     /// query of its own (any nested in it are compiled with it), and replaced by
     /// `(SELECT * FROM <placeholder> AS …)`. A subquery that reads this stage's
@@ -793,6 +980,97 @@ impl Compiler<'_> {
         }
         Ok((out, pending))
     }
+}
+
+/// The hidden item of a grand total that selects nothing; the outer list never
+/// names it.
+const HIDDEN_GROUPING_COLUMN: &str = "__ossiec_grouping_row";
+
+/// `COUNT(*) AS __ossiec_grouping_row0`, the one item of a grand total that
+/// selects nothing but has a `HAVING` to apply.
+fn hidden_count() -> Result<Expression> {
+    let ast = sql::parse(
+        &format!("SELECT COUNT(*) AS {HIDDEN_GROUPING_COLUMN}0"),
+        DialectType::Generic,
+    )
+    .map_err(Error::Internal)?;
+    match ast {
+        Expression::Select(s) => s
+            .expressions
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Internal("hidden count has no select item".into())),
+        _ => Err(Error::Internal(
+            "hidden count did not parse as a select".into(),
+        )),
+    }
+}
+
+/// `outputs` is a stage's columns, dimensions then measures. Walk the select
+/// list and take the next dimension or measure, so the stack's column order
+/// is the consumer's.
+fn names_in_select_order(sel: &Select, outputs: &[OutCol]) -> Result<Vec<String>> {
+    use std::collections::VecDeque;
+    let mut fields: VecDeque<&str> = outputs
+        .iter()
+        .filter(|o| o.kind == OutKind::Field)
+        .map(|o| o.name.as_str())
+        .collect();
+    let mut measures: VecDeque<&str> = outputs
+        .iter()
+        .filter(|o| o.kind != OutKind::Field)
+        .map(|o| o.name.as_str())
+        .collect();
+    let mut names = Vec::with_capacity(sel.expressions.len());
+    for expr in &sel.expressions {
+        let next = if is_dimension_item(expr) {
+            fields.pop_front()
+        } else {
+            measures.pop_front()
+        };
+        let Some(name) = next else {
+            return Err(Error::Internal(
+                "grouping output columns do not match the select list".into(),
+            ));
+        };
+        names.push(name.to_string());
+    }
+    if !fields.is_empty() || !measures.is_empty() || names.len() != outputs.len() {
+        return Err(Error::Internal(
+            "grouping output columns do not match the select list".into(),
+        ));
+    }
+    Ok(names)
+}
+
+/// A selected dimension: a column, not an aggregate. The stage rejects anything
+/// else that isn't a measure, so the remainder of the select list is measures.
+fn is_dimension_item(expr: &Expression) -> bool {
+    let (inner, _) = super::strip_alias(expr);
+    let inner = super::unwrap_paren(inner);
+    super::as_column(inner).is_some()
+        && !inner.contains(super::is_base_agg_expr)
+        && !inner.contains(super::is_measure_agg_expr)
+}
+
+/// The column names a compiled stage's statement returns, in order.
+fn output_names(ast: &Expression) -> Result<Vec<String>> {
+    let shape = || {
+        unsupported(
+            "Layer 2 ROLLUP, CUBE and GROUPING SETS with this query shape are not supported yet",
+        )
+    };
+    let Expression::Select(s) = ast else {
+        return Err(shape());
+    };
+    s.expressions
+        .iter()
+        .map(|e| match e {
+            Expression::Alias(a) => Ok(a.alias.name.clone()),
+            Expression::Column(c) => Ok(c.name.name.clone()),
+            _ => Err(shape()),
+        })
+        .collect()
 }
 
 /// A derived table's columns are addressed by name: duplicates are ambiguous.
