@@ -153,6 +153,32 @@ pub(super) fn parse_stage_from(
                 continue;
             }
         }
+        if inner.contains(is_scalar_marker) {
+            // §7.7: a scalar subquery, compiled on its own, alone or in arithmetic
+            // with AGG() and plain aggregates. Its stand-in is bound below, once
+            // the dimensions it may read are known.
+            if cfg.derived && alias.is_none() {
+                return Err(unsupported(
+                    "Layer 2 derived table: a subquery in the select list needs an explicit alias so the outer query can name it",
+                ));
+            }
+            let mut raw = RawAggs {
+                seq: &mut *base_seq,
+                made: &mut ephemeral,
+            };
+            let formula = parse_formula_with_plain(graph, scope, inner, &mut raw)?;
+            for leaf in formula_leaves(&formula) {
+                if !metrics.contains(&leaf) {
+                    metrics.push(leaf);
+                }
+            }
+            let out_name = alias
+                .clone()
+                .unwrap_or_else(|| default_measure_name(&formula, idx));
+            measure_outputs.push((out_name.clone(), formula));
+            outputs.push((out_name.clone(), out_name));
+            continue;
+        }
         if inner.contains(is_base_agg_expr) {
             // §7.2: ordinary aggregates over fields, beside the measures, alone or
             // in arithmetic with each other and with AGG(). Each is a raw leaf:
@@ -324,6 +350,10 @@ pub(super) fn parse_stage_from(
                 )));
             }
         }
+    }
+
+    for (_, formula) in measure_outputs.iter_mut() {
+        bind_scalars(graph, scope, formula, cfg.scalars, &dimensions)?;
     }
 
     let mut filters = vec![];
@@ -498,4 +528,77 @@ pub(super) fn parse_stage_from(
         unevaluated,
         ephemeral,
     })
+}
+
+fn is_scalar_marker(e: &Expression) -> bool {
+    matches!(e, Expression::Column(c) if c.table.is_none() && c.name.name.starts_with(super::SCALAR))
+}
+
+/// Put each scalar subquery's stand-in in place of its marker. A correlated one
+/// reads the enclosing row's columns, which at this stage's grain are its
+/// dimensions: each becomes the [`crate::plan::OUT_DIM`] placeholder `lower`
+/// turns into the dimension's column.
+fn bind_scalars(
+    graph: &SemanticGraph,
+    scope: &super::QueryScope,
+    formula: &mut L2Formula,
+    scalars: &[(String, Expression)],
+    dimensions: &[String],
+) -> Result<()> {
+    match formula {
+        L2Formula::Scalar(marker) => {
+            let Expression::Column(c) = &**marker else {
+                return Ok(());
+            };
+            let stand_in = scalars
+                .iter()
+                .find(|(m, _)| *m == c.name.name)
+                .map(|(_, s)| s.clone())
+                .ok_or_else(|| {
+                    Error::Internal(format!("unknown scalar subquery `{}`", c.name.name))
+                })?;
+            let failure = std::cell::RefCell::new(None);
+            let bound = crate::sql::transform(stand_in, &|x| {
+                Ok(Some(match x {
+                    Expression::Column(c)
+                        if !c
+                            .table
+                            .as_ref()
+                            .is_some_and(|t| t.name.starts_with(crate::sql::STAND_IN_PREFIX)) =>
+                    {
+                        let found = resolve_dim(graph, scope, &c).and_then(|dim| {
+                            dimensions.iter().position(|d| *d == dim).ok_or_else(|| {
+                                Error::Request(format!(
+                                    "Layer 2 subquery in the select list reads `{dim}` of the enclosing query, which is not a selected dimension; a row of the result has one value only of what it groups by"
+                                ))
+                            })
+                        });
+                        match found {
+                            Ok(i) => crate::sql::col(&format!("{}{i}", crate::plan::OUT_DIM)),
+                            Err(e) => {
+                                failure.borrow_mut().get_or_insert(e);
+                                Expression::Column(c)
+                            }
+                        }
+                    }
+                    other => other,
+                }))
+            })
+            .map_err(|e| Error::Internal(e.to_string()))?;
+            if let Some(e) = failure.into_inner() {
+                return Err(e);
+            }
+            *formula = L2Formula::Scalar(Box::new(bound));
+            Ok(())
+        }
+        L2Formula::Add(l, r)
+        | L2Formula::Sub(l, r)
+        | L2Formula::Mul(l, r)
+        | L2Formula::Div(l, r)
+        | L2Formula::NullIf(l, r) => {
+            bind_scalars(graph, scope, l, scalars, dimensions)?;
+            bind_scalars(graph, scope, r, scalars, dimensions)
+        }
+        L2Formula::Agg(_) | L2Formula::Lit(_) => Ok(()),
+    }
 }

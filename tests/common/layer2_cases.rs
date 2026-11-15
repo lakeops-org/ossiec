@@ -466,6 +466,20 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.7: scalar subqueries in the select list: a share of the whole, and a
+        // measure correlated with the row's region (0 where nothing matches).
+        name: "select_list_subqueries",
+        sql: "SELECT c.region, AGG(o.order_count) * 1.0 / (SELECT AGG(o2.order_count) FROM orders o2) AS share, \
+              (SELECT AGG(c2.known_customers) FROM customers c2 \
+                WHERE c2.region = c.region AND c2.segment = 'smb') AS smb \
+              FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region",
+        reference: "SELECT c.region, COUNT(*) * 1.0 / (SELECT COUNT(*) FROM orders) AS share, \
+                    (SELECT COUNT(c2.customer_id) FROM {customers} c2 \
+                      WHERE c2.region = c.region AND c2.segment = 'smb') AS smb \
+                    FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.3: correlated scalar subqueries: a plain aggregate (orders above their
         // customer's average) and a measure, whose value over no matching rows is
         // the measure over none (0), not NULL.

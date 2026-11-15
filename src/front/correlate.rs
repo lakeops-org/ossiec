@@ -274,7 +274,12 @@ pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Cor
                     Identifier::new(key.clone()),
                 ))));
                 match &mut rest.group_by {
-                    Some(g) if g.all != Some(true) => g.expressions.push(inside.clone()),
+                    // Already grouped by it: the key adds nothing to the grain.
+                    Some(g) if g.all != Some(true) => {
+                        if !g.expressions.contains(inside) {
+                            g.expressions.push(inside.clone());
+                        }
+                    }
                     Some(_) => {}
                     None if grand_total => {
                         rest.group_by = Some(GroupBy {

@@ -303,8 +303,9 @@ fn columns_are_named_as_in_standard_sql() {
     );
 }
 
-/// `SELECT *` and a select-list subquery are refused by name, not as `AGG`
-/// arithmetic or a plain aggregate, which is what they would otherwise be read as.
+/// `SELECT *` is refused by name, not read as `AGG` arithmetic. A select-list
+/// subquery over derived tables is refused by name too, not read as a plain
+/// aggregate (one over datasets compiles: `select_list_reads_subqueries`).
 #[test]
 fn select_star_and_select_list_subqueries_are_refused_by_name() {
     for (q, why) in [
@@ -315,7 +316,8 @@ fn select_star_and_select_list_subqueries_are_refused_by_name() {
             "SELECT *",
         ),
         (
-            "SELECT status, (SELECT MAX(order_date) FROM orders) AS d FROM orders GROUP BY status",
+            "SELECT t.status, (SELECT MAX(order_date) FROM orders) AS d \
+             FROM (SELECT status, AGG(order_count) AS n FROM orders GROUP BY status) t",
             "subqueries in the select list",
         ),
     ] {
