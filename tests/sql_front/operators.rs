@@ -451,6 +451,16 @@ fn where_reads_correlated_subqueries() {
             "1 < (SELECT COUNT(*) FROM orders o2 WHERE o2.customer_id = orders.customer_id)"
                 .to_string(),
         ),
+        // A query nested in the subquery names `orders` itself; that doesn't
+        // hide the subquery's own correlation with the outer `orders`.
+        (
+            "EXISTS (SELECT c.id FROM customers c WHERE c.id = orders.customer_id \
+             AND c.id IN (SELECT orders.customer_id FROM orders WHERE orders.status = 'returned'))",
+            format!(
+                "EXISTS (SELECT 1 FROM {customers} c WHERE c.customer_id = orders.customer_id \
+                 AND c.customer_id IN (SELECT o3.customer_id FROM orders o3 WHERE o3.status = 'returned'))"
+            ),
+        ),
         // The subquery names `orders` itself, so `orders.id` is its own column, as
         // in SQL: not correlated.
         (
@@ -501,6 +511,12 @@ fn where_reads_correlated_subqueries() {
             "1 < (SELECT AGG(o2.order_count) FROM orders o2 WHERE o2.customer_id = orders.customer_id \
              HAVING AGG(o2.order_count) > 2)",
             "HAVING",
+        ),
+        // A subtotal row has no key to match: refused, not dropped.
+        (
+            "product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+             WHERE o2.customer_id = orders.customer_id GROUP BY ROLLUP(o2.product_id))",
+            "ROLLUP, CUBE or GROUPING SETS",
         ),
         // Two levels out: the inner subquery reads the outermost query.
         (

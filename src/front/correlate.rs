@@ -49,20 +49,80 @@ pub(super) struct Correlation {
     pub empty: Option<Select>,
 }
 
-/// Names the subquery defines: a table's alias (or its name, without one), a
+/// Names one query level defines: a table's alias (or its name, without one), a
 /// derived table's alias, a CTE's name. A qualifier that is one of them reads
-/// the subquery, even when the enclosing query uses the same one.
-fn defined_names(sel: &Select) -> Vec<String> {
-    let whole = Expression::Select(Box::new(sel.clone()));
-    whole
-        .dfs()
+/// that level, even when the enclosing query uses the same one. Queries nested
+/// in it define their own, which don't reach it.
+fn level_names(sel: &Select) -> Vec<String> {
+    let mut out = vec![];
+    let mut add = |e: &Expression| match e {
+        Expression::Table(t) => out.push(t.alias.as_ref().unwrap_or(&t.name).name.clone()),
+        Expression::Subquery(s) => out.extend(s.alias.as_ref().map(|a| a.name.clone())),
+        Expression::Alias(a) => out.push(a.alias.name.clone()),
+        _ => {}
+    };
+    for e in sel.from.iter().flat_map(|f| &f.expressions) {
+        add(e);
+    }
+    for j in &sel.joins {
+        add(&j.this);
+    }
+    if let Some(w) = &sel.with {
+        out.extend(w.ctes.iter().map(|c| c.alias.name.clone()));
+    }
+    out
+}
+
+/// The queries nested in `e`, not `e` itself, outermost only.
+fn nested_selects(e: &Expression) -> Vec<&Expression> {
+    let mut out: Vec<&Expression> = vec![];
+    for x in e.dfs() {
+        if matches!(x, Expression::Select(_))
+            && !std::ptr::eq(x, e)
+            && !out.iter().any(|n| n.contains(|y| std::ptr::eq(y, x)))
+        {
+            out.push(x);
+        }
+    }
+    out
+}
+
+/// The columns of `e` outside the queries nested in it: those its own level reads.
+fn own_columns(e: &Expression) -> Vec<&Column> {
+    let nested = nested_selects(e);
+    e.dfs()
         .filter_map(|x| match x {
-            Expression::Table(t) => Some(t.alias.as_ref().unwrap_or(&t.name).name.clone()),
-            Expression::Subquery(s) => s.alias.as_ref().map(|a| a.name.clone()),
-            Expression::Cte(c) => Some(c.alias.name.clone()),
+            Expression::Column(c) => Some((x, c.as_ref())),
             _ => None,
         })
+        .filter(|(x, _)| !nested.iter().any(|n| n.contains(|y| std::ptr::eq(y, *x))))
+        .map(|(_, c)| c)
         .collect()
+}
+
+/// A column of a query nested in the subquery (`e`, inside `names` already) that
+/// reads the enclosing query: no level from the subquery down to it defines
+/// its qualifier.
+fn nested_outer<'a>(e: &'a Expression, names: &[String], stage: &[String]) -> Option<&'a Column> {
+    nested_selects(e).into_iter().find_map(|n| {
+        let Expression::Select(sel) = n else {
+            return None;
+        };
+        let mut scope = names.to_vec();
+        scope.extend(level_names(sel));
+        own_columns(n)
+            .into_iter()
+            .find(|c| reads(c, stage, &scope))
+            .or_else(|| nested_outer(n, &scope, stage))
+    })
+}
+
+/// `c` names a relation of the enclosing stage that `scope` doesn't redefine.
+fn reads(c: &Column, stage: &[String], scope: &[String]) -> bool {
+    c.table.as_ref().is_some_and(|q| {
+        stage.iter().any(|s| s.eq_ignore_ascii_case(&q.name))
+            && !scope.iter().any(|s| s.eq_ignore_ascii_case(&q.name))
+    })
 }
 
 fn conjuncts(e: &Expression, out: &mut Vec<Expression>) {
@@ -97,15 +157,11 @@ fn text(e: &Expression) -> String {
 /// `stage`, and make each one's inner side an output. `None` when `sel` reads
 /// nothing of the enclosing query.
 pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Correlation>> {
-    let inner = defined_names(sel);
-    let is_outer = |c: &Column| {
-        c.table.as_ref().is_some_and(|q| {
-            stage.iter().any(|s| s.eq_ignore_ascii_case(&q.name))
-                && !inner.iter().any(|s| s.eq_ignore_ascii_case(&q.name))
-        })
-    };
+    let inner = level_names(sel);
+    let is_outer = |c: &Column| reads(c, stage, &inner);
     let whole = Expression::Select(Box::new(sel.clone()));
-    if !columns(&whole).any(is_outer) {
+    let deep = nested_outer(&whole, &inner, stage).cloned();
+    if deep.is_none() && !own_columns(&whole).into_iter().any(is_outer) {
         return Ok(None);
     }
     let name = |c: &Column| {
@@ -122,6 +178,17 @@ pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Cor
         ))
     };
 
+    if let Some(c) = &deep {
+        return Err(refuse(c, "from a query nested in the subquery"));
+    }
+    if super::grouping::grouping_sets(sel)?.is_some() {
+        // A subtotal row's key is NULL, so keeping the enclosing row's value
+        // would drop it.
+        return Err(unsupported(
+            "Layer 2 correlated subquery with ROLLUP, CUBE or GROUPING SETS is not supported: a subtotal row has no value of the correlated column to match",
+        ));
+    }
+
     let mut kept = vec![];
     let mut pairs: Vec<(Expression, Expression)> = vec![];
     let mut parts = vec![];
@@ -129,15 +196,22 @@ pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Cor
         conjuncts(&w.this, &mut parts);
     }
     for part in parts {
-        let Some(c) = columns(&part).find(|c| is_outer(c)).cloned() else {
+        let Some(c) = own_columns(&part)
+            .into_iter()
+            .find(|c| is_outer(c))
+            .cloned()
+        else {
             kept.push(part);
             continue;
         };
         let Expression::Eq(eq) = unwrap_paren(&part) else {
             return Err(refuse(&c, &format!("in `{}`", text(&part))));
         };
-        let all_outer = |e: &Expression| columns(e).next().is_some() && columns(e).all(is_outer);
-        let no_outer = |e: &Expression| !columns(e).any(is_outer);
+        let all_outer = |e: &Expression| {
+            let cols = own_columns(e);
+            !cols.is_empty() && cols.into_iter().all(is_outer)
+        };
+        let no_outer = |e: &Expression| !own_columns(e).into_iter().any(is_outer);
         let (inside, outside) = if all_outer(&eq.right) && no_outer(&eq.left) {
             (&eq.left, &eq.right)
         } else if all_outer(&eq.left) && no_outer(&eq.right) {
@@ -153,7 +227,7 @@ pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Cor
     let mut rest = sel.clone();
     rest.where_clause = and_all(kept.clone()).map(|this| polyglot_sql::expressions::Where { this });
     let rest_whole = Expression::Select(Box::new(rest.clone()));
-    if let Some(c) = columns(&rest_whole).find(|c| is_outer(c)) {
+    if let Some(c) = own_columns(&rest_whole).into_iter().find(|c| is_outer(c)) {
         return Err(refuse(c, "outside its WHERE"));
     }
     if sel.limit.is_some() || sel.offset.is_some() || sel.fetch.is_some() {
