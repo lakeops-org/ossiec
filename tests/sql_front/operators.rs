@@ -133,6 +133,31 @@ fn grouping_sets_report_every_level() {
             "c.region, o.status, COUNT(*) AS n",
             "GROUP BY ROLLUP(c.region, o.status) HAVING AGG(o.order_count) > 1",
         ),
+        // An aggregate in HAVING reads the rows' values of a column the set
+        // leaves out: only the bare column is NULL at a subtotal.
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) HAVING COUNT(o.status) > 0",
+        ),
+        (
+            "c.region, o.status, AGG(o.order_count) AS n",
+            "c.region, o.status, COUNT(*) AS n",
+            "GROUP BY ROLLUP(c.region, o.status) \
+             HAVING SUM(CASE WHEN o.status = 'returned' THEN 1 ELSE 0 END) > 0",
+        ),
+        // Unnamed expressions and plain aggregates keep their names in every
+        // set, though a set leaves a column before them out.
+        (
+            "c.region, AGG(o.order_count) + 1, AGG(o.order_count) + 2",
+            "c.region, COUNT(*) + 1, COUNT(*) + 2",
+            "GROUP BY ROLLUP(c.region)",
+        ),
+        (
+            "c.region, COUNT(*), SUM(o.amount_cents)",
+            "c.region, COUNT(*), SUM(o.amount_cents)",
+            "GROUP BY ROLLUP(c.region)",
+        ),
     ] {
         let sql = format!("SELECT {select} {from} {rest}");
         let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{rest}: {e}"));
@@ -221,6 +246,45 @@ fn grouping_sets_report_every_level() {
     ));
     assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{}", c.sql);
     assert!(want.iter().any(|r| r[0] == "NULL"), "{want:?}");
+    // The same under includeUnmatched: the grand total is a constant row, not a
+    // plain aggregate, which includeUnmatched refuses.
+    let unmatched = Options {
+        include_unmatched: true,
+        ..duck()
+    };
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT status FROM orders GROUP BY ROLLUP(status)",
+        &unmatched,
+    )
+    .unwrap();
+    assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{}", c.sql);
+    // A grand total that selects nothing still answers to its HAVING.
+    let sql =
+        format!("SELECT c.region {from} GROUP BY ROLLUP(c.region) HAVING AGG(o.order_count) > 3");
+    let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap();
+    let want = sorted(duckdb_rows(
+        &db,
+        &format!("SELECT c.region {raw} GROUP BY ROLLUP(c.region) HAVING COUNT(*) > 3"),
+    ));
+    assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{sql}\n{}", c.sql);
+    assert!(want.iter().any(|r| r[0] == "NULL"), "{want:?}");
+    // An unnamed expression is named as in the same query without ROLLUP.
+    let names = |sql: &str| {
+        let c = ossiec::compile_sql(&g, sql, &duck()).unwrap();
+        c.sql
+            .match_indices("AS \"__l2_")
+            .map(|(i, _)| c.sql[i..].split('"').nth(1).unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(
+        names(&format!(
+            "SELECT c.region, AGG(o.order_count) + 1 {from} GROUP BY ROLLUP(c.region)"
+        )),
+        names(&format!(
+            "SELECT c.region, AGG(o.order_count) + 1 {from} GROUP BY c.region"
+        )),
+    );
     for (rest, want) in [
         ("GROUP BY ROLLUP(UPPER(c.region))", "take columns"),
         (

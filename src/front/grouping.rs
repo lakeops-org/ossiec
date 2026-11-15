@@ -5,7 +5,8 @@
 //! set, each at its own level, stacked: `ROLLUP(region, status)` is the query
 //! grouped by `(region, status)`, by `(region)` and by nothing. Each set is
 //! compiled as an ordinary stage, where a grouping column outside the set is left
-//! out of the select list and reads as NULL in `HAVING`, as SQL's subtotal rows do.
+//! out of the select list and reads as NULL in `HAVING` (outside an aggregate), as
+//! SQL's subtotal rows do.
 //! [`super::nested`] stacks the stages with `UNION ALL`.
 
 use polyglot_sql::expressions::{Column, Expression, Literal, Null, Select};
@@ -184,14 +185,7 @@ pub(super) fn branch(sel: &Select, all: &[Column], set: &[Column], empty: bool) 
         _ => b.group_by = None,
     }
     if let Some(h) = b.having.as_mut() {
-        h.this = transform(h.this.clone(), &|x| {
-            Ok(Some(if is_missing(&x) {
-                Expression::Null(Null)
-            } else {
-                x
-            }))
-        })
-        .map_err(|e| Error::Internal(e.to_string()))?;
+        h.this = null_outside_aggregates(&h.this, &is_missing)?;
     }
     b.order_by = None;
     b.limit = None;
@@ -212,6 +206,68 @@ pub(super) fn branch(sel: &Select, all: &[Column], set: &[Column], empty: bool) 
         }
     }
     Ok(b)
+}
+
+/// `sel` with each unnamed expression named as the whole query names it, by its
+/// position (`__l2_N`, [`super::formula::default_measure_name`]). A column, a
+/// single `AGG(m)` and a plain aggregate are named by what they read, so they
+/// keep their names in every branch already.
+pub(super) fn stable_names(sel: &Select) -> Select {
+    let mut out = sel.clone();
+    for (i, item) in out.expressions.iter_mut().enumerate() {
+        let inner = super::unwrap_paren(item);
+        let named_by_itself = matches!(item, Expression::Alias(_) | Expression::Column(_))
+            || super::is_base_agg_expr(inner)
+            || super::take_agg(inner)
+                .ok()
+                .flatten()
+                .is_some_and(|arg| super::as_column(arg).is_some());
+        if !named_by_itself {
+            let this = std::mem::replace(item, Expression::Null(Null));
+            *item = Expression::Alias(Box::new(polyglot_sql::expressions::Alias::new(
+                this,
+                polyglot_sql::expressions::Identifier::new(format!("__l2_{i}")),
+            )));
+        }
+    }
+    out
+}
+
+/// `HAVING` at a subtotal: a grouping column the set leaves out reads as NULL,
+/// as SQL's subtotal row does, but inside an aggregate (`COUNT(status)`,
+/// `AGG(m)`) it is the rows' own values. The walk is bottom-up, so aggregates
+/// are set aside behind stand-ins first and put back after.
+fn null_outside_aggregates(
+    e: &Expression,
+    is_missing: &dyn Fn(&Expression) -> bool,
+) -> Result<Expression> {
+    const STAND_IN: &str = "__ossiec_having_agg";
+    let is_agg = |x: &Expression| super::is_base_agg_expr(x) || super::is_measure_agg_expr(x);
+    let mut aggs: Vec<&Expression> = vec![];
+    for x in e.dfs() {
+        if is_agg(x) && !aggs.iter().any(|a| a.contains(|y| std::ptr::eq(y, x))) {
+            aggs.push(x);
+        }
+    }
+    let internal = |e: polyglot_sql::Error| Error::Internal(e.to_string());
+    let hidden = transform(e.clone(), &|x| {
+        Ok(Some(match aggs.iter().position(|a| **a == x) {
+            Some(i) => Expression::column(format!("{STAND_IN}{i}")),
+            None => x,
+        }))
+    })
+    .map_err(internal)?;
+    transform(hidden, &|x| {
+        Ok(Some(match &x {
+            Expression::Column(c) if c.table.is_none() && c.name.name.starts_with(STAND_IN) => {
+                let i: usize = c.name.name[STAND_IN.len()..].parse().unwrap_or(usize::MAX);
+                aggs.get(i).map_or(x, |a| (*a).clone())
+            }
+            _ if is_missing(&x) => Expression::Null(Null),
+            _ => x,
+        }))
+    })
+    .map_err(internal)
 }
 
 /// A key of the stacked whole's `ORDER BY`: an output column, by name or position.

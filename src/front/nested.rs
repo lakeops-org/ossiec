@@ -618,7 +618,10 @@ impl Compiler<'_> {
         derived_mode: bool,
         outer: &[String],
     ) -> Result<Node> {
-        use super::grouping::{all_columns, branch, order_key, same};
+        use super::grouping::{all_columns, branch, order_key, same, stable_names};
+        // A branch drops the grouping columns its set leaves out, which would
+        // renumber the unnamed expressions after them (`__l2_N`).
+        let sel = &stable_names(sel);
         if !matches!(classify(sel)?, Kind::Agg) {
             return Err(unsupported(
                 "Layer 2 ROLLUP, CUBE and GROUPING SETS over derived tables are not supported yet",
@@ -662,30 +665,41 @@ impl Compiler<'_> {
             }
         }
         let mut pending = vec![];
-        let mut branch_names: Vec<Vec<String>> = vec![];
+        // Each branch: the placeholder it reads (none for a constant row) and
+        // the columns it has.
+        let mut branches: Vec<(Option<String>, Vec<String>)> = vec![];
         let mut first_outputs: Vec<OutCol> = vec![];
         for (set, empty) in plan {
+            let b = branch(sel, &all, set, empty)?;
+            if b.expressions.is_empty() && set.is_empty() && b.having.is_none() {
+                // `SELECT status … GROUP BY ROLLUP(status)`: the grand total
+                // selects nothing. It is one row of NULLs, as SQL's empty
+                // grouping set is even over no rows, so no stage reads anything.
+                branches.push((None, vec![]));
+                continue;
+            }
+            let mut b = b;
+            // Every grouping column is selected (GROUP BY matches the selected
+            // dimensions), so only the grand total can select nothing. With a
+            // HAVING to apply, it gets one hidden aggregate (a plain one, so
+            // not with `includeUnmatched`), which the outer list never reads.
+            let hidden = b.expressions.is_empty();
+            if hidden {
+                b.expressions = vec![hidden_count()?];
+            }
             // Grouping sets have their own bound (`MAX_SETS`, checked when they're
             // expanded), not the derived tables'. The name only has to be unique.
             let placeholder = format!("{}g{}", sql::PLACEHOLDER_PREFIX, self.grouping_count);
             self.grouping_count += 1;
-            let mut b = branch(sel, &all, set, empty)?;
-            // `SELECT status … GROUP BY ROLLUP(status)` drops `status` from the
-            // grand total, and a stage needs a measure or a dimension. A hidden
-            // aggregate keeps that one NULL row; the outer list never names it.
-            let hidden = b.expressions.is_empty();
-            if hidden {
-                b.expressions.push(hidden_grouping_row()?);
-            }
             let node = self.agg_stage(&b, depth, derived_mode, outer)?;
             let mut cols = output_names(&node.ast)?;
             if hidden {
-                cols.retain(|n| !n.eq_ignore_ascii_case(HIDDEN_GROUPING_ROW));
+                cols.retain(|n| !n.starts_with(HIDDEN_GROUPING_COLUMN));
             }
-            branch_names.push(cols);
             if first_outputs.is_empty() {
                 first_outputs = node.outputs.clone();
             }
+            branches.push((Some(placeholder.clone()), cols));
             pending.push((placeholder, node));
         }
         // The first branch holds every selected column (it is the full set, or
@@ -699,11 +713,10 @@ impl Compiler<'_> {
             }
         }
         let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
-        let parts: Vec<String> = pending
+        let parts: Vec<String> = branches
             .iter()
-            .zip(&branch_names)
             .enumerate()
-            .map(|(i, ((placeholder, _), have))| {
+            .map(|(i, (placeholder, have))| {
                 let cols: Vec<String> = names
                     .iter()
                     .map(|n| {
@@ -714,10 +727,10 @@ impl Compiler<'_> {
                         }
                     })
                     .collect();
-                format!(
-                    "SELECT {} FROM {placeholder} AS __ossiec_g{i}",
-                    cols.join(", ")
-                )
+                match placeholder {
+                    Some(p) => format!("SELECT {} FROM {p} AS __ossiec_g{i}", cols.join(", ")),
+                    None => format!("SELECT {}", cols.join(", ")),
+                }
             })
             .collect();
         let mut text = format!(
@@ -883,25 +896,28 @@ impl Compiler<'_> {
     }
 }
 
-/// A subtotal that selected only grouping columns this set leaves out still
-/// returns its NULL row. The name stays inside that branch.
-const HIDDEN_GROUPING_ROW: &str = "__ossiec_grouping_row";
+/// The hidden item of a grand total that selects nothing; the outer list never
+/// names it.
+const HIDDEN_GROUPING_COLUMN: &str = "__ossiec_grouping_row";
 
-fn hidden_grouping_row() -> Result<Expression> {
+/// `COUNT(*) AS __ossiec_grouping_row0`, the one item of a grand total that
+/// selects nothing but has a `HAVING` to apply.
+fn hidden_count() -> Result<Expression> {
     let ast = sql::parse(
-        &format!("SELECT COUNT(*) AS {HIDDEN_GROUPING_ROW}"),
+        &format!("SELECT COUNT(*) AS {HIDDEN_GROUPING_COLUMN}0"),
         DialectType::Generic,
     )
     .map_err(Error::Internal)?;
-    let Expression::Select(s) = ast else {
-        return Err(Error::Internal(
-            "hidden grouping row did not parse as a select".into(),
-        ));
-    };
-    s.expressions
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::Internal("hidden grouping row has no select item".into()))
+    match ast {
+        Expression::Select(s) => s
+            .expressions
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Internal("hidden count has no select item".into())),
+        _ => Err(Error::Internal(
+            "hidden count did not parse as a select".into(),
+        )),
+    }
 }
 
 /// `outputs` is a stage's columns, dimensions then measures. Walk the select
