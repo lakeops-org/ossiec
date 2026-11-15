@@ -31,5 +31,5 @@ FROM (
 GROUP BY
   `c_first_name`
 ORDER BY
-  `customer_lifetime_value` DESC
+  `customer_lifetime_value` DESC NULLS LAST
 LIMIT 5
