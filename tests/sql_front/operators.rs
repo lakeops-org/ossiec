@@ -184,6 +184,43 @@ fn grouping_sets_report_every_level() {
         "{}",
         c.sql
     );
+    // A measure listed before its dimension: position 1 is the measure, so the
+    // grand total (the largest count) wins, not the last status.
+    let c = ossiec::compile_sql(
+        &g,
+        &format!(
+            "SELECT AGG(o.order_count) AS n, o.status {from} GROUP BY ROLLUP(o.status) \
+             ORDER BY 1 DESC LIMIT 1"
+        ),
+        &duck(),
+    )
+    .unwrap();
+    assert_eq!(
+        duckdb_rows(&db, &c.sql),
+        duckdb_rows(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n, o.status {raw} GROUP BY ROLLUP(o.status) \
+                 ORDER BY 1 DESC LIMIT 1"
+            )
+        ),
+        "{}",
+        c.sql
+    );
+    // The subtotal selects no measure once `status` is left out. It is still one
+    // NULL row.
+    let c = ossiec::compile_sql(
+        &g,
+        "SELECT status FROM orders GROUP BY ROLLUP(status)",
+        &duck(),
+    )
+    .unwrap();
+    let want = sorted(duckdb_rows(
+        &db,
+        "SELECT status FROM orders GROUP BY ROLLUP(status)",
+    ));
+    assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{}", c.sql);
+    assert!(want.iter().any(|r| r[0] == "NULL"), "{want:?}");
     for (rest, want) in [
         ("GROUP BY ROLLUP(UPPER(c.region))", "take columns"),
         (

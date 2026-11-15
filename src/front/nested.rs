@@ -606,8 +606,10 @@ impl Compiler<'_> {
     /// grouping column out. The set with every grouping column goes first, so
     /// each column has its type before a branch's NULL meets it (Postgres types
     /// `UNION` pairwise, and two bare NULLs would become text). When no set has
-    /// them all, a branch that returns no rows types them. `ORDER BY` and
-    /// `LIMIT` apply to the stacked whole.
+    /// them all, a branch that returns no rows types them. A stage emits
+    /// dimensions before measures; the stack projects them back into the select
+    /// list's order, which is what a positional `ORDER BY` indexes. `ORDER BY`
+    /// and `LIMIT` apply to the stacked whole.
     fn grouping(
         &mut self,
         sel: &Select,
@@ -667,15 +669,28 @@ impl Compiler<'_> {
             // expanded), not the derived tables'. The name only has to be unique.
             let placeholder = format!("{}g{}", sql::PLACEHOLDER_PREFIX, self.grouping_count);
             self.grouping_count += 1;
-            let b = branch(sel, &all, set, empty)?;
+            let mut b = branch(sel, &all, set, empty)?;
+            // `SELECT status … GROUP BY ROLLUP(status)` drops `status` from the
+            // grand total, and a stage needs a measure or a dimension. A hidden
+            // aggregate keeps that one NULL row; the outer list never names it.
+            let hidden = b.expressions.is_empty();
+            if hidden {
+                b.expressions.push(hidden_grouping_row()?);
+            }
             let node = self.agg_stage(&b, depth, derived_mode, outer)?;
-            branch_names.push(output_names(&node.ast)?);
+            let mut cols = output_names(&node.ast)?;
+            if hidden {
+                cols.retain(|n| !n.eq_ignore_ascii_case(HIDDEN_GROUPING_ROW));
+            }
+            branch_names.push(cols);
             if first_outputs.is_empty() {
                 first_outputs = node.outputs.clone();
             }
             pending.push((placeholder, node));
         }
-        let names = branch_names[0].clone();
+        // The first branch holds every selected column (it is the full set, or
+        // the branch that types them). Its stage lists dimensions, then measures.
+        let names = names_in_select_order(sel, &first_outputs)?;
         for (i, n) in names.iter().enumerate() {
             if names[..i].iter().any(|p| p.eq_ignore_ascii_case(n)) {
                 return Err(Error::Request(format!(
@@ -866,6 +881,74 @@ impl Compiler<'_> {
         }
         Ok((out, pending))
     }
+}
+
+/// A subtotal that selected only grouping columns this set leaves out still
+/// returns its NULL row. The name stays inside that branch.
+const HIDDEN_GROUPING_ROW: &str = "__ossiec_grouping_row";
+
+fn hidden_grouping_row() -> Result<Expression> {
+    let ast = sql::parse(
+        &format!("SELECT COUNT(*) AS {HIDDEN_GROUPING_ROW}"),
+        DialectType::Generic,
+    )
+    .map_err(Error::Internal)?;
+    let Expression::Select(s) = ast else {
+        return Err(Error::Internal(
+            "hidden grouping row did not parse as a select".into(),
+        ));
+    };
+    s.expressions
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Internal("hidden grouping row has no select item".into()))
+}
+
+/// `outputs` is a stage's columns, dimensions then measures. Walk the select
+/// list and take the next dimension or measure, so the stack's column order
+/// is the consumer's.
+fn names_in_select_order(sel: &Select, outputs: &[OutCol]) -> Result<Vec<String>> {
+    use std::collections::VecDeque;
+    let mut fields: VecDeque<&str> = outputs
+        .iter()
+        .filter(|o| o.kind == OutKind::Field)
+        .map(|o| o.name.as_str())
+        .collect();
+    let mut measures: VecDeque<&str> = outputs
+        .iter()
+        .filter(|o| o.kind != OutKind::Field)
+        .map(|o| o.name.as_str())
+        .collect();
+    let mut names = Vec::with_capacity(sel.expressions.len());
+    for expr in &sel.expressions {
+        let next = if is_dimension_item(expr) {
+            fields.pop_front()
+        } else {
+            measures.pop_front()
+        };
+        let Some(name) = next else {
+            return Err(Error::Internal(
+                "grouping output columns do not match the select list".into(),
+            ));
+        };
+        names.push(name.to_string());
+    }
+    if !fields.is_empty() || !measures.is_empty() || names.len() != outputs.len() {
+        return Err(Error::Internal(
+            "grouping output columns do not match the select list".into(),
+        ));
+    }
+    Ok(names)
+}
+
+/// A selected dimension: a column, not an aggregate. The stage rejects anything
+/// else that isn't a measure, so the remainder of the select list is measures.
+fn is_dimension_item(expr: &Expression) -> bool {
+    let (inner, _) = super::strip_alias(expr);
+    let inner = super::unwrap_paren(inner);
+    super::as_column(inner).is_some()
+        && !inner.contains(super::is_base_agg_expr)
+        && !inner.contains(super::is_measure_agg_expr)
 }
 
 /// The column names a compiled stage's statement returns, in order.
