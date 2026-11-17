@@ -304,8 +304,9 @@ fn columns_are_named_as_in_standard_sql() {
 }
 
 /// `SELECT *` is refused by name, not read as `AGG` arithmetic. A select-list
-/// subquery over derived tables is refused by name too, not read as a plain
-/// aggregate (one over datasets compiles: `select_list_reads_subqueries`).
+/// subquery in plain SQL over derived tables (no `AGG()`) is refused by name
+/// too, not read as a plain aggregate. One over datasets, or with `AGG()` over a
+/// sole derived table (folded), compiles: `select_list_reads_subqueries`.
 #[test]
 fn select_star_and_select_list_subqueries_are_refused_by_name() {
     for (q, why) in [

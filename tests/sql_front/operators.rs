@@ -457,6 +457,27 @@ fn select_list_reads_subqueries() {
                  {raw} GROUP BY ROLLUP(c.region)"
             ),
         ),
+        // AGG() over a sole derived table is folded into one stage, which
+        // compiles the subquery.
+        (
+            "SELECT t.status, AGG(t.order_count) AS n, (SELECT MAX(o2.order_date) FROM orders o2) AS d \
+             FROM (SELECT status, order_count FROM orders WHERE customer_id IS NOT NULL) t GROUP BY t.status"
+                .to_string(),
+            "SELECT status, COUNT(*) AS n, (SELECT MAX(order_date) FROM orders) AS d \
+             FROM orders WHERE customer_id IS NOT NULL GROUP BY status"
+                .to_string(),
+        ),
+        // Grouped by the correlated column, written unqualified there: one field.
+        (
+            "SELECT o.customer_id, (SELECT AGG(o2.order_count) FROM orders o2 \
+             WHERE o2.customer_id = o.customer_id GROUP BY customer_id) AS n \
+             FROM orders o GROUP BY o.customer_id"
+                .to_string(),
+            "SELECT o.customer_id, (SELECT COUNT(*) FROM orders o2 \
+             WHERE o2.customer_id = o.customer_id GROUP BY customer_id) AS n \
+             FROM orders o GROUP BY o.customer_id"
+                .to_string(),
+        ),
         // In a derived table, read by the query around it.
         (
             format!(
@@ -492,7 +513,7 @@ fn select_list_reads_subqueries() {
                 "SELECT t.region, (SELECT AGG(o2.order_count) FROM orders o2) AS x \
                  FROM (SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region) t"
             ),
-            "query over derived tables",
+            "plain SQL over derived tables",
         ),
         (
             format!(
@@ -500,6 +521,15 @@ fn select_list_reads_subqueries() {
                  {from} GROUP BY c.region) t"
             ),
             "explicit alias",
+        ),
+        // The same subquery nested in another one.
+        (
+            format!(
+                "SELECT c.region, (SELECT AGG(o2.order_count) FROM orders o2) + \
+                 (SELECT AGG(o3.order_count) FROM orders o3 \
+                  WHERE o3.id > (SELECT AGG(o2.order_count) FROM orders o2)) AS x {from} GROUP BY c.region"
+            ),
+            "write it once",
         ),
     ] {
         let e = ossiec::compile_sql(&g, &sql, &duck())

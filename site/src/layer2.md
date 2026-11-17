@@ -114,7 +114,7 @@ ossiec refuses these with a clear message rather than answer differently from th
 - `SELECT *`
 - Set operators (`UNION`, `INTERSECT`, `EXCEPT`)
 - With `ROLLUP`, `CUBE` or `GROUPING SETS`: grouping by an expression or a nested grouping, `CUBE` over more than 4 columns, more than 16 grouping sets, the `GROUPING()` function, grouping over derived tables, `DISTINCT` and `OFFSET`, and an `ORDER BY` key that isn't an output column
-- Subqueries in `HAVING` and `ORDER BY`, a subquery in the select list of a query over derived tables, and one that isn't a scalar (`IN`, `EXISTS`) there
+- Subqueries in `HAVING` and `ORDER BY`, a subquery in the select list of plain SQL over derived tables (without `AGG()`; with it, a sole derived table is folded and they compile), and one that isn't a scalar (`IN`, `EXISTS`) there
 - A correlated subquery that reads the enclosing query other than through `=` in its own `WHERE` (`o2.id < o.id`, a column in its select list), one with `LIMIT` or with `ROLLUP`, `CUBE` or `GROUPING SETS`, one that reads a query further out than the one around it, and one over a derived table that `AGG()` folds away. A subquery that aggregates without `GROUP BY` is correlated only as a scalar, without `HAVING`
 - `ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins
 - A `CROSS JOIN` (or comma `FROM`) spanning independent facts, and a comma `FROM` combined with a `RIGHT` or `FULL` join

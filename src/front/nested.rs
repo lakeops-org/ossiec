@@ -249,13 +249,14 @@ fn refuse_unsupported_items(sel: &Select, kind: &Kind) -> Result<()> {
                 "Layer 2 `SELECT *` is not supported yet: name the columns (§7.1)",
             ));
         }
-        // A stage over datasets compiles them (`Compiler::select_subqueries`);
-        // ordinary SQL over derived tables doesn't read them yet.
+        // A stage over datasets compiles them (`Compiler::select_subqueries`),
+        // and so does `AGG()` over a sole derived table, folded into one; plain
+        // SQL over derived tables (the shell) doesn't read them yet.
         if matches!(kind, Kind::Shell)
             && inner.contains(|e| matches!(e, Expression::Subquery(_) | Expression::Select(_)))
         {
             return Err(unsupported(
-                "Layer 2 subqueries in the select list of a query over derived tables are not supported yet (§7.7)",
+                "Layer 2 subqueries in the select list of plain SQL over derived tables (without AGG()) are not supported yet (§7.7); with AGG() over a sole derived table, the query is folded and they compile",
             ));
         }
     }
@@ -796,6 +797,35 @@ impl Compiler<'_> {
         })
     }
 
+    /// Whether two expressions of `select` read the same field, written either
+    /// way (`o2.customer_id`, `customer_id`): equal as written, or two columns
+    /// that resolve to one dimension in `select`'s own `FROM`.
+    fn same_field<'a>(
+        &'a self,
+        select: &Select,
+        outer: &[String],
+    ) -> impl Fn(&Expression, &Expression) -> bool + use<'a> {
+        let scope =
+            super::parse_from_clause(&self.graph, select.from.as_ref(), &select.joins, outer)
+                .ok()
+                .map(|p| p.scope);
+        move |a: &Expression, b: &Expression| {
+            if a == b {
+                return true;
+            }
+            let (Some(scope), Expression::Column(x), Expression::Column(y)) = (&scope, a, b) else {
+                return false;
+            };
+            match (
+                super::resolve_dim(&self.graph, scope, x),
+                super::resolve_dim(&self.graph, scope, y),
+            ) {
+                (Ok(p), Ok(q)) => p == q,
+                _ => false,
+            }
+        }
+    }
+
     /// §7.7: each scalar subquery in `sel`'s select list, outermost first, compiled
     /// as a Layer 2 query of its own (correlated ones as in `WHERE`, through
     /// [`super::correlate`]), and replaced by a marker column the stage reads as
@@ -848,7 +878,10 @@ impl Compiler<'_> {
                         )));
                     }
                 }
-                let correlation = correlate::correlate(&mut select, stage)?;
+                let correlation = {
+                    let same = self.same_field(&select, outer);
+                    correlate::correlate(&mut select, stage, &same)?
+                };
                 let (placeholder, node) = self.derived(&select, depth + 1, outer)?;
                 if let Some(m) = node
                     .outputs
@@ -923,6 +956,16 @@ impl Compiler<'_> {
                 ))
             })
             .map_err(|e| Error::Internal(e.to_string()))?;
+            // The walk is bottom-up: a copy of one subquery nested in another is
+            // replaced first, and the outer one no longer matches.
+            if replaced
+                .iter()
+                .any(|(_, marker)| !item.contains(|x| x == marker))
+            {
+                return Err(unsupported(
+                    "Layer 2 select list repeats a subquery inside another one; write it once",
+                ));
+            }
         }
         Ok((out, pending, scalars))
     }
@@ -996,7 +1039,10 @@ impl Compiler<'_> {
                     )));
                 }
             }
-            let correlation = correlate::correlate(&mut select, stage)?;
+            let correlation = {
+                let same = self.same_field(&select, outer);
+                correlate::correlate(&mut select, stage, &same)?
+            };
             let (placeholder, node) = self.derived(&select, depth + 1, outer)?;
             if let Some(m) = node
                 .outputs
