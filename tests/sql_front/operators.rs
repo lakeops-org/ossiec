@@ -380,6 +380,165 @@ datasets:
     }
 }
 
+/// §7.7: a scalar subquery in the select list is a Layer 2 query of its own,
+/// alone or in arithmetic with `AGG()`. A correlated one reads the row's
+/// dimensions through `=` in its own `WHERE`. Each answer is the same query in
+/// plain SQL over the source tables, so a measure over no matching rows is the
+/// measure over none (`COUNT` is 0), and a plain aggregate over none is NULL.
+#[test]
+fn select_list_reads_subqueries() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let customers = "(SELECT * FROM raw_customers WHERE NOT deleted)";
+    let from = "FROM orders o JOIN customers c ON o.customer_id = c.id";
+    let raw = format!("FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id");
+    for (sql, reference) in [
+        // Each region's share of all orders.
+        (
+            format!(
+                "SELECT c.region, AGG(o.order_count) * 1.0 / (SELECT AGG(o2.order_count) FROM orders o2) AS share \
+                 {from} GROUP BY c.region"
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) * 1.0 / (SELECT COUNT(*) FROM orders) AS share \
+                 {raw} GROUP BY c.region"
+            ),
+        ),
+        // Without AGG(): a dimension listing beside a constant.
+        (
+            format!(
+                "SELECT o.status, (SELECT MIN(o2.order_date) FROM orders o2) AS first {from} GROUP BY o.status"
+            ),
+            format!(
+                "SELECT o.status, (SELECT MIN(order_date) FROM orders) AS first {raw} GROUP BY o.status"
+            ),
+        ),
+        // Correlated with the row's region: its small customers, 0 where none.
+        (
+            format!(
+                "SELECT c.region, AGG(o.order_count) AS n, (SELECT AGG(c2.known_customers) FROM customers c2 \
+                 WHERE c2.region = c.region AND c2.segment = 'smb') AS smb {from} GROUP BY c.region"
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) AS n, (SELECT COUNT(c2.customer_id) FROM {customers} c2 \
+                 WHERE c2.region = c.region AND c2.segment = 'smb') AS smb {raw} GROUP BY c.region"
+            ),
+        ),
+        // A plain aggregate, correlated: NULL where no row matches.
+        (
+            format!(
+                "SELECT o.status, (SELECT MAX(o2.amount_cents) FROM orders o2 \
+                 WHERE o2.status = o.status AND o2.customer_id = 2) AS m {from} GROUP BY o.status"
+            ),
+            format!(
+                "SELECT o.status, (SELECT MAX(o2.amount_cents) FROM orders o2 \
+                 WHERE o2.status = o.status AND o2.customer_id = 2) AS m {raw} GROUP BY o.status"
+            ),
+        ),
+        // Grouped and correlated: one row per key.
+        (
+            format!(
+                "SELECT c.region, (SELECT AGG(o2.order_count) FROM orders o2 JOIN customers c2 ON o2.customer_id = c2.id \
+                 WHERE c2.region = c.region GROUP BY c2.region) AS n {from} GROUP BY c.region"
+            ),
+            format!(
+                "SELECT c.region, (SELECT COUNT(*) FROM orders o2 JOIN {customers} c2 ON o2.customer_id = c2.customer_id \
+                 WHERE c2.region = c.region GROUP BY c2.region) AS n {raw} GROUP BY c.region"
+            ),
+        ),
+        // With ROLLUP: each level reads the same total.
+        (
+            format!(
+                "SELECT c.region, AGG(o.order_count) AS n, (SELECT AGG(o2.order_count) FROM orders o2) AS total \
+                 {from} GROUP BY ROLLUP(c.region)"
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) AS n, (SELECT COUNT(*) FROM orders) AS total \
+                 {raw} GROUP BY ROLLUP(c.region)"
+            ),
+        ),
+        // AGG() over a sole derived table is folded into one stage, which
+        // compiles the subquery.
+        (
+            "SELECT t.status, AGG(t.order_count) AS n, (SELECT MAX(o2.order_date) FROM orders o2) AS d \
+             FROM (SELECT status, order_count FROM orders WHERE customer_id IS NOT NULL) t GROUP BY t.status"
+                .to_string(),
+            "SELECT status, COUNT(*) AS n, (SELECT MAX(order_date) FROM orders) AS d \
+             FROM orders WHERE customer_id IS NOT NULL GROUP BY status"
+                .to_string(),
+        ),
+        // Grouped by the correlated column, written unqualified there: one field.
+        (
+            "SELECT o.customer_id, (SELECT AGG(o2.order_count) FROM orders o2 \
+             WHERE o2.customer_id = o.customer_id GROUP BY customer_id) AS n \
+             FROM orders o GROUP BY o.customer_id"
+                .to_string(),
+            "SELECT o.customer_id, (SELECT COUNT(*) FROM orders o2 \
+             WHERE o2.customer_id = o.customer_id GROUP BY customer_id) AS n \
+             FROM orders o GROUP BY o.customer_id"
+                .to_string(),
+        ),
+        // In a derived table, read by the query around it.
+        (
+            format!(
+                "SELECT t.region, t.share FROM (SELECT c.region, AGG(o.order_count) * 1.0 / \
+                 (SELECT AGG(o2.order_count) FROM orders o2) AS share {from} GROUP BY c.region) t"
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) * 1.0 / (SELECT COUNT(*) FROM orders) AS share \
+                 {raw} GROUP BY c.region"
+            ),
+        ),
+    ] {
+        let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let want = sorted(duckdb_rows(&db, &reference));
+        assert!(want.len() > 1, "{sql}: proves nothing");
+        assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{sql}\n{}", c.sql);
+    }
+    for (sql, want) in [
+        (
+            format!("SELECT c.region, (SELECT o2.id, o2.status FROM orders o2 LIMIT 1) AS x {from} GROUP BY c.region"),
+            "one column",
+        ),
+        // `c.segment` has many values in a region's row.
+        (
+            format!(
+                "SELECT c.region, (SELECT AGG(c2.known_customers) FROM customers c2 \
+                 WHERE c2.segment = c.segment) AS x {from} GROUP BY c.region"
+            ),
+            "not a selected dimension",
+        ),
+        (
+            format!(
+                "SELECT t.region, (SELECT AGG(o2.order_count) FROM orders o2) AS x \
+                 FROM (SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region) t"
+            ),
+            "plain SQL over derived tables",
+        ),
+        (
+            format!(
+                "SELECT t.region FROM (SELECT c.region, (SELECT AGG(o2.order_count) FROM orders o2) \
+                 {from} GROUP BY c.region) t"
+            ),
+            "explicit alias",
+        ),
+        // The same subquery nested in another one.
+        (
+            format!(
+                "SELECT c.region, (SELECT AGG(o2.order_count) FROM orders o2) + \
+                 (SELECT AGG(o3.order_count) FROM orders o3 \
+                  WHERE o3.id > (SELECT AGG(o2.order_count) FROM orders o2)) AS x {from} GROUP BY c.region"
+            ),
+            "write it once",
+        ),
+    ] {
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(&sql)
+            .to_string();
+        assert!(e.contains(want), "{sql}: {e}");
+    }
+}
+
 /// §7.3: a correlated subquery in `WHERE` reads the outer row through `=` in its
 /// own `WHERE`. Each answer is the same correlated query in plain SQL over the
 /// source tables, so SQL's own semantics are the reference: NULL keys, `NOT IN`,
@@ -426,6 +585,15 @@ fn where_reads_correlated_subqueries() {
             "EXISTS (SELECT o2.customer_id FROM orders o2 WHERE o2.customer_id = orders.customer_id \
              GROUP BY o2.customer_id HAVING AGG(o2.order_count) > 1)",
             "EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             GROUP BY o2.customer_id HAVING COUNT(*) > 1)"
+                .to_string(),
+        ),
+        // Grouped by the correlated column without selecting it: the key is
+        // already part of the grain.
+        (
+            "EXISTS (SELECT AGG(o2.order_count) AS n FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             GROUP BY o2.customer_id HAVING AGG(o2.order_count) > 1)",
+            "EXISTS (SELECT COUNT(*) FROM orders o2 WHERE o2.customer_id = orders.customer_id \
              GROUP BY o2.customer_id HAVING COUNT(*) > 1)"
                 .to_string(),
         ),

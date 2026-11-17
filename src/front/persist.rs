@@ -198,6 +198,7 @@ fn collect_promotable(
         outer: &[],
         to_measures,
         compiled: &[],
+        scalars: &[],
     };
     let parsed_from = parse_stage_prep(graph, sel, &cfg)?;
     let schemas: Vec<(String, Vec<OutCol>)> = parsed_from
@@ -265,6 +266,11 @@ fn formula_to_metric_sql(graph: &SemanticGraph, f: &L2Formula) -> Result<String>
             formula_to_metric_sql(graph, l)?,
             formula_to_metric_sql(graph, r)?
         ),
+        L2Formula::Scalar(_) => {
+            return Err(Error::Unsupported(
+                "Layer 2 persist: a TO MEASURE can't read a subquery".into(),
+            ))
+        }
         L2Formula::Lit(v) => match v {
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => {

@@ -155,8 +155,13 @@ fn text(e: &Expression) -> String {
 
 /// Take the correlations out of `sel`, a subquery of a stage whose `FROM` names
 /// `stage`, and make each one's inner side an output. `None` when `sel` reads
-/// nothing of the enclosing query.
-pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Correlation>> {
+/// nothing of the enclosing query. `same` tells whether two of the subquery's
+/// expressions read the same field (`o2.customer_id` and `customer_id`).
+pub(super) fn correlate(
+    sel: &mut Select,
+    stage: &[String],
+    same: &dyn Fn(&Expression, &Expression) -> bool,
+) -> Result<Option<Correlation>> {
     let inner = level_names(sel);
     let is_outer = |c: &Column| reads(c, stage, &inner);
     let whole = Expression::Select(Box::new(sel.clone()));
@@ -258,7 +263,7 @@ pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Cor
         // field once.
         let selected = rest.expressions.iter().find_map(|item| {
             let (e, alias) = strip_alias(item);
-            (e == inside).then(|| {
+            same(e, inside).then(|| {
                 alias.or_else(|| match e {
                     Expression::Column(c) => Some(c.name.name.clone()),
                     _ => None,
@@ -274,7 +279,12 @@ pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Cor
                     Identifier::new(key.clone()),
                 ))));
                 match &mut rest.group_by {
-                    Some(g) if g.all != Some(true) => g.expressions.push(inside.clone()),
+                    // Already grouped by it: the key adds nothing to the grain.
+                    Some(g) if g.all != Some(true) => {
+                        if !g.expressions.iter().any(|x| same(x, inside)) {
+                            g.expressions.push(inside.clone());
+                        }
+                    }
                     Some(_) => {}
                     None if grand_total => {
                         rest.group_by = Some(GroupBy {
@@ -289,7 +299,7 @@ pub(super) fn correlate(sel: &mut Select, stage: &[String]) -> Result<Option<Cor
                 if grand_total {
                     // Later keys join the GROUP BY made for the first.
                     if let Some(g) = &mut rest.group_by {
-                        if !g.expressions.contains(inside) {
+                        if !g.expressions.iter().any(|x| same(x, inside)) {
                             g.expressions.push(inside.clone());
                         }
                     }

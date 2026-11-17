@@ -72,6 +72,7 @@ pub(super) fn formula_to_expr(
         )
         .into_inner(),
         L2Formula::Lit(v) => literal_expr(v)?,
+        L2Formula::Scalar(e) => (**e).clone(),
     })
 }
 
@@ -189,6 +190,9 @@ fn formula_in(
             })?;
             Ok(L2Formula::Lit(v))
         }
+        Expression::Column(c) if c.table.is_none() && c.name.name.starts_with(super::SCALAR) => {
+            Ok(L2Formula::Scalar(Box::new(e.clone())))
+        }
         Expression::Column(_) => Err(unsupported(
             "Layer 2 measure expressions must use AGG(measure) leaves, not bare columns",
         )),
@@ -231,7 +235,7 @@ pub(super) fn formula_leaves(f: &L2Formula) -> Vec<String> {
             v.dedup();
             v
         }
-        L2Formula::Lit(_) => vec![],
+        L2Formula::Lit(_) | L2Formula::Scalar(_) => vec![],
     }
 }
 

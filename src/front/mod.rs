@@ -235,6 +235,9 @@ pub(super) struct StageCfg<'a> {
     /// Placeholders of the `WHERE` subqueries compiled for this stage
     /// (`Compiler::where_subqueries`). Only these may stand in `WHERE`.
     pub compiled: &'a [String],
+    /// Select-list scalar subqueries compiled for this stage
+    /// (`Compiler::select_subqueries`): each marker and its stand-in.
+    pub scalars: &'a [(String, Expression)],
 }
 
 /// A derived table joined to an `AGG` stage: `JOIN (<select>) alias ON ...`.
@@ -292,7 +295,14 @@ pub(super) enum L2Formula {
     Div(Box<L2Formula>, Box<L2Formula>),
     NullIf(Box<L2Formula>, Box<L2Formula>),
     Lit(serde_json::Value),
+    /// A scalar subquery of the select list (§7.7), compiled on its own: its
+    /// stand-in, whose correlated columns read the stage's dimensions
+    /// ([`plan::OUT_DIM`]). Before they're bound, a [`SCALAR`] marker column.
+    Scalar(Box<Expression>),
 }
+
+/// Marks a select-list scalar subquery until the stage binds its stand-in.
+pub(super) const SCALAR: &str = "__ossiec_scalar";
 
 /// One dataset in the consumer `FROM` / `JOIN` list and its SQL alias.
 #[derive(Clone)]
@@ -384,6 +394,7 @@ fn parse_layer2(graph: &SemanticGraph, sql: &str) -> Result<Layer2Parsed> {
         outer: &[],
         to_measures: &to_measures,
         compiled: &[],
+        scalars: &[],
     };
     let parsed_from = parse_stage_prep(graph, &sel, &cfg)?;
     if !parsed_from.derived.is_empty() {
