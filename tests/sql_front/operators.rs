@@ -580,6 +580,23 @@ fn having_and_order_by_read_subqueries() {
             format!("ORDER BY {plain} DESC, c.region NULLS FIRST LIMIT 2"),
             true,
         ),
+        // The same subquery twice, side by side: one value, read twice.
+        (
+            "HAVING AGG(o.order_count) * 4 > (SELECT AGG(o2.order_count) FROM orders o2) \
+             AND AGG(o.order_count) < (SELECT AGG(o2.order_count) FROM orders o2)"
+                .to_string(),
+            "HAVING COUNT(*) * 4 > (SELECT COUNT(*) FROM orders) \
+             AND COUNT(*) < (SELECT COUNT(*) FROM orders)"
+                .to_string(),
+            false,
+        ),
+        // A key that is a subquery alone, read by no other column: the same
+        // for every row, so the next key orders them.
+        (
+            "ORDER BY (SELECT AGG(o2.order_count) FROM orders o2), c.region".to_string(),
+            "ORDER BY (SELECT COUNT(*) FROM orders), c.region NULLS FIRST".to_string(),
+            true,
+        ),
         (
             "ORDER BY AGG(o.order_count) * 1.0 / (SELECT AGG(o2.order_count) FROM orders o2) DESC, c.region"
                 .to_string(),
@@ -625,6 +642,19 @@ fn having_and_order_by_read_subqueries() {
             .to_string();
         assert!(e.contains(want), "{rest}: {e}");
     }
+    // StarRocks orders by keys computed in a derived table: their names differ
+    // from every output's, even one named like them.
+    let sql = format!(
+        "SELECT c.region AS __ossiec_ord0, AGG(o.order_count) AS n {from} GROUP BY c.region \
+         ORDER BY (SELECT AGG(o2.order_count) FROM orders o2), c.region"
+    );
+    let opts = ossiec::Options {
+        target: Some(polyglot_sql::DialectType::StarRocks),
+        ..Default::default()
+    };
+    let c = ossiec::compile_sql(&g, &sql, &opts).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.sql.contains("__ossiec_ord0_"), "{}", c.sql);
+    assert_eq!(c.sql.matches("AS `__ossiec_ord0`").count(), 2, "{}", c.sql);
 }
 
 /// §7.7: `[NOT] EXISTS` and `x [NOT] IN` read a subquery in the select list,

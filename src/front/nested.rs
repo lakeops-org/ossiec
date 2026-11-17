@@ -906,6 +906,11 @@ impl Compiler<'_> {
                     "Layer 2 {clause} takes a subquery as a scalar value `(SELECT …)`, in `[NOT] EXISTS (SELECT …)` or in `x [NOT] IN (SELECT …)`"
                 ))
             })?;
+            // The same subquery again, beside the first: one value, one marker,
+            // which the rewrite below puts in both places.
+            if replaced.iter().any(|(original, _)| original == around) {
+                continue;
+            }
             if let Form::In(Expression::In(i)) = &form {
                 if i.this.contains(|x| {
                     matches!(x, Expression::Select(_) | Expression::Subquery(_))
