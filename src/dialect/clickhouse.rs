@@ -18,8 +18,10 @@ use crate::{Error, Result};
 /// Evidence: `running_total_and_change` on ClickHouse 25.8 and 26.8 (`LAG` fails to
 /// resolve; ClickHouse's own `lag` returns 0 for the first period).
 ///
-/// Plus backslashes in `LIKE` patterns (see `literal_backslashes_in_like`).
+/// Plus backslashes in `LIKE` patterns (see `literal_backslashes_in_like`), and
+/// subqueries in `ORDER BY` (see `order_by_subqueries_by_name`).
 pub(super) fn adapt(ast: Expression, _plan: &LogicalPlan) -> Result<Expression> {
+    let ast = super::order_by_subqueries_by_name(ast)?;
     let ast = literal_backslashes_in_like(ast)?;
     transform(ast, &|e| {
         let Expression::WindowFunction(mut w) = e else {

@@ -7,7 +7,7 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 - **Set operators** (`UNION`, `INTERSECT`, `EXCEPT`), even over fields only (§7.8)
 - **`GROUPING()`, and `ROLLUP`/`CUBE`/`GROUPING SETS` over derived tables or expressions** (§7.4)
 - **`SELECT *`** (§7.1)
-- **Subqueries in the select list, `HAVING` and `ORDER BY` of plain SQL over derived tables** (without `AGG()`; with it, a sole derived table is folded and they compile), and `EXISTS`/`IN` there (§7.5, §7.7)
+- **Subqueries in the select list, `HAVING` and `ORDER BY` of plain SQL over derived tables** (without `AGG()`; with it, a sole derived table is folded and they compile), and `ANY`/`ALL` and `IN` with an aggregate on its left (§7.5, §7.7)
 - **Correlated subqueries beyond an `=` in their own `WHERE`**: a non-equality correlation (`o2.order_date < o.order_date`), one under `LIMIT` or grouping sets, one that reads a query two levels out, and `EXISTS` or `IN` over a subquery that aggregates without `GROUP BY` (§7.3)
 - **`WHERE` on one of several independent facts' columns**, beyond a comparison, `IN`, `BETWEEN` or `LIKE` on a plain column: `IS NULL`, `NOT BETWEEN`, `NOT LIKE` and other predicates there, one on a field defined as an expression (`COALESCE(amount, 0)`), and one that reads two facts (§7.3)
 - **`ASOF`, `SEMI`/`ANTI`, `NATURAL` and `LATERAL` joins** (§7.6)

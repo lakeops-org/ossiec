@@ -42,7 +42,7 @@ Each rule exists because an engine test showed polyglot's rendering answering di
 | Postgres | Locale collation sorts `'ada'` before `'Bob'` | `COLLATE "C"` on string dimensions |
 | MySQL | Default collation compares case-insensitively, merging `Ada` and `ada` | `COLLATE utf8mb4_bin` on string dimensions and filters |
 | MySQL | `AVG` of integers is rounded to 4 decimal places | The argument is cast to `DOUBLE` |
-| StarRocks | A subquery in `ORDER BY` is refused ("ORDER BY clause cannot contain subquery") | The keys are computed in a derived table, and the query around it orders by their names (`having_and_order_by_subqueries`) |
+| StarRocks, ClickHouse | StarRocks refuses a subquery in `ORDER BY` ("ORDER BY clause cannot contain subquery"); ClickHouse refuses a correlated one ("Correlated subqueries in ORDER BY are not supported") | The keys are computed in a derived table, and the query around it orders by their names (`having_and_order_by_subqueries`, `having_and_order_by_exists_and_in`) |
 | StarRocks | `\` in a string literal is an escape, and polyglot doesn't double it | Double it |
 | Postgres, ClickHouse, StarRocks, MySQL | `\` in a `LIKE` pattern is an escape | Double it, so it matches itself |
 | BigQuery | `DATE_TRUNC(d, WEEK)` starts weeks on Sunday; Ossie's start on Monday | `ISOWEEK` (checked by golden SQL only) |

@@ -605,8 +605,8 @@ fn having_and_order_by_read_subqueries() {
     }
     for (rest, want) in [
         (
-            "HAVING EXISTS (SELECT o2.id FROM orders o2 WHERE o2.status = 'returned')",
-            "HAVING takes a subquery only as a scalar",
+            "HAVING AGG(o.order_count) = ANY (SELECT AGG(o2.order_count) FROM orders o2)",
+            "HAVING takes a subquery as a scalar value",
         ),
         (
             "HAVING AGG(o.order_count) > (SELECT AGG(c2.known_customers) FROM customers c2 \
@@ -616,6 +616,169 @@ fn having_and_order_by_read_subqueries() {
         (
             "ORDER BY (SELECT o2.id, o2.status FROM orders o2 LIMIT 1)",
             "ORDER BY must return one column",
+        ),
+    ] {
+        let sql =
+            format!("SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region {rest}");
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(rest)
+            .to_string();
+        assert!(e.contains(want), "{rest}: {e}");
+    }
+}
+
+/// §7.7: `[NOT] EXISTS` and `x [NOT] IN` read a subquery in the select list,
+/// `HAVING` and `ORDER BY` as in `WHERE`, correlated with the row's dimensions
+/// or not. Each answer is the same query in plain SQL, so SQL's own semantics
+/// are the reference, `NOT IN` over a NULL among them.
+#[test]
+fn exists_and_in_outside_where() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let customers = "(SELECT * FROM raw_customers WHERE NOT deleted)";
+    let from = "FROM orders o JOIN customers c ON o.customer_id = c.id";
+    let raw = format!("FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id");
+    let smb = |customers: &str, id: &str| {
+        format!(
+            "(SELECT c2.{id} FROM {customers} c2 WHERE c2.region = c.region AND c2.segment = 'smb')"
+        )
+    };
+    let (ours, plain) = (smb("customers", "id"), smb(customers, "customer_id"));
+    let smb_regions = |customers: &str| {
+        format!("(SELECT c2.region FROM {customers} c2 WHERE c2.segment = 'smb')")
+    };
+    let returned = "(SELECT o2.product_id FROM orders o2 \
+                    WHERE o2.customer_id = o.customer_id AND o2.status = 'returned')";
+    for (sql, reference, ordered) in [
+        // The select list: each region, whether it has a small customer.
+        (
+            format!("SELECT c.region, EXISTS {ours} AS has_smb {from} GROUP BY c.region"),
+            format!("SELECT c.region, EXISTS {plain} AS has_smb {raw} GROUP BY c.region"),
+            false,
+        ),
+        (
+            format!(
+                "SELECT c.region, AGG(o.order_count) AS n, NOT EXISTS {ours} AS no_smb {from} GROUP BY c.region"
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) AS n, NOT EXISTS {plain} AS no_smb {raw} GROUP BY c.region"
+            ),
+            false,
+        ),
+        (
+            format!(
+                "SELECT c.region, c.region IN {} AS smb_region {from} GROUP BY c.region",
+                smb_regions("customers")
+            ),
+            format!(
+                "SELECT c.region, c.region IN {} AS smb_region {raw} GROUP BY c.region",
+                smb_regions(customers)
+            ),
+            false,
+        ),
+        // Correlated: each customer's products, whether they returned one.
+        (
+            format!(
+                "SELECT o.customer_id, o.product_id, o.product_id IN {returned} AS r \
+                 FROM orders o GROUP BY o.customer_id, o.product_id"
+            ),
+            format!(
+                "SELECT o.customer_id, o.product_id, o.product_id IN {returned} AS r \
+                 FROM orders o GROUP BY o.customer_id, o.product_id"
+            ),
+            false,
+        ),
+        // NOT IN with a NULL region among the values: NULL or FALSE, never TRUE.
+        (
+            format!(
+                "SELECT c.region, c.region NOT IN {} AS a {from} GROUP BY c.region",
+                smb_regions("customers")
+            ),
+            format!(
+                "SELECT c.region, c.region NOT IN {} AS a {raw} GROUP BY c.region",
+                smb_regions(customers)
+            ),
+            false,
+        ),
+        // Correlated NOT IN: customer 7's product is NULL.
+        (
+            format!(
+                "SELECT o.customer_id, o.product_id, o.product_id NOT IN {returned} AS kept \
+                 FROM orders o GROUP BY o.customer_id, o.product_id"
+            ),
+            format!(
+                "SELECT o.customer_id, o.product_id, o.product_id NOT IN {returned} AS kept \
+                 FROM orders o GROUP BY o.customer_id, o.product_id"
+            ),
+            false,
+        ),
+        // HAVING: the regions with a small customer, and those without.
+        (
+            format!("SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region HAVING EXISTS {ours}"),
+            format!("SELECT c.region, COUNT(*) AS n {raw} GROUP BY c.region HAVING EXISTS {plain}"),
+            false,
+        ),
+        (
+            format!(
+                "SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region \
+                 HAVING NOT EXISTS {ours} AND AGG(o.order_count) > 0"
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) AS n {raw} GROUP BY c.region \
+                 HAVING NOT EXISTS {plain} AND COUNT(*) > 0"
+            ),
+            false,
+        ),
+        (
+            format!(
+                "SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region HAVING c.region NOT IN {}",
+                smb_regions("customers").replace("smb", "enterprise")
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) AS n {raw} GROUP BY c.region HAVING c.region NOT IN {}",
+                smb_regions(customers).replace("smb", "enterprise")
+            ),
+            false,
+        ),
+        // ORDER BY: regions with a small customer first.
+        (
+            format!(
+                "SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region \
+                 ORDER BY EXISTS {ours} DESC, c.region"
+            ),
+            format!(
+                "SELECT c.region, COUNT(*) AS n {raw} GROUP BY c.region \
+                 ORDER BY EXISTS {plain} DESC, c.region NULLS FIRST"
+            ),
+            true,
+        ),
+    ] {
+        let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let (got, want) = if ordered {
+            (duckdb_rows(&db, &c.sql), duckdb_rows(&db, &reference))
+        } else {
+            (sorted(duckdb_rows(&db, &c.sql)), sorted(duckdb_rows(&db, &reference)))
+        };
+        assert!(!want.is_empty(), "{sql}: proves nothing");
+        assert_eq!(got, want, "{sql}\n{}", c.sql);
+    }
+    for (rest, want) in [
+        (
+            "HAVING AGG(o.order_count) IN (SELECT AGG(o2.order_count) FROM orders o2 GROUP BY o2.status)",
+            "left side of `IN (SELECT …)` reads the grouping columns only",
+        ),
+        // No GROUP BY: one row for every region, matched or not.
+        (
+            "HAVING EXISTS (SELECT AGG(c2.known_customers) FROM customers c2 WHERE c2.region = c.region)",
+            "as a scalar value",
+        ),
+        (
+            "ORDER BY c.region IN (SELECT c2.region, c2.segment FROM customers c2)",
+            "must return one column",
+        ),
+        (
+            "HAVING EXISTS (SELECT c2.id FROM customers c2 WHERE c2.segment = c.segment)",
+            "not a selected dimension",
         ),
     ] {
         let sql =
@@ -940,8 +1103,7 @@ fn where_reads_subqueries() {
     }
     // A subquery shaped like ossiec's stand-in for a compiled one is nothing of
     // the kind when the consumer writes it: in WHERE it is compiled as a query
-    // (and has no such dataset), HAVING takes only a scalar, and
-    // sql_to_request takes none.
+    // (and has no such dataset), in HAVING too, and sql_to_request takes none.
     let stand_in = "status IN (SELECT * FROM __ossiec_deriv0 AS x)";
     for sql in [
         format!("SELECT status, AGG(order_count) FROM orders WHERE {stand_in} GROUP BY status"),
@@ -959,10 +1121,7 @@ fn where_reads_subqueries() {
     )
     .unwrap_err()
     .to_string();
-    assert!(
-        e.contains("HAVING takes a subquery only as a scalar"),
-        "{e}"
-    );
+    assert!(e.contains("`SELECT *` is not supported"), "{e}");
     for predicate in [
         stand_in,
         "customer_id IN (SELECT c.id FROM customers c WHERE c.segment = 'smb')",
