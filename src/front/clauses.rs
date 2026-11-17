@@ -203,8 +203,10 @@ pub(super) fn order_key(
             "Layer 2 subqueries in ORDER BY are compiled by compile_sql; sql_to_request returns one request and takes none",
         ));
     }
+    // A compiled subquery reads a query, though none of this one's columns.
+    let reads_subquery = e.contains(super::stage::is_scalar_marker);
     let key = group_expr(graph, scope, e.clone(), dimensions, scalars, raw)?;
-    if key.measures.is_empty() && get_columns(&key.expr).is_empty() {
+    if key.measures.is_empty() && get_columns(&key.expr).is_empty() && !reads_subquery {
         return Err(unsupported(
             "Layer 2 ORDER BY must name a selected dimension, measure, or AGG(...); a position like `ORDER BY 1` is not supported",
         ));

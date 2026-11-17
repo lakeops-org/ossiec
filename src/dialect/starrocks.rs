@@ -63,17 +63,30 @@ fn order_by_subqueries_by_name(ast: Expression) -> Result<Expression> {
     };
     const OUTER: &str = "__ossiec_ordered";
     const KEY: &str = "__ossiec_ord";
+    // Each key's name, unlike any output's (engines may fold case).
+    let mut key_names: Vec<String> = vec![];
+    for i in 0..order.expressions.len() {
+        let mut name = format!("{KEY}{i}");
+        while names
+            .iter()
+            .chain(&key_names)
+            .any(|n| n.eq_ignore_ascii_case(&name))
+        {
+            name.push('_');
+        }
+        key_names.push(name);
+    }
     let mut inner = (**sel).clone();
     inner.order_by = None;
     inner.limit = None;
     inner.offset = None;
     inner.fetch = None;
-    for (i, k) in order.expressions.iter().enumerate() {
+    for (k, name) in order.expressions.iter().zip(&key_names) {
         inner
             .expressions
             .push(Expression::Alias(Box::new(Alias::new(
                 k.this.clone(),
-                Identifier::new(format!("{KEY}{i}")),
+                Identifier::new(name.clone()),
             ))));
     }
     let quote = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
@@ -91,8 +104,8 @@ fn order_by_subqueries_by_name(ast: Expression) -> Result<Expression> {
         return Ok(ast);
     };
     let mut keys = order.clone();
-    for (i, k) in keys.expressions.iter_mut().enumerate() {
-        k.this = crate::sql::col(&format!("{OUTER}.{KEY}{i}"));
+    for (k, name) in keys.expressions.iter_mut().zip(&key_names) {
+        k.this = crate::sql::col(&format!("{OUTER}.{name}"));
     }
     outer.order_by = Some(keys);
     outer.limit = sel.limit.clone();

@@ -909,6 +909,11 @@ impl Compiler<'_> {
                         "Layer 2 {clause} takes a subquery only as a scalar value, `(SELECT …)`"
                     ))
                 })?;
+            // The same subquery again, beside the first: one value, one marker,
+            // which the rewrite below puts in both places.
+            if replaced.iter().any(|(original, _)| original == around) {
+                continue;
+            }
             let mut select = (**select).clone();
             for (i, e) in select.expressions.iter_mut().enumerate() {
                 if !matches!(e, Expression::Alias(_) | Expression::Column(_)) {
