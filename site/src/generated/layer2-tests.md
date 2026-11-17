@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 162 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 163 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -172,7 +172,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY ALL`, `DISTINCT` and `WITH`.
 
-[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 15 tests
+[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 16 tests
 
 | Test | What it shows |
 |---|---|
@@ -180,6 +180,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 | `grouping_sets_report_every_level` | §7.4: `ROLLUP`, `CUBE` and `GROUPING SETS` report each measure at every level they name. |
 | `order_by_keeps_nulls_first_under_a_vendor_source` | An `ORDER BY` without `NULLS` means what the consumer's SQL means, NULL as the smallest value, even when the model's fields pick a vendor dialect that sorts NULL last (Postgres): both the grouping-set and the ordinary path write it out. |
 | `select_list_reads_subqueries` | §7.7: a scalar subquery in the select list is a Layer 2 query of its own, alone or in arithmetic with `AGG()`. |
+| `having_and_order_by_read_subqueries` | §7.5, §7.7: `HAVING` and `ORDER BY` read a scalar subquery as the select list does, alone or in arithmetic with `AGG()`, correlated with the row's dimensions or not. |
 | `where_reads_correlated_subqueries` | §7.3: a correlated subquery in `WHERE` reads the outer row through `=` in its own `WHERE`. |
 | `where_reads_subqueries` | §7.3: a subquery in `WHERE` is a Layer 2 query of its own, compiled as one and read by the predicate as SQL reads it: `IN`, `NOT IN`, `EXISTS` and a scalar. |
 | `having_keeps_or_drops_finished_groups` | §7.5: `HAVING` may contain `AGG()` and scalar expressions over it. |

@@ -539,6 +539,94 @@ fn select_list_reads_subqueries() {
     }
 }
 
+/// §7.5, §7.7: `HAVING` and `ORDER BY` read a scalar subquery as the select list
+/// does, alone or in arithmetic with `AGG()`, correlated with the row's
+/// dimensions or not. Each answer is the same query in plain SQL.
+#[test]
+fn having_and_order_by_read_subqueries() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let customers = "(SELECT * FROM raw_customers WHERE NOT deleted)";
+    let from = "FROM orders o JOIN customers c ON o.customer_id = c.id";
+    let raw = format!("FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id");
+    let smb = |customers: &str, count: &str| {
+        format!(
+            "(SELECT {count} FROM {customers} c2 WHERE c2.region = c.region AND c2.segment = 'smb')"
+        )
+    };
+    let ours = smb("customers", "AGG(c2.known_customers)");
+    let plain = smb(customers, "COUNT(c2.customer_id)");
+    for (rest, reference, ordered) in [
+        // Regions with more than a quarter of all orders.
+        (
+            "HAVING AGG(o.order_count) * 4 > (SELECT AGG(o2.order_count) FROM orders o2)".to_string(),
+            "HAVING COUNT(*) * 4 > (SELECT COUNT(*) FROM orders)".to_string(),
+            false,
+        ),
+        // More orders than small customers there (0 where none).
+        (
+            format!("HAVING AGG(o.order_count) > {ours}"),
+            format!("HAVING COUNT(*) > {plain}"),
+            false,
+        ),
+        // A conjunct that is only a subquery reads the group, not the rows.
+        (
+            format!("HAVING {ours} = 0"),
+            format!("HAVING {plain} = 0"),
+            false,
+        ),
+        (
+            format!("ORDER BY {ours} DESC, c.region LIMIT 2"),
+            format!("ORDER BY {plain} DESC, c.region NULLS FIRST LIMIT 2"),
+            true,
+        ),
+        (
+            "ORDER BY AGG(o.order_count) * 1.0 / (SELECT AGG(o2.order_count) FROM orders o2) DESC, c.region"
+                .to_string(),
+            "ORDER BY COUNT(*) * 1.0 / (SELECT COUNT(*) FROM orders) DESC, c.region NULLS FIRST"
+                .to_string(),
+            true,
+        ),
+    ] {
+        let sql = format!("SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region {rest}");
+        let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{rest}: {e}"));
+        let reference = format!("SELECT c.region, COUNT(*) AS n {raw} GROUP BY c.region {reference}");
+        let (got, want) = if ordered {
+            (duckdb_rows(&db, &c.sql), duckdb_rows(&db, &reference))
+        } else {
+            (sorted(duckdb_rows(&db, &c.sql)), sorted(duckdb_rows(&db, &reference)))
+        };
+        assert!(!want.is_empty(), "{rest}: proves nothing");
+        let all = sorted(duckdb_rows(&db, &format!("SELECT c.region, COUNT(*) AS n {raw} GROUP BY c.region")));
+        if !ordered {
+            assert_ne!(want, all, "{rest}: keeps every group, proves nothing");
+        }
+        assert_eq!(got, want, "{rest}\n{}", c.sql);
+    }
+    for (rest, want) in [
+        (
+            "HAVING EXISTS (SELECT o2.id FROM orders o2 WHERE o2.status = 'returned')",
+            "HAVING takes a subquery only as a scalar",
+        ),
+        (
+            "HAVING AGG(o.order_count) > (SELECT AGG(c2.known_customers) FROM customers c2 \
+             WHERE c2.segment = c.segment)",
+            "not a selected dimension",
+        ),
+        (
+            "ORDER BY (SELECT o2.id, o2.status FROM orders o2 LIMIT 1)",
+            "ORDER BY must return one column",
+        ),
+    ] {
+        let sql =
+            format!("SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region {rest}");
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(rest)
+            .to_string();
+        assert!(e.contains(want), "{rest}: {e}");
+    }
+}
+
 /// §7.3: a correlated subquery in `WHERE` reads the outer row through `=` in its
 /// own `WHERE`. Each answer is the same correlated query in plain SQL over the
 /// source tables, so SQL's own semantics are the reference: NULL keys, `NOT IN`,
@@ -852,7 +940,8 @@ fn where_reads_subqueries() {
     }
     // A subquery shaped like ossiec's stand-in for a compiled one is nothing of
     // the kind when the consumer writes it: in WHERE it is compiled as a query
-    // (and has no such dataset), and HAVING and sql_to_request take none.
+    // (and has no such dataset), HAVING takes only a scalar, and
+    // sql_to_request takes none.
     let stand_in = "status IN (SELECT * FROM __ossiec_deriv0 AS x)";
     for sql in [
         format!("SELECT status, AGG(order_count) FROM orders WHERE {stand_in} GROUP BY status"),
@@ -870,7 +959,10 @@ fn where_reads_subqueries() {
     )
     .unwrap_err()
     .to_string();
-    assert!(e.contains("HAVING does not support subqueries"), "{e}");
+    assert!(
+        e.contains("HAVING takes a subquery only as a scalar"),
+        "{e}"
+    );
     for predicate in [
         stand_in,
         "customer_id IN (SELECT c.id FROM customers c WHERE c.segment = 'smb')",
@@ -940,7 +1032,7 @@ fn having_keeps_or_drops_finished_groups() {
     );
     refuses(
         "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING AGG(order_count) > (SELECT 1)",
-        "subqueries",
+        "needs a FROM clause",
     );
     refuses(
         "SELECT status, AGG(order_count) FROM orders GROUP BY status HAVING AGG(nope) > 1",
@@ -1176,7 +1268,7 @@ fn order_by_reads_measures_that_are_not_selected() {
     );
     refuses(
         "SELECT status FROM orders GROUP BY status ORDER BY (SELECT 1)",
-        "subqueries",
+        "needs a FROM clause",
     );
     let g = ossiec::from_yaml(common::MODEL).unwrap();
     let sql = "SELECT status FROM orders GROUP BY status ORDER BY AGG(order_count)";
