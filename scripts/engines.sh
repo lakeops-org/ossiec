@@ -17,21 +17,29 @@ CLICKHOUSE_IMAGE="${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8}"
 # (Alpine/musl sorts by byte), which the string_ordering case depends on.
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"
 MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4}"
-ENGINES=(postgres clickhouse trino starrocks mysql)
+# Spark (and Databricks, whose SQL ossiec writes as Spark's): spark_sql_server.py serves queries from inside it.
+SPARK_IMAGE="${SPARK_IMAGE:-spark:4.0.1-python3}"
+ENGINES=(postgres clickhouse trino starrocks mysql spark)
 
 unpause_all() {
   for e in "${ENGINES[@]}"; do docker unpause "ossiec-$e" >/dev/null 2>&1 || true; done
 }
 
-start() { # name image [docker args...]
+start() { # name image [docker args...] [-- command args...]
   local name=$1 image=$2
   shift 2
+  local opts=() cmd=()
+  while (($#)); do
+    if [[ $1 == -- ]]; then shift; cmd=("$@"); break; fi
+    opts+=("$1"); shift
+  done
   if docker ps --format '{{.Names}}' | grep -qx "$name"; then
     echo "$name: running"
   elif docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
     docker start "$name" >/dev/null && echo "$name: restarted"
   else
-    docker run -d --name "$name" "$@" "$image" >/dev/null && echo "$name: started ($image)"
+    docker run -d --name "$name" ${opts[@]+"${opts[@]}"} "$image" ${cmd[@]+"${cmd[@]}"} >/dev/null \
+      && echo "$name: started ($image)"
   fi
 }
 
@@ -63,10 +71,14 @@ case "${1:-}" in
       -v "$SCRIPTS_DIR/trino-memory.properties:/etc/trino/catalog/memory.properties:ro"
     # local-infile: the TPC-DS tier bulk-loads CSV.
     start ossiec-mysql "$MYSQL_IMAGE" -e MYSQL_ROOT_PASSWORD=ossiec -e MYSQL_DATABASE=ossiec
+    # Idle until a test binary starts spark_sql_server.py in it.
+    start ossiec-spark "$SPARK_IMAGE" -v "$SCRIPTS_DIR:/ossiec:ro" --entrypoint tail \
+      -- -f /dev/null
     wait_for ossiec-postgres 60 psql -U postgres -c 'SELECT 1'
     wait_for ossiec-clickhouse 60 clickhouse-client --query 'SELECT 1'
     wait_for ossiec-trino 180 trino --execute 'SELECT 1 FROM memory.information_schema.schemata LIMIT 1'
     wait_for ossiec-mysql 120 mysql -uroot -possiec -e "SELECT 1"
+    wait_for ossiec-spark 60 python3 -c "import os; assert os.path.isdir(os.environ['SPARK_HOME'] + '/python')"
     wait_for ossiec-starrocks 600 bash -c \
       "mysql -h127.0.0.1 -P9030 -uroot -N -e 'SHOW BACKENDS' | grep -q true"
     ;;
@@ -80,7 +92,7 @@ case "${1:-}" in
     ;;
   down)
     unpause_all
-    docker rm -f ossiec-postgres ossiec-clickhouse ossiec-trino ossiec-starrocks ossiec-mysql >/dev/null 2>&1 || true
+    docker rm -f ossiec-postgres ossiec-clickhouse ossiec-trino ossiec-starrocks ossiec-mysql ossiec-spark >/dev/null 2>&1 || true
     echo "removed"
     ;;
   *)

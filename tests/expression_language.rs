@@ -71,6 +71,14 @@ fn gaps(e: Engine) -> &'static [&'static str] {
         ],
         // Athena's SQL runs on Trino (see `Engine::host`).
         Engine::Athena => gaps(Engine::Trino),
+        // Databricks' SQL is Spark's (see `Engine::host`).
+        Engine::Databricks => gaps(Engine::Spark),
+        // No TIME type.
+        Engine::Spark => &[
+            "CURRENT_TIME IS NOT NULL",
+            "CURRENT_TIME() IS NOT NULL",
+            "TIME '10:30:00' IS NOT NULL",
+        ],
         Engine::StarRocks => &[
             // A known limit, and the one wrong answer on this list: `UPPER` on a column
             // only changes ASCII letters on StarRocks, which has no Unicode form.
@@ -109,6 +117,7 @@ fn seed(e: Engine) -> String {
                 (Engine::Postgres, "DOUBLE") => "DOUBLE PRECISION",
                 (Engine::MySql | Engine::StarRocks, "TEXT") => "VARCHAR(64)",
                 (Engine::MySql | Engine::StarRocks, "TS") => "DATETIME",
+                (Engine::Spark | Engine::Databricks, "TEXT") => "STRING",
                 (_, "TEXT") => "VARCHAR",
                 (_, "TS") => "TIMESTAMP",
                 (_, "BOOL") => "BOOLEAN",
@@ -695,6 +704,13 @@ fn every_construct_on_trino() {
 #[ignore]
 fn every_construct_on_athena() {
     check_engine(Engine::Athena);
+}
+
+/// Apache Spark SQL, which is also what ossiec writes for Databricks.
+#[test]
+#[ignore]
+fn every_construct_on_spark() {
+    check_engine(Engine::Spark);
 }
 
 #[test]
@@ -1475,6 +1491,67 @@ fn athena_compiles_every_construct_as_trino_does() {
     assert!(differ.is_empty(), "{}", differ.join("\n"));
 }
 
+/// Databricks SQL is Spark SQL, so every construct compiles for Databricks to the
+/// SQL Spark runs, refusals included. The engine tier runs on Apache Spark; this
+/// holds Databricks to it without Docker.
+#[test]
+fn databricks_compiles_every_construct_as_spark_does() {
+    let mut differ = vec![];
+    for p in probes() {
+        let (label, databricks) = compile_probe(Engine::Databricks, &p);
+        let (_, spark) = compile_probe(Engine::Spark, &p);
+        match (databricks, spark) {
+            (Ok(d), Ok(s)) if d.sql == s.sql => {}
+            (Err(d), Err(s)) if d.to_string() == s.to_string().replace("Spark", "Databricks") => {}
+            (d, s) => differ.push(format!(
+                "{label}\n  databricks: {:?}\n  spark:      {:?}",
+                d.map(|c| c.sql),
+                s.map(|c| c.sql)
+            )),
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+
+/// Spark's forms, which the engine tier checks; held here without Docker. Each is
+/// one polyglot would otherwise render with another answer.
+#[test]
+fn spark_forms_answer_the_same() {
+    let on = |sql: &str| sql_on(&field(sql), Some(ossiec::DialectType::Spark), None).unwrap();
+    // Boundaries crossed, not whole units.
+    let s = on("DATEDIFF(month, a, b)");
+    assert!(s.contains("TIMESTAMPDIFF(MONTH, DATE_TRUNC('MONTH'"), "{s}");
+    // Sunday is 0, not 1.
+    assert!(
+        on("EXTRACT(DAYOFWEEK FROM a)").contains("DAYOFWEEK("),
+        "DAYOFWEEK"
+    );
+    // Java format codes, with a literal letter quoted.
+    let s = on("TO_CHAR(a, 'YYYY-MM-DD\"T\"HH24:MI')");
+    assert!(s.contains("yyyy-MM-dd"), "{s}");
+    let s = on("TO_CHAR(a, 'YYYY-MM-DD HH24:MI:SS')");
+    assert!(s.contains("'yyyy-MM-dd HH:mm:ss'"), "{s}");
+    // Adjacent literal letters are one quoted run: `'x''y'` would read as x'y.
+    let s = on("TO_CHAR(a, 'YYYYxy')");
+    assert!(s.contains(r"'yyyy\'xy\''"), "{s}");
+    // Exact, not approximate.
+    let g = t("", "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)").unwrap();
+    let s = sql_for(&g, ossiec::DialectType::Spark);
+    assert!(s.contains("PERCENTILE(") && !s.contains("APPROX"), "{s}");
+    // The whole match, not group 1.
+    assert!(
+        on("REGEXP_EXTRACT(a, 'x+')").contains(", 0)"),
+        "REGEXP_EXTRACT"
+    );
+    assert!(sql_on(
+        &field("CURRENT_TIME"),
+        Some(ossiec::DialectType::Spark),
+        None
+    )
+    .unwrap_err()
+    .contains("no equivalent on Spark"));
+}
+
 /// Where an engine can't give the same answer, the compile says so.
 #[test]
 fn an_engine_without_a_faithful_form_refuses() {
@@ -1627,6 +1704,8 @@ const SITE_ENGINES: &[(Engine, &str)] = &[
     (Engine::ClickHouse, "ClickHouse"),
     (Engine::Trino, "Trino"),
     (Engine::Athena, "Athena"),
+    (Engine::Spark, "Spark"),
+    (Engine::Databricks, "Databricks"),
     (Engine::StarRocks, "StarRocks"),
 ];
 
@@ -1710,7 +1789,7 @@ fn site_function_matrix_is_current() {
         "Every construct of `expression_language.md` that ossiec tests: {} in all. Each is compiled for each engine and run on fixed data, against a value worked out by hand. **Verified** means it returned that value. Anything else is listed under [Gaps](#gaps): a refusal (ossiec won't compile what the engine can't express faithfully), an engine error, or the one known wrong answer. The page is written from each engine's list of gaps, and CI holds that list exact: on every commit it runs every construct on every engine, and fails if one off the list doesn't return its value or one on the list does.\n\n",
         probes.len()
     ));
-    out.push_str("Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) is built on, so a function that Trino has and Athena lacks wouldn't show up here.\n\n");
+    out.push_str("Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) is built on, so a function that Trino has and Athena lacks wouldn't show up here. Spark's column is Apache Spark 4.0 with ANSI mode on, as in Databricks SQL. Databricks SQL is Spark SQL, so ossiec writes Databricks' SQL as Spark's, and its column is Spark's: a function Spark has and Databricks lacks wouldn't show up here.\n\n");
     out.push_str("## Summary\n\n| Section |");
     for (_, n) in SITE_ENGINES {
         out.push_str(&format!(" {n} |"));
