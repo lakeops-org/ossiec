@@ -351,16 +351,28 @@ pub(super) fn where_predicate(
     e: &Expression,
     compiled: &[String],
 ) -> Result<String> {
-    if contains_aggregate(e) || contains_window_function(e) || e.contains(is_measure_agg_expr) {
-        return Err(Error::Request(
-            "Layer 2 WHERE cannot contain an aggregate or a window function; use HAVING, or a measure's FILTER".into(),
-        ));
-    }
     // Subqueries were compiled on their own before this (`Compiler::where_subqueries`),
     // and what's left is their placeholders: only those, by name, stand here.
     let ours = |p: &Expression| {
         sql::subquery_placeholder(p).is_some_and(|name| compiled.iter().any(|c| c == name))
     };
+    // A stand-in's own aggregate (the MAX of a correlated scalar) isn't this query's.
+    let own = transform(e.clone(), &|x| {
+        Ok(Some(if ours(&x) {
+            Expression::Null(polyglot_sql::expressions::Null)
+        } else {
+            x
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))?;
+    if contains_aggregate(&own)
+        || contains_window_function(&own)
+        || own.contains(is_measure_agg_expr)
+    {
+        return Err(Error::Request(
+            "Layer 2 WHERE cannot contain an aggregate or a window function; use HAVING, or a measure's FILTER".into(),
+        ));
+    }
     let inside_ours = |x: &Expression| {
         e.contains(|p| ours(p) && (std::ptr::eq(p, x) || p.contains(|y| std::ptr::eq(y, x))))
     };
@@ -369,11 +381,26 @@ pub(super) fn where_predicate(
             "Layer 2 subqueries in WHERE are compiled by compile_sql; sql_to_request returns one request and takes none",
         ));
     }
+    let stand_in_column = |x: &Expression| matches!(x, Expression::Column(c) if c.table.as_ref().is_some_and(|t| t.name.starts_with(sql::STAND_IN_PREFIX)));
+    if let Some(Expression::Column(c)) = e.dfs().find(|x| stand_in_column(x) && !inside_ours(x)) {
+        return Err(Error::Request(format!(
+            "column `{}.{}` does not refer to a relation in FROM/JOIN",
+            c.table.as_ref().map_or("", |t| t.name.as_str()),
+            c.name.name
+        )));
+    }
     let failure = RefCell::new(None);
     let resolved = transform(e.clone(), &|x| {
         let Expression::Column(c) = x else {
             return Ok(Some(x));
         };
+        // A column of a compiled subquery's stand-in (`sq."id"`), not a field.
+        if c.table
+            .as_ref()
+            .is_some_and(|t| t.name.starts_with(sql::STAND_IN_PREFIX))
+        {
+            return Ok(Some(Expression::Column(c)));
+        }
         let field = resolve_dim(graph, scope, &c)
             .and_then(|field| sql::parse(&field, DialectType::Generic).map_err(Error::Internal));
         Ok(Some(match field {

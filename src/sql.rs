@@ -195,22 +195,23 @@ pub(crate) fn placeholder_relation(placeholder: &str, alias: &str) -> Expression
 /// Placeholder relations start with this; `substitute_relation` fills them in.
 pub(crate) const PLACEHOLDER_PREFIX: &str = "__ossiec_deriv";
 
-/// `SELECT * FROM __ossiec_derivN AS …`, alone or as `( … )`: a Layer 2 `WHERE`
+/// `SELECT … FROM __ossiec_derivN AS …`, alone or as `( … )`: a Layer 2 `WHERE`
 /// subquery that was compiled on its own, standing in for it until
-/// `substitute_relation` puts the compiled query in its place.
+/// `substitute_relation` puts the compiled query in its place. A correlated one
+/// selects its columns and keeps the rows of the enclosing row's values
+/// (`WHERE sq.key = o.customer_id`).
 pub(crate) fn is_subquery_placeholder(e: &Expression) -> bool {
     subquery_placeholder(e).is_some()
 }
+
+/// Columns of a subquery stand-in are qualified with names that start with this.
+pub(crate) const STAND_IN_PREFIX: &str = "__ossiec_sq";
 
 /// The placeholder relation a [`is_subquery_placeholder`] reads.
 pub(crate) fn subquery_placeholder(e: &Expression) -> Option<&str> {
     match e {
         Expression::Subquery(s) => subquery_placeholder(&s.this),
-        Expression::Select(s)
-            if matches!(s.expressions.as_slice(), [Expression::Star(_)])
-                && s.joins.is_empty()
-                && s.where_clause.is_none() =>
-        {
+        Expression::Select(s) if s.joins.is_empty() => {
             match s.from.as_ref()?.expressions.as_slice() {
                 [Expression::Table(t)] if t.name.name.starts_with(PLACEHOLDER_PREFIX) => {
                     Some(t.name.name.as_str())

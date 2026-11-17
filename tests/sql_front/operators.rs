@@ -380,6 +380,228 @@ datasets:
     }
 }
 
+/// §7.3: a correlated subquery in `WHERE` reads the outer row through `=` in its
+/// own `WHERE`. Each answer is the same correlated query in plain SQL over the
+/// source tables, so SQL's own semantics are the reference: NULL keys, `NOT IN`,
+/// and an aggregate over no matching rows (`COUNT` is 0, not NULL).
+#[test]
+fn where_reads_correlated_subqueries() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let customers = "(SELECT * FROM raw_customers WHERE NOT deleted)";
+    for (predicate, reference) in [
+        (
+            "EXISTS (SELECT c.id FROM customers c WHERE c.id = orders.customer_id AND c.region = 'EU')",
+            format!("EXISTS (SELECT 1 FROM {customers} c WHERE c.customer_id = orders.customer_id AND c.region = 'EU')"),
+        ),
+        // The outer column on the left, and a guest order (no customer) kept.
+        (
+            "NOT EXISTS (SELECT c.id FROM customers c WHERE orders.customer_id = c.id AND c.region = 'EU')",
+            format!("NOT EXISTS (SELECT 1 FROM {customers} c WHERE orders.customer_id = c.customer_id AND c.region = 'EU')"),
+        ),
+        (
+            "product_id IN (SELECT o2.product_id FROM orders o2 \
+             WHERE o2.customer_id = orders.customer_id AND o2.status = 'returned')",
+            "product_id IN (SELECT o2.product_id FROM orders o2 \
+             WHERE o2.customer_id = orders.customer_id AND o2.status = 'returned')"
+                .to_string(),
+        ),
+        (
+            "product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+             WHERE o2.customer_id = orders.customer_id AND o2.status = 'returned')",
+            "product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+             WHERE o2.customer_id = orders.customer_id AND o2.status = 'returned')"
+                .to_string(),
+        ),
+        // Two correlations.
+        (
+            "EXISTS (SELECT o2.id FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             AND o2.status = orders.status AND o2.id <> 101)",
+            "EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             AND o2.status = orders.status AND o2.order_id <> 101)"
+                .to_string(),
+        ),
+        // Grouped, with HAVING on a measure: customers with more than one order.
+        (
+            "EXISTS (SELECT o2.customer_id FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             GROUP BY o2.customer_id HAVING AGG(o2.order_count) > 1)",
+            "EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             GROUP BY o2.customer_id HAVING COUNT(*) > 1)"
+                .to_string(),
+        ),
+        // A scalar: orders above their customer's average.
+        (
+            "revenue > (SELECT AVG(o2.revenue) FROM orders o2 WHERE o2.customer_id = orders.customer_id)",
+            "amount_cents / 100.0 > (SELECT AVG(o2.amount_cents / 100.0) FROM orders o2 \
+             WHERE o2.customer_id = orders.customer_id)"
+                .to_string(),
+        ),
+        // A measure over no matching rows is the measure over none: 0, so orders
+        // outside the EU (and the guest order) stay.
+        (
+            "(SELECT AGG(c.known_customers) FROM customers c \
+             WHERE c.id = orders.customer_id AND c.region = 'EU') = 0",
+            format!(
+                "(SELECT COUNT(c.customer_id) FROM {customers} c \
+                 WHERE c.customer_id = orders.customer_id AND c.region = 'EU') = 0"
+            ),
+        ),
+        (
+            "1 < (SELECT AGG(o2.order_count) FROM orders o2 WHERE o2.customer_id = orders.customer_id)",
+            "1 < (SELECT COUNT(*) FROM orders o2 WHERE o2.customer_id = orders.customer_id)"
+                .to_string(),
+        ),
+        // A query nested in the subquery names `orders` itself; that doesn't
+        // hide the subquery's own correlation with the outer `orders`.
+        (
+            "EXISTS (SELECT c.id FROM customers c WHERE c.id = orders.customer_id \
+             AND c.id IN (SELECT orders.customer_id FROM orders WHERE orders.status = 'returned'))",
+            format!(
+                "EXISTS (SELECT 1 FROM {customers} c WHERE c.customer_id = orders.customer_id \
+                 AND c.customer_id IN (SELECT o3.customer_id FROM orders o3 WHERE o3.status = 'returned'))"
+            ),
+        ),
+        // The subquery names `orders` itself, so `orders.id` is its own column, as
+        // in SQL: not correlated.
+        (
+            "id IN (SELECT orders.id FROM orders WHERE orders.status = 'returned')",
+            "order_id IN (SELECT order_id FROM orders WHERE status = 'returned')".to_string(),
+        ),
+    ] {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let compiled =
+            ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{predicate}: {e}"));
+        let got = sorted(duckdb_rows(&db, &compiled.sql));
+        let want = sorted(duckdb_rows(
+            &db,
+            &format!("SELECT status, COUNT(*) FROM orders WHERE {reference} GROUP BY status"),
+        ));
+        assert_eq!(got, want, "{predicate}\n{}", compiled.sql);
+        assert!(!want.is_empty(), "{predicate}: proves nothing");
+        let all = sorted(duckdb_rows(
+            &db,
+            "SELECT status, COUNT(*) FROM orders GROUP BY status",
+        ));
+        assert_ne!(got, all, "{predicate}: keeps every row, proves nothing");
+    }
+    for (predicate, want) in [
+        (
+            "EXISTS (SELECT o2.id FROM orders o2 WHERE o2.id < orders.id)",
+            "reads `orders.id`",
+        ),
+        (
+            "EXISTS (SELECT o2.id FROM orders o2 WHERE o2.customer_id = orders.customer_id OR o2.id = 1)",
+            "reads `orders.customer_id`",
+        ),
+        (
+            "1 < (SELECT MAX(orders.id) FROM customers c)",
+            "outside",
+        ),
+        (
+            "EXISTS (SELECT o2.id FROM orders o2 WHERE o2.customer_id = orders.customer_id LIMIT 1)",
+            "LIMIT",
+        ),
+        (
+            "EXISTS (SELECT AGG(o2.order_count) FROM orders o2 WHERE o2.customer_id = orders.customer_id)",
+            "as a scalar value",
+        ),
+        (
+            "1 < (SELECT AGG(o2.order_count) FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             HAVING AGG(o2.order_count) > 2)",
+            "HAVING",
+        ),
+        // A subtotal row has no key to match: refused, not dropped.
+        (
+            "product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+             WHERE o2.customer_id = orders.customer_id GROUP BY ROLLUP(o2.product_id))",
+            "ROLLUP, CUBE or GROUPING SETS",
+        ),
+        // Two levels out: the inner subquery reads the outermost query.
+        (
+            "customer_id IN (SELECT c.id FROM customers c WHERE c.id IN \
+             (SELECT o2.customer_id FROM orders o2 WHERE o2.status = orders.status))",
+            "reads `orders.status`",
+        ),
+    ] {
+        let sql = format!(
+            "SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status"
+        );
+        let e = ossiec::compile_sql(&g, &sql, &duck())
+            .expect_err(predicate)
+            .to_string();
+        assert!(e.contains(want), "{predicate}: {e}");
+    }
+    // Correlated with a joined dataset: orders of customers with a returned order.
+    let compiled = ossiec::compile_sql(
+        &g,
+        "SELECT o.status, AGG(o.order_count) FROM orders o JOIN customers c ON o.customer_id = c.id \
+         WHERE EXISTS (SELECT o2.id FROM orders o2 WHERE o2.customer_id = c.id AND o2.status = 'returned') \
+         GROUP BY o.status",
+        &duck(),
+    )
+    .unwrap();
+    let want = sorted(duckdb_rows(
+        &db,
+        &format!(
+            "SELECT o.status, COUNT(*) FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id \
+             WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = c.customer_id AND o2.status = 'returned') \
+             GROUP BY o.status"
+        ),
+    ));
+    assert!(!want.is_empty());
+    assert_eq!(
+        sorted(duckdb_rows(&db, &compiled.sql)),
+        want,
+        "{}",
+        compiled.sql
+    );
+    // Each grouping set's stage compiles the correlated subquery with it.
+    let compiled = ossiec::compile_sql(
+        &g,
+        "SELECT c.region, o.status, AGG(o.order_count) AS n FROM orders o JOIN customers c ON o.customer_id = c.id \
+         WHERE EXISTS (SELECT o2.id FROM orders o2 WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') \
+         OR o.product_id = 12 GROUP BY ROLLUP(c.region, o.status)",
+        &duck(),
+    )
+    .unwrap();
+    let want = sorted(duckdb_rows(
+        &db,
+        &format!(
+            "SELECT c.region, o.status, COUNT(*) AS n FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id \
+             WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') \
+             OR o.product_id = 12 GROUP BY ROLLUP(c.region, o.status)"
+        ),
+    ));
+    assert!(want.len() > 2);
+    assert_eq!(
+        sorted(duckdb_rows(&db, &compiled.sql)),
+        want,
+        "{}",
+        compiled.sql
+    );
+    // A derived table that AGG() folds away can't be read by a subquery.
+    let e = ossiec::compile_sql(
+        &g,
+        "SELECT s, AGG(m) FROM (SELECT status AS s, order_count AS m, customer_id AS cid FROM orders) t \
+         WHERE EXISTS (SELECT c.id FROM customers c WHERE c.id = t.cid) GROUP BY s",
+        &duck(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("folds into the query"), "{e}");
+    // A stand-in's column written by the consumer names no relation.
+    let e = ossiec::compile_sql(
+        &g,
+        "SELECT status, AGG(order_count) FROM orders WHERE __ossiec_sq0.id = 1 GROUP BY status",
+        &duck(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("does not refer to a relation"), "{e}");
+}
+
 /// §7.3: a subquery in `WHERE` is a Layer 2 query of its own, compiled as one and
 /// read by the predicate as SQL reads it: `IN`, `NOT IN`, `EXISTS` and a scalar.
 /// It can evaluate a measure (`HAVING AGG(...)`) and hold a subquery of its own.
@@ -443,11 +665,6 @@ fn where_reads_subqueries() {
         assert!(!want.is_empty(), "{predicate}: proves nothing");
     }
     for (predicate, want) in [
-        // It reads the outer query's row: correlated, not supported yet.
-        (
-            "EXISTS (SELECT c.id FROM customers c WHERE c.id = orders.customer_id)",
-            "correlated",
-        ),
         (
             "customer_id IN (SELECT c.id, c.region FROM customers c)",
             "one column",

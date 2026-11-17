@@ -60,6 +60,7 @@ use joins::{apply_consumer_joins, mark_narrowing_legs, planned_alias_on_leg};
 
 mod catalog;
 mod clauses;
+mod correlate;
 mod cte;
 mod fold;
 mod formula;

@@ -63,6 +63,14 @@ pub(crate) fn supports_null_safe_eq(target: Option<DialectType>) -> bool {
     }
 }
 
+/// Engines that run a correlated subquery as the right side of `IN`. ClickHouse
+/// runs correlated `EXISTS` but refuses one in `IN` ("not supported as IN function
+/// arguments yet", 26.8), so it gets `EXISTS` forms with `IN`'s three-valued
+/// answer. Evidence: `where_correlated_subqueries`.
+pub(crate) fn supports_correlated_in(target: Option<DialectType>) -> bool {
+    !matches!(target, Some(DialectType::ClickHouse))
+}
+
 /// The engine whose SQL `target` runs. Athena's engine (v3) is Trino, and its
 /// queries are Trino's: same functions, same type names (polyglot's Athena dialect
 /// writes Hive's DDL types such as `STRING`, which an Athena query rejects). So an
