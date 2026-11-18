@@ -4,7 +4,7 @@ ossiec refuses what it can't answer the spec's way, with a message that says so.
 
 ## Layer 2
 
-- **Set operators** (`UNION`, `INTERSECT`, `EXCEPT`), even over fields only (§7.8)
+- **Set operators inside a derived table, a CTE, or a subquery in the select list, `HAVING` or `ORDER BY`** (`FROM (SELECT … UNION SELECT …) t`); at the top of a query and in a `WHERE` subquery they compile (§7.8)
 - **`GROUPING()`, and `ROLLUP`/`CUBE`/`GROUPING SETS` over derived tables or expressions** (§7.4)
 - **`SELECT *`** (§7.1)
 - **Subqueries in the `WHERE`, select list, `HAVING` and `ORDER BY` of plain SQL over derived tables** (without `AGG()`; with it, a sole derived table is folded and they compile), and `ANY`/`ALL` and `IN` with an aggregate on its left (§7.5, §7.7)

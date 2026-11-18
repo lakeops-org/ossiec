@@ -2,7 +2,7 @@
 
 # Layer 2 test evidence
 
-All 164 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
+All 165 tests of the Layer 2 SQL interface, by spec area. Each compiles a query and, almost always, runs it on DuckDB against a plain-SQL reference. A test named `s72_…` or `a2_…` follows that section or appendix of `relational_semantics.md`.
 
 ## Appendix A.1 and naming
 
@@ -172,7 +172,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 
 `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY ALL`, `DISTINCT` and `WITH`.
 
-[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 17 tests
+[`tests/sql_front/operators.rs`](https://github.com/lakeops-org/ossiec/blob/main/tests/sql_front/operators.rs) · 18 tests
 
 | Test | What it shows |
 |---|---|
@@ -193,6 +193,7 @@ Derived tables joined into an `AGG` stage, outer queries over them, nesting limi
 | `distinct_keeps_one_of_each_row` | §7.8: `DISTINCT` is valid over fields and evaluated measures. |
 | `distinct_refuses_unevaluated_measures` | §7.8: an unevaluated measure has no value to compare. |
 | `having_and_order_by_read_plain_aggregates` | §7.2, §7.5: a plain aggregate in `HAVING` or `ORDER BY` reads the group's joined rows as plain SQL does, beside `AGG()`, whether or not it is selected. |
+| `set_operators_over_evaluated_rows` | §7.8: `UNION [ALL]`, `INTERSECT` and `EXCEPT` compare or append whole rows, so each branch is a Layer 2 query of its own, over fields or evaluated measures. |
 
 ## Roles and `includeUnmatched`
 
