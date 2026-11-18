@@ -486,6 +486,7 @@ ossiec is a library first, built to be embedded in query engines, SQL proxies an
 - [x] Layer 2 `ROLLUP`, `CUBE` and `GROUPING SETS` over columns, each grouping set compiled at its own level
 - [x] Layer 2 scalar subqueries in the select list, alone or in arithmetic with `AGG()`, correlated with the row's dimensions or not
 - [x] Layer 2 scalar subqueries in `HAVING` and `ORDER BY`, as in the select list
+- [x] Layer 2 `[NOT] EXISTS` and `x [NOT] IN (SELECT …)` in the select list, `HAVING` and `ORDER BY`, as in `WHERE`
 - [ ] Layer 2 correlated subqueries beyond an `=` in their own `WHERE`, the `GROUPING()` function, set operators, and the `MEASURE` marker
 - [x] NULL placement in `orderBy`
 - [x] Ossie Layer 2: SQL with `AGG(measure)` (A.1–A.6 incl. nested derived tables; §7.6 `RIGHT`/`FULL`/`CROSS`; §7.7 pass-through and query-local `TO MEASURE`, including base `SUM|COUNT|AVG|MIN|MAX(...)`; role-playing dimensions and `includeUnmatched`, including a derived join on the unmatched grain; A.7 `CREATE VIEW` in a session catalog; `persist_layer2_view` / `persist-view` writes measures into the model)
