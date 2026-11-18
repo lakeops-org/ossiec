@@ -1729,3 +1729,180 @@ fn having_and_order_by_read_plain_aggregates() {
         ))
     );
 }
+
+/// §7.8: `UNION [ALL]`, `INTERSECT` and `EXCEPT` compare or append whole rows,
+/// so each branch is a Layer 2 query of its own, over fields or evaluated
+/// measures. Each answer is the same operation in plain SQL over the source
+/// tables: rows equal with NULLs in them, `ORDER BY` and `LIMIT` over the whole.
+#[test]
+fn set_operators_over_evaluated_rows() {
+    let g = ossiec::from_yaml(common::MODEL).unwrap();
+    let db = duckdb();
+    let customers = "(SELECT * FROM raw_customers WHERE NOT deleted)";
+    let regions = |customers: &str, segment: &str| {
+        format!("SELECT c.region FROM {customers} c WHERE c.segment = '{segment}'")
+    };
+    let per = |customers: &str, count: &str, known: &str| {
+        format!(
+            "SELECT o.status AS k, {count} AS n FROM orders o GROUP BY o.status \
+             UNION ALL SELECT c.region, {known} FROM {customers} c GROUP BY c.region"
+        )
+    };
+    let customers_with =
+        |status: &str| format!("SELECT o.customer_id FROM orders o WHERE o.status = '{status}'");
+    for (sql, reference, ordered) in [
+        // Fields only, the spec's example: a region once, NULL included.
+        (
+            format!("{} UNION {}", regions("customers", "smb"), regions("customers", "enterprise")),
+            format!("{} UNION {}", regions(customers, "smb"), regions(customers, "enterprise")),
+            false,
+        ),
+        // Evaluated measures, appended.
+        (
+            per("customers", "AGG(o.order_count)", "AGG(c.known_customers)"),
+            per(customers, "COUNT(*)", "COUNT(c.customer_id)"),
+            false,
+        ),
+        // The guest order's NULL customer equals itself, so it is kept once.
+        (
+            format!("{} EXCEPT {}", customers_with("completed"), customers_with("returned")),
+            format!("{} EXCEPT {}", customers_with("completed"), customers_with("returned")),
+            false,
+        ),
+        (
+            format!("{} INTERSECT {}", customers_with("completed"), customers_with("returned")),
+            format!("{} INTERSECT {}", customers_with("completed"), customers_with("returned")),
+            false,
+        ),
+        // ORDER BY and LIMIT over the whole, by the first branch's names.
+        (
+            format!(
+                "{} ORDER BY n DESC, k LIMIT 4",
+                per("customers", "AGG(o.order_count)", "AGG(c.known_customers)")
+            ),
+            format!(
+                "{} ORDER BY n DESC, k NULLS FIRST LIMIT 4",
+                per(customers, "COUNT(*)", "COUNT(c.customer_id)")
+            ),
+            true,
+        ),
+        // A branch in parentheses keeps its own ORDER BY and LIMIT.
+        (
+            "(SELECT o.status, AGG(o.order_count) AS n FROM orders o GROUP BY o.status ORDER BY n DESC LIMIT 1) \
+             UNION ALL (SELECT c.region, AGG(c.known_customers) AS n FROM customers c GROUP BY c.region ORDER BY n DESC, c.region LIMIT 1)"
+                .to_string(),
+            format!(
+                "(SELECT o.status, COUNT(*) AS n FROM orders o GROUP BY o.status ORDER BY n DESC LIMIT 1) \
+                 UNION ALL (SELECT c.region, COUNT(c.customer_id) AS n FROM {customers} c GROUP BY c.region \
+                 ORDER BY n DESC, c.region NULLS FIRST LIMIT 1)"
+            ),
+            false,
+        ),
+        // Nested, with a WITH before the whole that every branch reads.
+        (
+            format!(
+                "WITH busy AS (SELECT o.customer_id, AGG(o.order_count) AS n FROM orders o GROUP BY o.customer_id) \
+                 SELECT b.customer_id FROM busy b WHERE b.n > 1 \
+                 UNION ({} EXCEPT SELECT b.customer_id FROM busy b WHERE b.n > 2)",
+                customers_with("returned")
+            ),
+            format!(
+                "WITH busy AS (SELECT o.customer_id, COUNT(*) AS n FROM orders o GROUP BY o.customer_id) \
+                 SELECT b.customer_id FROM busy b WHERE b.n > 1 \
+                 UNION ({} EXCEPT SELECT b.customer_id FROM busy b WHERE b.n > 2)",
+                customers_with("returned")
+            ),
+            false,
+        ),
+    ] {
+        let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let (got, want) = if ordered {
+            (duckdb_rows(&db, &c.sql), duckdb_rows(&db, &reference))
+        } else {
+            (sorted(duckdb_rows(&db, &c.sql)), sorted(duckdb_rows(&db, &reference)))
+        };
+        assert!(!want.is_empty(), "{sql}: proves nothing");
+        assert_eq!(got, want, "{sql}\n{}", c.sql);
+    }
+    for (sql, want) in [
+        // The spec's rejected example: a measure has no value to append.
+        (
+            "SELECT t.m FROM (SELECT o.status, o.order_count AS m FROM orders o) t \
+             UNION SELECT u.m FROM (SELECT o.status, o.order_count AS m FROM orders o) u",
+            "unevaluated measure",
+        ),
+        (
+            "SELECT o.status FROM orders o UNION SELECT o.order_count FROM orders o",
+            "bare measure",
+        ),
+        (
+            "SELECT o.status, o.customer_id FROM orders o UNION SELECT c.region FROM customers c",
+            "return 2 and 1 columns",
+        ),
+        (
+            "SELECT o.status FROM orders o UNION SELECT c.region FROM customers c ORDER BY o.status",
+            "names an output column of its first branch",
+        ),
+        // Elsewhere, a set operation is one relation, which isn't compiled yet.
+        (
+            "SELECT t.status FROM (SELECT status FROM orders UNION SELECT status FROM orders) t",
+            "set operators",
+        ),
+        (
+            "SELECT c.region, (SELECT AGG(o2.order_count) FROM orders o2 \
+             UNION ALL SELECT AGG(o3.order_count) FROM orders o3) AS x FROM customers c GROUP BY c.region",
+            "set operation inside a subquery",
+        ),
+    ] {
+        let e = ossiec::compile_sql(&g, sql, &duck()).expect_err(sql).to_string();
+        assert!(e.contains(want), "{sql}: {e}");
+    }
+    // In a WHERE subquery, each branch is a subquery of its own, compiled as
+    // such (correlated or not), and the operation reads them as SQL does.
+    for (predicate, reference) in [
+        (
+            "customer_id IN (SELECT c.id FROM customers c WHERE c.segment = 'smb' \
+             UNION SELECT c.id FROM customers c WHERE c.region = 'EU')"
+                .to_string(),
+            format!(
+                "customer_id IN (SELECT c.customer_id FROM {customers} c WHERE c.segment = 'smb' \
+                 UNION SELECT c.customer_id FROM {customers} c WHERE c.region = 'EU')"
+            ),
+        ),
+        (
+            "customer_id NOT IN (SELECT c.id FROM customers c WHERE c.segment = 'smb' \
+             EXCEPT SELECT o2.customer_id FROM orders o2 WHERE o2.status = 'returned')"
+                .to_string(),
+            format!(
+                "customer_id NOT IN (SELECT c.customer_id FROM {customers} c WHERE c.segment = 'smb' \
+                 EXCEPT SELECT o2.customer_id FROM orders o2 WHERE o2.status = 'returned')"
+            ),
+        ),
+        (
+            "EXISTS (SELECT o2.id FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             AND o2.status = 'returned' INTERSECT SELECT o2.id FROM orders o2 WHERE o2.product_id = 10)"
+                .to_string(),
+            "EXISTS (SELECT o2.order_id FROM orders o2 WHERE o2.customer_id = orders.customer_id \
+             AND o2.status = 'returned' INTERSECT SELECT o2.order_id FROM orders o2 WHERE o2.product_id = 10)"
+                .to_string(),
+        ),
+    ] {
+        let sql =
+            format!("SELECT status, AGG(order_count) FROM orders WHERE {predicate} GROUP BY status");
+        let c = ossiec::compile_sql(&g, &sql, &duck()).unwrap_or_else(|e| panic!("{predicate}: {e}"));
+        let want = sorted(duckdb_rows(
+            &db,
+            &format!("SELECT status, COUNT(*) FROM orders WHERE {reference} GROUP BY status"),
+        ));
+        let all = sorted(duckdb_rows(&db, "SELECT status, COUNT(*) FROM orders GROUP BY status"));
+        assert_ne!(want, all, "{predicate}: keeps every row, proves nothing");
+        assert_eq!(sorted(duckdb_rows(&db, &c.sql)), want, "{predicate}\n{}", c.sql);
+    }
+    let e = ossiec::sql_to_request(
+        &g,
+        "SELECT status FROM orders UNION SELECT status FROM orders",
+    )
+    .expect_err("one request")
+    .to_string();
+    assert!(e.contains("sql_to_request returns one request"), "{e}");
+}

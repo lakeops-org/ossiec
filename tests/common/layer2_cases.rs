@@ -496,6 +496,32 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.8: evaluated measures appended, ordered over the whole; the limit
+        // cuts between the NULL region and `returned`, both 1, NULL first.
+        name: "union_all_ordered",
+        sql: "SELECT c.region AS k, AGG(c.known_customers) AS n FROM customers c GROUP BY c.region \
+              UNION ALL SELECT o.status, AGG(o.order_count) FROM orders o GROUP BY o.status \
+              ORDER BY n DESC, k LIMIT 5",
+        reference: "SELECT c.region AS k, COUNT(c.customer_id) AS n FROM {customers} c GROUP BY c.region \
+                    UNION ALL SELECT o.status, COUNT(*) FROM orders o GROUP BY o.status \
+                    ORDER BY n DESC, k NULLS FIRST LIMIT 5",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.8: rows compared whole, NULLs equal: the guest order's NULL
+        // customer is in both completed branches, so INTERSECT keeps it once.
+        name: "intersect_except_union",
+        sql: "(SELECT o.customer_id FROM orders o WHERE o.status = 'completed' \
+                INTERSECT SELECT o.customer_id FROM orders o WHERE o.product_id <> 11 OR o.customer_id IS NULL) \
+              UNION (SELECT c.id FROM customers c WHERE c.segment = 'smb' \
+                EXCEPT SELECT o.customer_id FROM orders o WHERE o.status = 'completed')",
+        reference: "(SELECT o.customer_id FROM orders o WHERE o.status = 'completed' \
+                      INTERSECT SELECT o.customer_id FROM orders o WHERE o.product_id <> 11 OR o.customer_id IS NULL) \
+                    UNION (SELECT c.customer_id FROM {customers} c WHERE c.segment = 'smb' \
+                      EXCEPT SELECT o.customer_id FROM orders o WHERE o.status = 'completed')",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.7: EXISTS and IN in the select list, correlated with the row's
         // dimensions; the guest order's customer matches no returned order, and
         // customer 7's NULL product is in no set. (ClickHouse runs the

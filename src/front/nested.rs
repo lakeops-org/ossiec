@@ -32,7 +32,7 @@ use super::catalog::{self, Layer2Catalog};
 use super::correlate;
 use super::{
     apply_consumer_joins, apply_select_formulas, mark_narrowing_legs, parse_stage_from,
-    parse_stage_prep, parse_top_select, planned_alias_on_leg, pragma_include_unmatched,
+    parse_stage_prep, parse_top, planned_alias_on_leg, pragma_include_unmatched,
     protect_inflating_joins, rename_consumer_outputs, stage_aliases, unsupported, L2Formula,
     StageCfg,
 };
@@ -152,8 +152,7 @@ pub(super) fn compile(
     sql_text: &str,
     opts: &Options,
 ) -> Result<Compiled> {
-    let (mut sel, mut to_measures) = parse_top_select(graph, sql_text)?;
-    catalog::expand_query(catalog, &mut sel, &mut to_measures, None)?;
+    let (top, to_measures) = parse_top(graph, sql_text)?;
     let mut c = Compiler {
         graph: graph.clone(),
         opts,
@@ -167,15 +166,24 @@ pub(super) fn compile(
         include_unmatched: opts.include_unmatched || pragma_include_unmatched(sql_text),
         to_measures,
     };
-    let node = c.select(&sel, 0, false, &[])?;
-    let ast = resolve(node)?;
+    let (ast, consumer) = match top {
+        Expression::Select(mut sel) => {
+            catalog::expand_query(catalog, &mut sel, &mut c.to_measures, None)?;
+            let node = c.select(&sel, 0, false, &[])?;
+            (resolve(node)?, Expression::Select(sel))
+        }
+        op => {
+            let (ast, consumer, _) = c.set_operation(op, catalog)?;
+            (ast, consumer)
+        }
+    };
     // The identity is the normalized consumer SQL plus the TO MEASURE formulas:
     // two queries that differ only in a join kind compile to different SQL, so
     // they must not share a hash.
     let render = |e: Expression| {
         generate(&e, DialectType::Generic).map_err(|e| Error::Internal(e.to_string()))
     };
-    let text = render(Expression::Select(Box::new(sel)))?;
+    let text = render(consumer)?;
     let mut identity = serde_json::json!({ "layer2_sql": text });
     if !c.to_measures.is_empty() {
         let tm = c
@@ -297,6 +305,93 @@ fn classify(sel: &Select) -> Result<Kind> {
 }
 
 impl Compiler<'_> {
+    /// §7.8: a set operation compares or appends whole rows, so each branch is a
+    /// Layer 2 query of its own, compiled as a top query (no unevaluated measure
+    /// leaves it), and the operation reads their rows as SQL does. Returns the
+    /// compiled operation, the consumer's (with views expanded, for the
+    /// identity), and the output names, which are the first branch's.
+    fn set_operation(
+        &mut self,
+        e: Expression,
+        catalog: &Layer2Catalog,
+    ) -> Result<(Expression, Expression, Vec<String>)> {
+        macro_rules! both_sides {
+            ($op:ident, $variant:ident) => {{
+                let mut op = $op;
+                let (left, consumer_left, names) = self.set_operation(std::mem::replace(&mut op.left, Expression::Null(Null)), catalog)?;
+                let (right, consumer_right, right_names) = self.set_operation(std::mem::replace(&mut op.right, Expression::Null(Null)), catalog)?;
+                if names.len() != right_names.len() {
+                    return Err(Error::Request(format!(
+                        "Layer 2 set operation: its branches return {} and {} columns; each must return the same number (§7.8)",
+                        names.len(),
+                        right_names.len()
+                    )));
+                }
+                // Each key is an output, as the compiled branches spell it, with
+                // NULLs placed as every stage places them (`lower`).
+                if let Some(order) = op.order_by.as_mut() {
+                    for k in order.expressions.iter_mut() {
+                        let named = match &k.this {
+                            Expression::Column(c) if c.table.is_none() => names
+                                .iter()
+                                .find(|n| n.eq_ignore_ascii_case(&c.name.name)),
+                            _ => None,
+                        };
+                        let Some(name) = named else {
+                            return Err(unsupported(format!(
+                                "Layer 2 ORDER BY after a set operation names an output column of its first branch ({})",
+                                names.join(", ")
+                            )));
+                        };
+                        k.this = sql::quoted_col(name);
+                        k.nulls_first.get_or_insert(!k.desc);
+                    }
+                }
+                let mut consumer = op.clone();
+                consumer.left = consumer_left;
+                consumer.right = consumer_right;
+                op.left = left;
+                op.right = right;
+                Ok((
+                    Expression::$variant(op),
+                    Expression::$variant(consumer),
+                    names,
+                ))
+            }};
+        }
+        match e {
+            Expression::Union(op) => both_sides!(op, Union),
+            Expression::Intersect(op) => both_sides!(op, Intersect),
+            Expression::Except(op) => both_sides!(op, Except),
+            Expression::Subquery(mut s) => {
+                let this = std::mem::replace(&mut s.this, Expression::Null(Null));
+                let (inner, consumer, names) = self.set_operation(this, catalog)?;
+                // A compiled branch is already in parentheses.
+                let inner = match inner {
+                    Expression::Subquery(mut c) => {
+                        std::mem::replace(&mut c.this, Expression::Null(Null))
+                    }
+                    other => other,
+                };
+                s.this = consumer;
+                Ok((parenthesized(inner), Expression::Subquery(s), names))
+            }
+            Expression::Select(mut sel) => {
+                catalog::expand_query(catalog, &mut sel, &mut self.to_measures, None)?;
+                let node = self.select(&sel, 0, false, &[])?;
+                let names = node.outputs.iter().map(|o| o.name.clone()).collect();
+                Ok((
+                    parenthesized(resolve(node)?),
+                    Expression::Select(sel),
+                    names,
+                ))
+            }
+            _ => Err(unsupported(
+                "Layer 2 set operation: each branch must be a SELECT",
+            )),
+        }
+    }
+
     /// Compile one `SELECT` (the top query or a derived table).
     pub(super) fn select(
         &mut self,
@@ -901,10 +996,24 @@ impl Compiler<'_> {
             let Expression::Select(select) = top else {
                 unreachable!("tops are selects")
             };
+            let in_set_operation = || {
+                item.dfs().any(|x| {
+                    matches!(
+                        x,
+                        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
+                    ) && x.contains(|y| std::ptr::eq(y, top))
+                })
+            };
             let (around, form) = predicate_around(item, top).ok_or_else(|| {
-                unsupported(format!(
-                    "Layer 2 {clause} takes a subquery as a scalar value `(SELECT …)`, in `[NOT] EXISTS (SELECT …)` or in `x [NOT] IN (SELECT …)`"
-                ))
+                unsupported(if in_set_operation() {
+                    format!(
+                        "Layer 2 {clause}: a set operation inside a subquery is not supported yet (§7.8); in WHERE it is"
+                    )
+                } else {
+                    format!(
+                        "Layer 2 {clause} takes a subquery as a scalar value `(SELECT …)`, in `[NOT] EXISTS (SELECT …)` or in `x [NOT] IN (SELECT …)`"
+                    )
+                })
             })?;
             // The same subquery again, beside the first: one value, one marker,
             // which the rewrite below puts in both places.
@@ -1416,4 +1525,14 @@ pub(super) fn check_unique_names(outputs: &[OutCol]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `( <query> )`: a branch of a set operation, whose own `ORDER BY` and
+/// `LIMIT` stay its own.
+fn parenthesized(query: Expression) -> Expression {
+    let mut e = polyglot_sql::builder::subquery_expr(query, "_").into_inner();
+    if let Expression::Subquery(s) = &mut e {
+        s.alias = None;
+    }
+    e
 }

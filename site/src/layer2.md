@@ -35,6 +35,7 @@ Compile from the CLI with `ossiec compile-sql model.yaml query.sql --dialect tri
 | `HAVING`, `ORDER BY`, `LIMIT` | `ORDER BY AGG(revenue) DESC LIMIT 10`, `HAVING COUNT(*) > 5`; neither needs to be selected | §7.5 |
 | Derived tables and CTEs | a measure passes through any number of levels to the outer `AGG()` | §7.7, A.2, A.3 |
 | `DISTINCT` | over fields and evaluated measures | §7.8 |
+| `UNION [ALL]`, `INTERSECT`, `EXCEPT` | at the top of a query, each branch a Layer 2 query of its own over fields or evaluated measures; `ORDER BY` and `LIMIT` after it name the first branch's columns. In a `WHERE` subquery too, each branch a subquery of its own | §7.8 |
 | Query-local measures | `(AGG(a) / AGG(b)) TO MEASURE AS ratio`, `SUM(x) TO MEASURE AS m` | §5.1, §5.2 |
 | Views | `CREATE VIEW v AS SELECT … TO MEASURE …` in a session catalog | A.7 |
 | Roles | `departs_from.city`, or the relationship name as the join alias | §11.3 |
@@ -113,7 +114,7 @@ A customer without orders is one joined row, so `COUNT(*)` counts it, while `ord
 ossiec refuses these with a clear message rather than answer differently from the spec. Each is on the [roadmap](roadmap.md).
 
 - `SELECT *`
-- Set operators (`UNION`, `INTERSECT`, `EXCEPT`)
+- A set operator (`UNION`, `INTERSECT`, `EXCEPT`) inside a derived table, a CTE, or a subquery in the select list, `HAVING` or `ORDER BY`, and one over a branch that returns an unevaluated measure (§7.8 requires that refusal)
 - With `ROLLUP`, `CUBE` or `GROUPING SETS`: grouping by an expression or a nested grouping, `CUBE` over more than 4 columns, more than 16 grouping sets, the `GROUPING()` function, grouping over derived tables, `DISTINCT` and `OFFSET`, and an `ORDER BY` key that isn't an output column
 - A subquery in the `WHERE`, select list, `HAVING` or `ORDER BY` of plain SQL over derived tables (without `AGG()`; with it, a sole derived table is folded and they compile); there, `ANY`/`ALL (SELECT …)`, and `IN (SELECT …)` with an aggregate on its left (`HAVING AGG(m) IN (SELECT …)`)
 - A correlated subquery that reads the enclosing query other than through `=` in its own `WHERE` (`o2.id < o.id`, a column in its select list), one with `LIMIT` or with `ROLLUP`, `CUBE` or `GROUPING SETS`, one that reads a query further out than the one around it, and one over a derived table that `AGG()` folds away. A subquery that aggregates without `GROUP BY` is correlated only as a scalar, without `HAVING`

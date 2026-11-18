@@ -48,7 +48,7 @@
 
 use std::collections::HashMap;
 
-use polyglot_sql::expressions::{DotAccess, Select};
+use polyglot_sql::expressions::{DotAccess, Null, Select, With};
 use polyglot_sql::{parse_one, transform_all, DialectType, Expression};
 
 use crate::graph::SemanticGraph;
@@ -329,6 +329,19 @@ pub(super) fn parse_top_select(
     graph: &SemanticGraph,
     sql: &str,
 ) -> Result<(Select, Vec<Expression>)> {
+    let (ast, to_measures) = parse_top(graph, sql)?;
+    match ast {
+        Expression::Select(sel) => Ok((*sel, to_measures)),
+        _ => Err(unsupported(
+            "Layer 2 set operators (UNION, INTERSECT, EXCEPT) are compiled by compile_sql; sql_to_request returns one request and a view is one SELECT",
+        )),
+    }
+}
+
+/// The consumer's top-level query: one `SELECT`, its `WITH` expanded, or a set
+/// operation (§7.8) over them, each branch's `WITH` (and one written before
+/// the whole operation) expanded in it.
+pub(super) fn parse_top(graph: &SemanticGraph, sql: &str) -> Result<(Expression, Vec<Expression>)> {
     let (text, to_measures) = to_measure::extract(sql.trim())?;
     let ast = parse_one(&text, DialectType::Generic)
         .map_err(|e| Error::Request(format!("Layer 2 SQL: {e}")))?;
@@ -336,7 +349,10 @@ pub(super) fn parse_top_select(
     match ast {
         Expression::Select(mut sel) => {
             cte::expand(&mut sel)?;
-            Ok((*sel, to_measures))
+            Ok((Expression::Select(sel), to_measures))
+        }
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => {
+            Ok((set_branches_expanded(ast, None)?, to_measures))
         }
         Expression::CreateView(_) => Err(unsupported(
             "Layer 2 CREATE VIEW is not a query; register it with define_layer2_view (or pass CREATE VIEW statements and a final SELECT to compile_script / compile-l2)",
@@ -345,7 +361,59 @@ pub(super) fn parse_top_select(
             "Layer 2 DROP VIEW is not supported; views live in a session Layer2Catalog",
         )),
         _ => Err(unsupported(
-            "Layer 2 accepts a single SELECT (set operators are not supported)",
+            "Layer 2 accepts a SELECT, or a set operation (UNION, INTERSECT, EXCEPT) over SELECTs",
+        )),
+    }
+}
+
+/// Each `SELECT` branch of set operation `e` with its `WITH` expanded: its own,
+/// and `with`, the one written before the whole operation, which every branch
+/// may read.
+fn set_branches_expanded(e: Expression, with: Option<&With>) -> Result<Expression> {
+    macro_rules! both_sides {
+        ($op:ident, $variant:ident) => {{
+            let mut op = $op;
+            let with = op.with.take().or_else(|| with.cloned());
+            let left = std::mem::replace(&mut op.left, Expression::Null(Null));
+            op.left = set_branches_expanded(left, with.as_ref())?;
+            let right = std::mem::replace(&mut op.right, Expression::Null(Null));
+            op.right = set_branches_expanded(right, with.as_ref())?;
+            Ok(Expression::$variant(op))
+        }};
+    }
+    match e {
+        Expression::Union(op) => both_sides!(op, Union),
+        Expression::Intersect(op) => both_sides!(op, Intersect),
+        Expression::Except(op) => both_sides!(op, Except),
+        Expression::Subquery(mut s) if s.alias.is_none() => {
+            let this = std::mem::replace(&mut s.this, Expression::Null(Null));
+            s.this = set_branches_expanded(this, with)?;
+            Ok(Expression::Subquery(s))
+        }
+        Expression::Select(mut sel) => {
+            if let Some(outer) = with {
+                match sel.with.as_mut() {
+                    // The branch's own names come first, as SQL scopes them.
+                    Some(own) => {
+                        let mine: Vec<String> = own
+                            .ctes
+                            .iter()
+                            .map(|c| c.alias.name.to_lowercase())
+                            .collect();
+                        for cte in outer.ctes.iter().rev() {
+                            if !mine.contains(&cte.alias.name.to_lowercase()) {
+                                own.ctes.insert(0, cte.clone());
+                            }
+                        }
+                    }
+                    None => sel.with = Some(outer.clone()),
+                }
+            }
+            cte::expand(&mut sel)?;
+            Ok(Expression::Select(sel))
+        }
+        _ => Err(unsupported(
+            "Layer 2 set operation: each branch must be a SELECT",
         )),
     }
 }
