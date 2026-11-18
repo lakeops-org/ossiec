@@ -378,7 +378,8 @@ pub(super) fn parse_stage_from(
                 seq: &mut *base_seq,
                 made: &mut ephemeral,
             };
-            let (pushed, parsed) = parse_having(graph, scope, &h.this, &dimensions, &mut raw)?;
+            let (pushed, parsed) =
+                parse_having(graph, scope, &h.this, &dimensions, cfg.scalars, &mut raw)?;
             for conjunct in pushed {
                 match conjunct {
                     Conjunct::Filter(f) => filters.push(f),
@@ -434,7 +435,7 @@ pub(super) fn parse_stage_from(
                 resolve_agg(graph, scope, arg)?,
                 L2Formula::Agg(m) if selected_measure(&m)
             ),
-            None => as_column(&o.this).is_some(),
+            None => as_column(&o.this).is_some() && !is_scalar_marker(&o.this),
         };
         if by_name {
             order_by.push(OrderBy {
@@ -450,6 +451,7 @@ pub(super) fn parse_stage_from(
                     scope,
                     &o.this,
                     &dimensions,
+                    cfg.scalars,
                     &mut RawAggs {
                         seq: &mut *base_seq,
                         made: &mut ephemeral,
@@ -530,7 +532,7 @@ pub(super) fn parse_stage_from(
     })
 }
 
-fn is_scalar_marker(e: &Expression) -> bool {
+pub(super) fn is_scalar_marker(e: &Expression) -> bool {
     matches!(e, Expression::Column(c) if c.table.is_none() && c.name.name.starts_with(super::SCALAR))
 }
 
@@ -550,44 +552,7 @@ fn bind_scalars(
             let Expression::Column(c) = &**marker else {
                 return Ok(());
             };
-            let stand_in = scalars
-                .iter()
-                .find(|(m, _)| *m == c.name.name)
-                .map(|(_, s)| s.clone())
-                .ok_or_else(|| {
-                    Error::Internal(format!("unknown scalar subquery `{}`", c.name.name))
-                })?;
-            let failure = std::cell::RefCell::new(None);
-            let bound = crate::sql::transform(stand_in, &|x| {
-                Ok(Some(match x {
-                    Expression::Column(c)
-                        if !c
-                            .table
-                            .as_ref()
-                            .is_some_and(|t| t.name.starts_with(crate::sql::STAND_IN_PREFIX)) =>
-                    {
-                        let found = resolve_dim(graph, scope, &c).and_then(|dim| {
-                            dimensions.iter().position(|d| *d == dim).ok_or_else(|| {
-                                Error::Request(format!(
-                                    "Layer 2 subquery in the select list reads `{dim}` of the enclosing query, which is not a selected dimension; a row of the result has one value only of what it groups by"
-                                ))
-                            })
-                        });
-                        match found {
-                            Ok(i) => crate::sql::col(&format!("{}{i}", crate::plan::OUT_DIM)),
-                            Err(e) => {
-                                failure.borrow_mut().get_or_insert(e);
-                                Expression::Column(c)
-                            }
-                        }
-                    }
-                    other => other,
-                }))
-            })
-            .map_err(|e| Error::Internal(e.to_string()))?;
-            if let Some(e) = failure.into_inner() {
-                return Err(e);
-            }
+            let bound = bind_stand_in(graph, scope, &c.name.name, scalars, dimensions)?;
             *formula = L2Formula::Scalar(Box::new(bound));
             Ok(())
         }
@@ -600,5 +565,53 @@ fn bind_scalars(
             bind_scalars(graph, scope, r, scalars, dimensions)
         }
         L2Formula::Agg(_) | L2Formula::Lit(_) => Ok(()),
+    }
+}
+
+/// The stand-in of scalar subquery `marker`, its correlated columns turned into
+/// the [`crate::plan::OUT_DIM`] placeholders of the dimensions they read.
+pub(super) fn bind_stand_in(
+    graph: &SemanticGraph,
+    scope: &super::QueryScope,
+    marker: &str,
+    scalars: &[(String, Expression)],
+    dimensions: &[String],
+) -> Result<Expression> {
+    let stand_in = scalars
+        .iter()
+        .find(|(m, _)| m == marker)
+        .map(|(_, s)| s.clone())
+        .ok_or_else(|| Error::Internal(format!("unknown scalar subquery `{marker}`")))?;
+    let failure = std::cell::RefCell::new(None);
+    let bound = crate::sql::transform(stand_in, &|x| {
+        Ok(Some(match x {
+            Expression::Column(c)
+                if !c
+                    .table
+                    .as_ref()
+                    .is_some_and(|t| t.name.starts_with(crate::sql::STAND_IN_PREFIX)) =>
+            {
+                let found = resolve_dim(graph, scope, &c).and_then(|dim| {
+                    dimensions.iter().position(|d| *d == dim).ok_or_else(|| {
+                        Error::Request(format!(
+                            "Layer 2 subquery reads `{dim}` of the enclosing query, which is not a selected dimension; a row of the result has one value only of what it groups by"
+                        ))
+                    })
+                });
+                match found {
+                    Ok(i) => crate::sql::col(&format!("{}{i}", crate::plan::OUT_DIM)),
+                    Err(e) => {
+                        failure.borrow_mut().get_or_insert(e);
+                        Expression::Column(c)
+                    }
+                }
+            }
+            other => other,
+        }))
+    })
+    .map_err(|e| Error::Internal(e.to_string()))?;
+    match failure.into_inner() {
+        Some(e) => Err(e),
+        None => Ok(bound),
     }
 }

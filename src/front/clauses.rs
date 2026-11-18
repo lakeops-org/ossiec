@@ -116,6 +116,7 @@ pub(super) fn parse_having(
     scope: &QueryScope,
     e: &Expression,
     dimensions: &[String],
+    scalars: &[(String, Expression)],
     raw: &mut RawAggs,
 ) -> Result<(Vec<Conjunct>, Option<GroupExpr>)> {
     fn split<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
@@ -133,10 +134,11 @@ pub(super) fn parse_having(
     let mut pushed = vec![];
     let mut kept: Vec<Expression> = vec![];
     for c in conjuncts {
-        // Before any conjunct goes to WHERE: no subquery here was compiled.
+        // Before any conjunct goes to WHERE: compile_sql compiled every subquery
+        // here into a marker, so one left is sql_to_request's, which takes none.
         if c.contains(|x| is_query(x) || is_subquery(x)) {
             return Err(unsupported(
-                "Layer 2 HAVING does not support subqueries yet",
+                "Layer 2 subqueries in HAVING are compiled by compile_sql; sql_to_request returns one request and takes none",
             ));
         }
         if contains_window_function(c) {
@@ -144,8 +146,11 @@ pub(super) fn parse_having(
                 "Layer 2 HAVING takes aggregates, AGG(measure) and selected columns; a window is not supported",
             ));
         }
-        // A plain aggregate (§7.2) reads the group, as AGG() does: never pushed to WHERE.
-        let has_agg = c.contains(is_measure_agg_expr) || c.contains(is_base_agg_expr);
+        // A plain aggregate (§7.2) reads the group, as AGG() does: never pushed to
+        // WHERE. Nor is a scalar subquery, compiled for HAVING (§7.7).
+        let has_agg = c.contains(is_measure_agg_expr)
+            || c.contains(is_base_agg_expr)
+            || c.contains(super::stage::is_scalar_marker);
         for column in get_columns(c) {
             // With an AGG(), its argument is a column too: the second pass below
             // checks those that aren't one.
@@ -169,12 +174,12 @@ pub(super) fn parse_having(
     });
     if joined.contains(|x| is_query(x) || is_subquery(x)) {
         return Err(unsupported(
-            "Layer 2 HAVING does not support subqueries yet",
+            "Layer 2 subqueries in HAVING are compiled by compile_sql; sql_to_request returns one request and takes none",
         ));
     }
     Ok((
         pushed,
-        Some(group_expr(graph, scope, joined, dimensions, raw)?),
+        Some(group_expr(graph, scope, joined, dimensions, scalars, raw)?),
     ))
 }
 
@@ -185,6 +190,7 @@ pub(super) fn order_key(
     scope: &QueryScope,
     e: &Expression,
     dimensions: &[String],
+    scalars: &[(String, Expression)],
     raw: &mut RawAggs,
 ) -> Result<GroupExpr> {
     if contains_window_function(e) {
@@ -194,11 +200,13 @@ pub(super) fn order_key(
     }
     if e.contains(|x| is_query(x) || is_subquery(x)) {
         return Err(unsupported(
-            "Layer 2 ORDER BY does not support subqueries yet",
+            "Layer 2 subqueries in ORDER BY are compiled by compile_sql; sql_to_request returns one request and takes none",
         ));
     }
-    let key = group_expr(graph, scope, e.clone(), dimensions, raw)?;
-    if key.measures.is_empty() && get_columns(&key.expr).is_empty() {
+    // A compiled subquery reads a query, though none of this one's columns.
+    let reads_subquery = e.contains(super::stage::is_scalar_marker);
+    let key = group_expr(graph, scope, e.clone(), dimensions, scalars, raw)?;
+    if key.measures.is_empty() && get_columns(&key.expr).is_empty() && !reads_subquery {
         return Err(unsupported(
             "Layer 2 ORDER BY must name a selected dimension, measure, or AGG(...); a position like `ORDER BY 1` is not supported",
         ));
@@ -213,6 +221,7 @@ pub(super) fn group_expr(
     scope: &QueryScope,
     e: Expression,
     dimensions: &[String],
+    scalars: &[(String, Expression)],
     raw: &mut RawAggs,
 ) -> Result<GroupExpr> {
     let failure = RefCell::new(None);
@@ -248,6 +257,19 @@ pub(super) fn group_expr(
     .map_err(|e| Error::Internal(e.to_string()))?;
     let expr = transform(without_aggs, &|x| {
         Ok(Some(match x {
+            // A scalar subquery compiled for this clause: its stand-in, bound to
+            // the dimensions it reads.
+            Expression::Column(c)
+                if c.table.is_none() && c.name.name.starts_with(super::SCALAR) =>
+            {
+                match super::stage::bind_stand_in(graph, scope, &c.name.name, scalars, dimensions) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        failure.borrow_mut().get_or_insert(err);
+                        Expression::Column(c)
+                    }
+                }
+            }
             Expression::Column(c) if !c.name.name.starts_with(HAVING_MEASURE) => {
                 match selected_dimension(graph, scope, &c, dimensions) {
                     Ok(i) => sql::col(&format!("{}{i}", plan::OUT_DIM)),

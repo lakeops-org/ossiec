@@ -826,10 +826,11 @@ impl Compiler<'_> {
         }
     }
 
-    /// §7.7: each scalar subquery in `sel`'s select list, outermost first, compiled
-    /// as a Layer 2 query of its own (correlated ones as in `WHERE`, through
-    /// [`super::correlate`]), and replaced by a marker column the stage reads as
-    /// one [`super::L2Formula::Scalar`] leaf. Returns the compiled queries and
+    /// §7.7: each scalar subquery in `sel`'s select list, `HAVING` and `ORDER BY`,
+    /// outermost first, compiled as a Layer 2 query of its own (correlated ones
+    /// as in `WHERE`, through [`super::correlate`]), and replaced by a marker
+    /// column the stage reads as one [`super::L2Formula::Scalar`] leaf (or, in
+    /// `HAVING` and `ORDER BY`, binds in place). Returns the compiled queries and
     /// each marker's stand-in.
     #[allow(clippy::type_complexity)]
     fn select_subqueries(
@@ -842,132 +843,176 @@ impl Compiler<'_> {
         let mut out = sel.clone();
         let mut pending = vec![];
         let mut scalars: Vec<(String, Expression)> = vec![];
+        let mut clause = "select list";
+        let mut each = |this: &mut Self, item: &mut Expression, clause: &str| {
+            this.scalar_subqueries(
+                item,
+                clause,
+                depth,
+                outer,
+                stage,
+                &mut pending,
+                &mut scalars,
+            )
+        };
         for item in out.expressions.iter_mut() {
-            let mut tops: Vec<&Expression> = vec![];
-            for x in item.dfs() {
-                if matches!(x, Expression::Select(_))
-                    && !tops.iter().any(|t| t.contains(|y| std::ptr::eq(y, x)))
-                {
-                    tops.push(x);
-                }
+            each(self, item, clause)?;
+        }
+        clause = "HAVING";
+        if let Some(h) = out.having.as_mut() {
+            each(self, &mut h.this, clause)?;
+        }
+        clause = "ORDER BY";
+        if let Some(o) = out.order_by.as_mut() {
+            for k in o.expressions.iter_mut() {
+                each(self, &mut k.this, clause)?;
             }
-            if tops.is_empty() {
+        }
+        Ok((out, pending, scalars))
+    }
+
+    /// The scalar subqueries of one expression of `clause`: see
+    /// [`Self::select_subqueries`].
+    #[allow(clippy::too_many_arguments)]
+    fn scalar_subqueries(
+        &mut self,
+        item: &mut Expression,
+        clause: &str,
+        depth: usize,
+        outer: &[String],
+        stage: &[String],
+        pending: &mut Vec<(String, Node)>,
+        scalars: &mut Vec<(String, Expression)>,
+    ) -> Result<()> {
+        let mut tops: Vec<&Expression> = vec![];
+        for x in item.dfs() {
+            if matches!(x, Expression::Select(_))
+                && !tops.iter().any(|t| t.contains(|y| std::ptr::eq(y, x)))
+            {
+                tops.push(x);
+            }
+        }
+        if tops.is_empty() {
+            return Ok(());
+        }
+        let mut replaced: Vec<(Expression, Expression)> = vec![];
+        for top in tops {
+            let Expression::Select(select) = top else {
+                unreachable!("tops are selects")
+            };
+            // `( SELECT … )`: the scalar the marker stands for.
+            let around = item
+                .dfs()
+                .find(|x| matches!(x, Expression::Subquery(s) if std::ptr::eq(&s.this, top)))
+                .ok_or_else(|| {
+                    unsupported(format!(
+                        "Layer 2 {clause} takes a subquery only as a scalar value, `(SELECT …)`"
+                    ))
+                })?;
+            // The same subquery again, beside the first: one value, one marker,
+            // which the rewrite below puts in both places.
+            if replaced.iter().any(|(original, _)| original == around) {
                 continue;
             }
-            let mut replaced: Vec<(Expression, Expression)> = vec![];
-            for top in tops {
-                let Expression::Select(select) = top else {
-                    unreachable!("tops are selects")
-                };
-                // `( SELECT … )`: the scalar the marker stands for.
-                let around = item
-                    .dfs()
-                    .find(|x| matches!(x, Expression::Subquery(s) if std::ptr::eq(&s.this, top)))
-                    .ok_or_else(|| {
-                        unsupported(
-                            "Layer 2 select list takes a subquery only as a scalar value, `(SELECT …)`",
-                        )
-                    })?;
-                let mut select = (**select).clone();
-                for (i, e) in select.expressions.iter_mut().enumerate() {
-                    if !matches!(e, Expression::Alias(_) | Expression::Column(_)) {
-                        let this = std::mem::replace(e, Expression::Null(Null));
-                        *e = Expression::Alias(Box::new(Alias::new(
-                            this,
-                            Identifier::new(format!("__ossiec_v{i}")),
-                        )));
-                    }
-                }
-                let correlation = {
-                    let same = self.same_field(&select, outer);
-                    correlate::correlate(&mut select, stage, &same)?
-                };
-                let (placeholder, node) = self.derived(&select, depth + 1, outer)?;
-                if let Some(m) = node
-                    .outputs
-                    .iter()
-                    .find(|o| matches!(o.kind, OutKind::UnevaluatedMeasure { .. }))
-                {
-                    return Err(unsupported(format!(
-                        "Layer 2 subquery in the select list returns `{}`, an unevaluated measure: evaluate it with AGG()",
-                        m.name
+            let mut select = (**select).clone();
+            for (i, e) in select.expressions.iter_mut().enumerate() {
+                if !matches!(e, Expression::Alias(_) | Expression::Column(_)) {
+                    let this = std::mem::replace(e, Expression::Null(Null));
+                    *e = Expression::Alias(Box::new(Alias::new(
+                        this,
+                        Identifier::new(format!("__ossiec_v{i}")),
                     )));
                 }
-                let outputs: Vec<String> = node
-                    .outputs
-                    .iter()
-                    .map(|o| o.name.clone())
-                    .filter(|n| correlation.is_none() || !n.starts_with(correlate::KEY))
-                    .collect();
-                if outputs.len() != 1 {
-                    return Err(Error::Request(format!(
-                        "Layer 2 subquery in the select list must return one column, as a scalar; it returns {}",
-                        outputs.len()
-                    )));
+            }
+            let correlation = {
+                let same = self.same_field(&select, outer);
+                correlate::correlate(&mut select, stage, &same)?
+            };
+            let (placeholder, node) = self.derived(&select, depth + 1, outer)?;
+            if let Some(m) = node
+                .outputs
+                .iter()
+                .find(|o| matches!(o.kind, OutKind::UnevaluatedMeasure { .. }))
+            {
+                return Err(unsupported(format!(
+                    "Layer 2 subquery in the {clause} returns `{}`, an unevaluated measure: evaluate it with AGG()",
+                    m.name
+                )));
+            }
+            let outputs: Vec<String> = node
+                .outputs
+                .iter()
+                .map(|o| o.name.clone())
+                .filter(|n| correlation.is_none() || !n.starts_with(correlate::KEY))
+                .collect();
+            if outputs.len() != 1 {
+                return Err(Error::Request(format!(
+                    "Layer 2 subquery in the {clause} must return one column, as a scalar; it returns {}",
+                    outputs.len()
+                )));
+            }
+            let n = scalars.len();
+            let sq = format!("{}{}_{n}", sql::STAND_IN_PREFIX, "s");
+            let stand_in = match &correlation {
+                None => {
+                    let mut s = match around {
+                        Expression::Subquery(s) => (**s).clone(),
+                        _ => unreachable!("found as a subquery"),
+                    };
+                    s.this = sql::parse(
+                        &format!("SELECT * FROM {placeholder} AS {sq}"),
+                        DialectType::Generic,
+                    )
+                    .map_err(Error::Internal)?;
+                    Expression::Subquery(Box::new(s))
                 }
-                let n = scalars.len();
-                let sq = format!("{}{}_{n}", sql::STAND_IN_PREFIX, "s");
-                let stand_in = match &correlation {
+                Some(corr) => match &corr.empty {
                     None => {
                         let mut s = match around {
                             Expression::Subquery(s) => (**s).clone(),
                             _ => unreachable!("found as a subquery"),
                         };
-                        s.this = sql::parse(
-                            &format!("SELECT * FROM {placeholder} AS {sq}"),
-                            DialectType::Generic,
-                        )
-                        .map_err(Error::Internal)?;
+                        s.this = correlate::stand_in(corr, &placeholder, &sq, &outputs)?;
                         Expression::Subquery(Box::new(s))
                     }
-                    Some(corr) => match &corr.empty {
-                        None => {
-                            let mut s = match around {
-                                Expression::Subquery(s) => (**s).clone(),
-                                _ => unreachable!("found as a subquery"),
-                            };
-                            s.this = correlate::stand_in(corr, &placeholder, &sq, &outputs)?;
-                            Expression::Subquery(Box::new(s))
-                        }
-                        Some(empty) => {
-                            let (none, none_node) = self.derived(empty, depth + 1, outer)?;
-                            pending.push((none, none_node));
-                            correlate::scalar_with_default(
-                                corr,
-                                &placeholder,
-                                &sq,
-                                &pending.last().expect("just pushed").0,
-                                &outputs[0],
-                            )?
-                        }
-                    },
-                };
-                pending.push((placeholder, node));
-                let marker = format!("{}{n}", super::SCALAR);
-                replaced.push((around.clone(), sql::col(&marker)));
-                scalars.push((marker, stand_in));
-            }
-            *item = sql::transform(item.clone(), &|x| {
-                Ok(Some(
-                    replaced
-                        .iter()
-                        .find(|(original, _)| *original == x)
-                        .map_or(x, |(_, marker)| marker.clone()),
-                ))
-            })
-            .map_err(|e| Error::Internal(e.to_string()))?;
-            // The walk is bottom-up: a copy of one subquery nested in another is
-            // replaced first, and the outer one no longer matches.
-            if replaced
-                .iter()
-                .any(|(_, marker)| !item.contains(|x| x == marker))
-            {
-                return Err(unsupported(
-                    "Layer 2 select list repeats a subquery inside another one; write it once",
-                ));
-            }
+                    Some(empty) => {
+                        let (none, none_node) = self.derived(empty, depth + 1, outer)?;
+                        pending.push((none, none_node));
+                        correlate::scalar_with_default(
+                            corr,
+                            &placeholder,
+                            &sq,
+                            &pending.last().expect("just pushed").0,
+                            &outputs[0],
+                        )?
+                    }
+                },
+            };
+            pending.push((placeholder, node));
+            let marker = format!("{}{n}", super::SCALAR);
+            replaced.push((around.clone(), sql::col(&marker)));
+            scalars.push((marker, stand_in));
         }
-        Ok((out, pending, scalars))
+        *item = sql::transform(item.clone(), &|x| {
+            Ok(Some(
+                replaced
+                    .iter()
+                    .find(|(original, _)| *original == x)
+                    .map_or(x, |(_, marker)| marker.clone()),
+            ))
+        })
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        // The walk is bottom-up: a copy of one subquery nested in another is
+        // replaced first, and the outer one no longer matches.
+        if replaced
+            .iter()
+            .any(|(_, marker)| !item.contains(|x| x == marker))
+        {
+            return Err(unsupported(format!(
+                "Layer 2 {clause} repeats a subquery inside another one; write it once"
+            )));
+        }
+        Ok(())
     }
 
     /// §7.3: each subquery in `sel`'s `WHERE`, outermost first, compiled as a Layer 2

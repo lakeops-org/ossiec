@@ -480,6 +480,22 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.5, §7.7: a scalar subquery in HAVING, correlated with the row's region
+        // (0 where nothing matches), and one in ORDER BY's arithmetic.
+        name: "having_and_order_by_subqueries",
+        sql: "SELECT c.region, AGG(o.order_count) AS n \
+              FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region \
+              HAVING AGG(o.order_count) > (SELECT AGG(c2.known_customers) FROM customers c2 \
+                WHERE c2.region = c.region AND c2.segment = 'smb') \
+              ORDER BY AGG(o.order_count) * 1.0 / (SELECT AGG(o2.order_count) FROM orders o2) DESC, c.region",
+        reference: "SELECT c.region, COUNT(*) AS n \
+                    FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region \
+                    HAVING COUNT(*) > (SELECT COUNT(c2.customer_id) FROM {customers} c2 \
+                      WHERE c2.region = c.region AND c2.segment = 'smb') \
+                    ORDER BY COUNT(*) * 1.0 / (SELECT COUNT(*) FROM orders) DESC, c.region NULLS FIRST",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.3: correlated scalar subqueries: a plain aggregate (orders above their
         // customer's average) and a measure, whose value over no matching rows is
         // the measure over none (0), not NULL.
