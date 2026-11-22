@@ -634,6 +634,15 @@ fn having_and_order_by_read_subqueries() {
             "ORDER BY (SELECT o2.id, o2.status FROM orders o2 LIMIT 1)",
             "ORDER BY must return one column",
         ),
+        // The IN predicate becomes one marker, so its left side is checked first.
+        (
+            "HAVING ROW_NUMBER() OVER () IN (SELECT o2.customer_id FROM orders o2)",
+            "a window is not supported",
+        ),
+        (
+            "ORDER BY ROW_NUMBER() OVER () IN (SELECT o2.customer_id FROM orders o2)",
+            "a window is not supported",
+        ),
     ] {
         let sql =
             format!("SELECT c.region, AGG(o.order_count) AS n {from} GROUP BY c.region {rest}");
@@ -655,6 +664,14 @@ fn having_and_order_by_read_subqueries() {
     let c = ossiec::compile_sql(&g, &sql, &opts).unwrap_or_else(|e| panic!("{e}"));
     assert!(c.sql.contains("__ossiec_ord0_"), "{}", c.sql);
     assert_eq!(c.sql.matches("AS `__ossiec_ord0`").count(), 2, "{}", c.sql);
+    // Output names named like the query's own template slots stay names.
+    let sql = format!(
+        "SELECT c.region AS __ossiec_0, AGG(o.order_count) AS __ossiec_a0 {from} \
+         GROUP BY c.region ORDER BY (SELECT AGG(o2.order_count) FROM orders o2), c.region"
+    );
+    let c = ossiec::compile_sql(&g, &sql, &opts).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(c.sql.matches("AS `__ossiec_0`").count(), 2, "{}", c.sql);
+    assert_eq!(c.sql.matches("AS `__ossiec_a0`").count(), 2, "{}", c.sql);
 }
 
 /// §7.7: `[NOT] EXISTS` and `x [NOT] IN` read a subquery in the select list,

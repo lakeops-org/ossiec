@@ -912,6 +912,13 @@ impl Compiler<'_> {
                 continue;
             }
             if let Form::In(Expression::In(i)) = &form {
+                // The marker below replaces the whole predicate, left side included,
+                // so a window there would pass the clause's own check unseen.
+                if polyglot_sql::contains_window_function(&i.this) {
+                    return Err(unsupported(format!(
+                        "Layer 2 {clause}: the left side of `IN (SELECT …)` reads the grouping columns only; a window is not supported"
+                    )));
+                }
                 if i.this.contains(|x| {
                     matches!(x, Expression::Select(_) | Expression::Subquery(_))
                         || super::is_measure_agg_expr(x)
@@ -976,22 +983,16 @@ impl Compiler<'_> {
                         "Layer 2 correlated subquery that aggregates without GROUP BY is supported as a scalar value (`(SELECT AGG(m) …)`); in EXISTS or IN, group it by the correlated column instead",
                     ));
                 }
-                (Form::Exists | Form::In(..), None) => predicate(
-                    sql::parse(
-                        &format!("SELECT * FROM {placeholder} AS {sq}"),
-                        DialectType::Generic,
-                    )
-                    .map_err(Error::Internal)?,
-                )?,
-                // A target that takes only correlated EXISTS: the IN as EXISTS forms.
-                (Form::In(in_node), Some(corr))
-                    if !crate::dialect::supports_correlated_in(self.opts.target) =>
+                // A target that takes only correlated EXISTS, or whose IN answers
+                // NULL differently: the IN as EXISTS forms.
+                (Form::In(in_node), corr)
+                    if !in_runs_natively(self.opts.target, corr.is_some()) =>
                 {
                     let Expression::In(i) = in_node else {
                         unreachable!("an IN")
                     };
                     let exists = correlate::in_as_exists(
-                        corr,
+                        corr.as_ref(),
                         &placeholder,
                         &sq,
                         &outputs[0],
@@ -1003,6 +1004,13 @@ impl Compiler<'_> {
                     })
                     .map_err(|e| Error::Internal(e.to_string()))?
                 }
+                (Form::Exists | Form::In(..), None) => predicate(
+                    sql::parse(
+                        &format!("SELECT * FROM {placeholder} AS {sq}"),
+                        DialectType::Generic,
+                    )
+                    .map_err(Error::Internal)?,
+                )?,
                 (Form::Exists | Form::In(..), Some(corr)) => {
                     predicate(correlate::stand_in(corr, &placeholder, &sq, &outputs)?)?
                 }
@@ -1166,6 +1174,37 @@ impl Compiler<'_> {
                 )));
             }
             let sq = format!("{}{}", sql::STAND_IN_PREFIX, pending.len());
+            // `x [NOT] IN (top)`, when the target doesn't run it as written: the
+            // whole IN becomes EXISTS forms.
+            let in_node = w.this.dfs().find(|x| match x {
+                Expression::In(i) => i.query.as_ref().is_some_and(|q| match q {
+                    Expression::Subquery(s) => std::ptr::eq(&s.this, top),
+                    other => std::ptr::eq(other, top),
+                }),
+                _ => false,
+            });
+            let as_exists = match (in_node, &correlation) {
+                (Some(Expression::In(i)), corr)
+                    if corr.as_ref().is_none_or(|c| c.empty.is_none())
+                        && !in_runs_natively(self.opts.target, corr.is_some()) =>
+                {
+                    Some((i, in_node.cloned().expect("found")))
+                }
+                _ => None,
+            };
+            if let Some((i, in_node)) = as_exists {
+                let replacement = correlate::in_as_exists(
+                    correlation.as_ref(),
+                    &placeholder,
+                    &sq,
+                    &outputs[0],
+                    &i.this,
+                    i.not,
+                )?;
+                compiled.push((in_node, replacement));
+                pending.push((placeholder, node));
+                continue;
+            }
             match correlation {
                 None => {
                     let stand_in = sql::parse(
@@ -1177,36 +1216,6 @@ impl Compiler<'_> {
                     pending.push((placeholder, node));
                 }
                 Some(corr) => match &corr.empty {
-                    // `x [NOT] IN (<correlated>)` where the target takes only
-                    // correlated EXISTS: the whole IN becomes EXISTS forms.
-                    None if !crate::dialect::supports_correlated_in(self.opts.target) => {
-                        let in_node = w.this.dfs().find(|x| match x {
-                            Expression::In(i) => i.query.as_ref().is_some_and(|q| match q {
-                                Expression::Subquery(s) => std::ptr::eq(&s.this, top),
-                                other => std::ptr::eq(other, top),
-                            }),
-                            _ => false,
-                        });
-                        let stand_in = match in_node {
-                            Some(Expression::In(i)) => {
-                                let replacement = correlate::in_as_exists(
-                                    &corr,
-                                    &placeholder,
-                                    &sq,
-                                    &outputs[0],
-                                    &i.this,
-                                    i.not,
-                                )?;
-                                compiled.push((in_node.cloned().expect("found"), replacement));
-                                None
-                            }
-                            _ => Some(correlate::stand_in(&corr, &placeholder, &sq, &outputs)?),
-                        };
-                        if let Some(stand_in) = stand_in {
-                            compiled.push((top.clone(), stand_in));
-                        }
-                        pending.push((placeholder, node));
-                    }
                     None => {
                         let stand_in = correlate::stand_in(&corr, &placeholder, &sq, &outputs)?;
                         compiled.push((top.clone(), stand_in));
@@ -1416,4 +1425,12 @@ pub(super) fn check_unique_names(outputs: &[OutCol]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `target` runs `x IN (<subquery>)` as written: a correlated one where it
+/// takes correlated `IN`, any one where its `IN` answers NULL as SQL does. Elsewhere
+/// it becomes `EXISTS` forms (`correlate::in_as_exists`).
+fn in_runs_natively(target: Option<DialectType>, correlated: bool) -> bool {
+    crate::dialect::in_is_three_valued(target)
+        && (!correlated || crate::dialect::supports_correlated_in(target))
 }

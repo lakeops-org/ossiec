@@ -71,6 +71,15 @@ pub(crate) fn supports_correlated_in(target: Option<DialectType>) -> bool {
     !matches!(target, Some(DialectType::ClickHouse))
 }
 
+/// Engines whose `x IN (subquery)` answers as SQL does when `x` or a row is NULL.
+/// ClickHouse's doesn't (`transform_null_in = 0`, 26.8): `7 NOT IN (SELECT NULL)`
+/// is 1, not NULL, and `NULL NOT IN (<no rows>)` is NULL, not TRUE. So every `IN`
+/// subquery gets `EXISTS` forms there, uncorrelated ones too. Evidence:
+/// `in_subquery_nulls`.
+pub(crate) fn in_is_three_valued(target: Option<DialectType>) -> bool {
+    !matches!(target, Some(DialectType::ClickHouse))
+}
+
 /// The engine whose SQL `target` runs. Athena's engine (v3) is Trino, and its
 /// queries are Trino's: same functions, same type names (polyglot's Athena dialect
 /// writes Hive's DDL types such as `STRING`, which an Athena query rejects). So an
@@ -215,16 +224,21 @@ pub(super) fn order_by_subqueries_by_name(ast: Expression) -> Result<Expression>
                 Identifier::new(name.clone()),
             ))));
     }
-    let quote = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
     let mut t = crate::sql::Tpl::new();
     let src = t.e(crate::sql::derived(
         Expression::Select(Box::new(inner)),
         Identifier::new(OUTER),
     ));
-    let cols: Vec<String> = names
-        .iter()
-        .map(|n| format!("{OUTER}.{} AS {}", quote(n), quote(n)))
-        .collect();
+    // Output names go in as placeholders, never as text: a name like `__ossiec_a0`
+    // would read as a template slot.
+    let mut cols: Vec<String> = Vec::with_capacity(names.len());
+    for n in &names {
+        let mut column = crate::sql::col(&format!("{OUTER}.x"));
+        if let Expression::Column(c) = &mut column {
+            c.name = crate::sql::quoted(n);
+        }
+        cols.push(format!("{} AS {}", t.e(column), t.alias(n)));
+    }
     t.push(&format!("SELECT {} FROM {src}", cols.join(", ")));
     let Expression::Select(mut outer) = t.build()? else {
         return Ok(ast);
