@@ -1127,6 +1127,8 @@ impl Compiler<'_> {
             })
             .collect();
         let mut compiled: Vec<(Expression, Expression)> = vec![];
+        // `x [NOT] IN (top)` rewritten whole, after the rest: see below.
+        let mut whole_ins = vec![];
         let mut pending = vec![];
         for top in tops {
             let Expression::Select(select) = top else {
@@ -1193,15 +1195,15 @@ impl Compiler<'_> {
                 _ => None,
             };
             if let Some((i, in_node)) = as_exists {
-                let replacement = correlate::in_as_exists(
-                    correlation.as_ref(),
-                    &placeholder,
-                    &sq,
-                    &outputs[0],
-                    &i.this,
+                whole_ins.push((
+                    in_node,
+                    i.this.clone(),
                     i.not,
-                )?;
-                compiled.push((in_node, replacement));
+                    correlation,
+                    placeholder.clone(),
+                    sq,
+                    outputs[0].clone(),
+                ));
                 pending.push((placeholder, node));
                 continue;
             }
@@ -1247,15 +1249,34 @@ impl Compiler<'_> {
                 },
             }
         }
-        let this = sql::transform(w.this.clone(), &|x| {
-            Ok(Some(
-                compiled
-                    .iter()
-                    .find(|(original, _)| *original == x)
-                    .map_or(x, |(_, stand_in)| stand_in.clone()),
-            ))
-        })
-        .map_err(|e| Error::Internal(e.to_string()))?;
+        let apply = |e: Expression, compiled: &[(Expression, Expression)]| {
+            sql::transform(e, &|x| {
+                Ok(Some(
+                    compiled
+                        .iter()
+                        .find(|(original, _)| *original == x)
+                        .map_or(x, |(_, stand_in)| stand_in.clone()),
+                ))
+            })
+            .map_err(|e| Error::Internal(e.to_string()))
+        };
+        // The transform works bottom up, so by the time it meets an `IN` rewritten
+        // whole, a subquery on its left has been replaced: match the `IN` as it
+        // is then, and build the EXISTS forms from the replaced left side.
+        for (in_node, left, not, correlation, placeholder, sq, output) in whole_ins {
+            let key = apply(in_node, &compiled)?;
+            let left = apply(left, &compiled)?;
+            let replacement = correlate::in_as_exists(
+                correlation.as_ref(),
+                &placeholder,
+                &sq,
+                &output,
+                &left,
+                not,
+            )?;
+            compiled.push((key, replacement));
+        }
+        let this = apply(w.this.clone(), &compiled)?;
         // A subquery identical to one nested in another would have changed its
         // parent before the parent was matched.
         let left = this.contains(|x| {
