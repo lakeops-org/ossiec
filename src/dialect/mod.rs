@@ -71,6 +71,15 @@ pub(crate) fn supports_correlated_in(target: Option<DialectType>) -> bool {
     !matches!(target, Some(DialectType::ClickHouse))
 }
 
+/// Engines whose `x IN (subquery)` answers as SQL does when `x` or a row is NULL.
+/// ClickHouse's doesn't (`transform_null_in = 0`, 26.8): `7 NOT IN (SELECT NULL)`
+/// is 1, not NULL, and `NULL NOT IN (<no rows>)` is NULL, not TRUE. So every `IN`
+/// subquery gets `EXISTS` forms there, uncorrelated ones too. Evidence:
+/// `in_subquery_nulls`.
+pub(crate) fn in_is_three_valued(target: Option<DialectType>) -> bool {
+    !matches!(target, Some(DialectType::ClickHouse))
+}
+
 /// The engine whose SQL `target` runs. Athena's engine (v3) is Trino, and its
 /// queries are Trino's: same functions, same type names (polyglot's Athena dialect
 /// writes Hive's DDL types such as `STRING`, which an Athena query rejects). So an
@@ -153,4 +162,94 @@ fn literal_backslashes_in_like(ast: Expression) -> Result<Expression> {
         }))
     })
     .map_err(internal)
+}
+
+/// StarRocks refuses a subquery in `ORDER BY` ("ORDER BY clause cannot contain
+/// subquery"), and ClickHouse 26.8 a correlated one ("Correlated subqueries in
+/// ORDER BY are not supported"); both take one in the select list. Each key is
+/// computed in a derived table instead, and the query around it orders by the
+/// keys' names, then applies `LIMIT`/`OFFSET`. Evidence:
+/// `having_and_order_by_subqueries`, `having_and_order_by_exists_and_in`.
+pub(super) fn order_by_subqueries_by_name(ast: Expression) -> Result<Expression> {
+    use polyglot_sql::expressions::{Alias, Identifier};
+    use polyglot_sql::{is_query, is_subquery, ExpressionWalk};
+    let Expression::Select(sel) = &ast else {
+        return Ok(ast);
+    };
+    let Some(order) = &sel.order_by else {
+        return Ok(ast);
+    };
+    let reads_query = order
+        .expressions
+        .iter()
+        .any(|k| k.this.contains(|x| is_query(x) || is_subquery(x)));
+    // Every output is named, so the query around can name it.
+    let names: Option<Vec<String>> = sel
+        .expressions
+        .iter()
+        .map(|e| match e {
+            Expression::Alias(a) => Some(a.alias.name.clone()),
+            Expression::Column(c) => Some(c.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let (true, Some(names), false) = (reads_query, names, sel.distinct) else {
+        return Ok(ast);
+    };
+    const OUTER: &str = "__ossiec_ordered";
+    const KEY: &str = "__ossiec_ord";
+    // Each key's name, unlike any output's (engines may fold case).
+    let mut key_names: Vec<String> = vec![];
+    for i in 0..order.expressions.len() {
+        let mut name = format!("{KEY}{i}");
+        while names
+            .iter()
+            .chain(&key_names)
+            .any(|n| n.eq_ignore_ascii_case(&name))
+        {
+            name.push('_');
+        }
+        key_names.push(name);
+    }
+    let mut inner = (**sel).clone();
+    inner.order_by = None;
+    inner.limit = None;
+    inner.offset = None;
+    inner.fetch = None;
+    for (k, name) in order.expressions.iter().zip(&key_names) {
+        inner
+            .expressions
+            .push(Expression::Alias(Box::new(Alias::new(
+                k.this.clone(),
+                Identifier::new(name.clone()),
+            ))));
+    }
+    let mut t = crate::sql::Tpl::new();
+    let src = t.e(crate::sql::derived(
+        Expression::Select(Box::new(inner)),
+        Identifier::new(OUTER),
+    ));
+    // Output names go in as placeholders, never as text: a name like `__ossiec_a0`
+    // would read as a template slot.
+    let mut cols: Vec<String> = Vec::with_capacity(names.len());
+    for n in &names {
+        let mut column = crate::sql::col(&format!("{OUTER}.x"));
+        if let Expression::Column(c) = &mut column {
+            c.name = crate::sql::quoted(n);
+        }
+        cols.push(format!("{} AS {}", t.e(column), t.alias(n)));
+    }
+    t.push(&format!("SELECT {} FROM {src}", cols.join(", ")));
+    let Expression::Select(mut outer) = t.build()? else {
+        return Ok(ast);
+    };
+    let mut keys = order.clone();
+    for (k, name) in keys.expressions.iter_mut().zip(&key_names) {
+        k.this = crate::sql::col(&format!("{OUTER}.{name}"));
+    }
+    outer.order_by = Some(keys);
+    outer.limit = sel.limit.clone();
+    outer.offset = sel.offset.clone();
+    outer.fetch = sel.fetch.clone();
+    Ok(Expression::Select(outer))
 }

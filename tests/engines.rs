@@ -64,6 +64,23 @@ fn sweep_layer2_nested(engine: Engine) {
     );
 }
 
+/// A truth value as the number MySQL and StarRocks return for one: Postgres
+/// writes `t`, DuckDB and ClickHouse `true`. The shop has no text column that
+/// holds these words.
+fn truth_as_numbers(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    rows.into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|v| match v.as_str() {
+                    "t" | "true" => "1.000000".to_string(),
+                    "f" | "false" => "0.000000".to_string(),
+                    _ => v,
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn sweep_cases(
     engine: Engine,
     model: &str,
@@ -83,9 +100,9 @@ fn sweep_cases(
             ossiec::compile_sql(&g, case.sql, &opts)
         }
         .unwrap_or_else(|e| panic!("{}: {e}", case.name));
-        let mut want = duckdb_rows(&db, case.reference);
+        let mut want = truth_as_numbers(duckdb_rows(&db, case.reference));
         want.sort();
-        match run(engine, &compiled.sql) {
+        match run(engine, &compiled.sql).map(truth_as_numbers) {
             Ok(mut got) => {
                 got.sort();
                 if got != want {

@@ -826,10 +826,11 @@ impl Compiler<'_> {
         }
     }
 
-    /// §7.7: each scalar subquery in `sel`'s select list, `HAVING` and `ORDER BY`,
+    /// §7.7: each subquery in `sel`'s select list, `HAVING` and `ORDER BY` (a
+    /// scalar, `[NOT] EXISTS` or `x [NOT] IN`: see [`predicate_around`]),
     /// outermost first, compiled as a Layer 2 query of its own (correlated ones
-    /// as in `WHERE`, through [`super::correlate`]), and replaced by a marker
-    /// column the stage reads as one [`super::L2Formula::Scalar`] leaf (or, in
+    /// as in `WHERE`, through [`super::correlate`]), and replaced with what reads
+    /// it by a marker column the stage reads as one [`super::L2Formula::Scalar`] leaf (or, in
     /// `HAVING` and `ORDER BY`, binds in place). Returns the compiled queries and
     /// each marker's stand-in.
     #[allow(clippy::type_complexity)]
@@ -900,19 +901,34 @@ impl Compiler<'_> {
             let Expression::Select(select) = top else {
                 unreachable!("tops are selects")
             };
-            // `( SELECT … )`: the scalar the marker stands for.
-            let around = item
-                .dfs()
-                .find(|x| matches!(x, Expression::Subquery(s) if std::ptr::eq(&s.this, top)))
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "Layer 2 {clause} takes a subquery only as a scalar value, `(SELECT …)`"
-                    ))
-                })?;
+            let (around, form) = predicate_around(item, top).ok_or_else(|| {
+                unsupported(format!(
+                    "Layer 2 {clause} takes a subquery as a scalar value `(SELECT …)`, in `[NOT] EXISTS (SELECT …)` or in `x [NOT] IN (SELECT …)`"
+                ))
+            })?;
             // The same subquery again, beside the first: one value, one marker,
             // which the rewrite below puts in both places.
             if replaced.iter().any(|(original, _)| original == around) {
                 continue;
+            }
+            if let Form::In(Expression::In(i)) = &form {
+                // The marker below replaces the whole predicate, left side included,
+                // so a window there would pass the clause's own check unseen.
+                if polyglot_sql::contains_window_function(&i.this) {
+                    return Err(unsupported(format!(
+                        "Layer 2 {clause}: the left side of `IN (SELECT …)` reads the grouping columns only; a window is not supported"
+                    )));
+                }
+                if i.this.contains(|x| {
+                    matches!(x, Expression::Select(_) | Expression::Subquery(_))
+                        || super::is_measure_agg_expr(x)
+                        || super::is_base_agg_expr(x)
+                        || super::stage::is_scalar_marker(x)
+                }) {
+                    return Err(unsupported(format!(
+                        "Layer 2 {clause}: the left side of `IN (SELECT …)` reads the grouping columns only; an aggregate or a subquery there is not supported yet"
+                    )));
+                }
             }
             let mut select = (**select).clone();
             for (i, e) in select.expressions.iter_mut().enumerate() {
@@ -945,16 +961,60 @@ impl Compiler<'_> {
                 .map(|o| o.name.clone())
                 .filter(|n| correlation.is_none() || !n.starts_with(correlate::KEY))
                 .collect();
-            if outputs.len() != 1 {
+            if !matches!(form, Form::Exists) && outputs.len() != 1 {
                 return Err(Error::Request(format!(
-                    "Layer 2 subquery in the {clause} must return one column, as a scalar; it returns {}",
+                    "Layer 2 subquery in the {clause} must return one column, as SQL requires outside EXISTS; it returns {}",
                     outputs.len()
                 )));
             }
             let n = scalars.len();
             let sq = format!("{}{}_{n}", sql::STAND_IN_PREFIX, "s");
-            let stand_in = match &correlation {
-                None => {
+            // `[NOT] EXISTS (…)` and `x [NOT] IN (…)`: the predicate, its query
+            // read from the compiled one, as in WHERE.
+            let predicate = |body: Expression| -> Result<Expression> {
+                sql::transform(around.clone(), &|x| {
+                    Ok(Some(if x == *top { body.clone() } else { x }))
+                })
+                .map_err(|e| Error::Internal(e.to_string()))
+            };
+            let stand_in = match (&form, &correlation) {
+                (Form::Exists | Form::In(..), Some(corr)) if corr.empty.is_some() => {
+                    return Err(unsupported(
+                        "Layer 2 correlated subquery that aggregates without GROUP BY is supported as a scalar value (`(SELECT AGG(m) …)`); in EXISTS or IN, group it by the correlated column instead",
+                    ));
+                }
+                // A target that takes only correlated EXISTS, or whose IN answers
+                // NULL differently: the IN as EXISTS forms.
+                (Form::In(in_node), corr)
+                    if !in_runs_natively(self.opts.target, corr.is_some()) =>
+                {
+                    let Expression::In(i) = in_node else {
+                        unreachable!("an IN")
+                    };
+                    let exists = correlate::in_as_exists(
+                        corr.as_ref(),
+                        &placeholder,
+                        &sq,
+                        &outputs[0],
+                        &i.this,
+                        i.not,
+                    )?;
+                    sql::transform(around.clone(), &|x| {
+                        Ok(Some(if x == **in_node { exists.clone() } else { x }))
+                    })
+                    .map_err(|e| Error::Internal(e.to_string()))?
+                }
+                (Form::Exists | Form::In(..), None) => predicate(
+                    sql::parse(
+                        &format!("SELECT * FROM {placeholder} AS {sq}"),
+                        DialectType::Generic,
+                    )
+                    .map_err(Error::Internal)?,
+                )?,
+                (Form::Exists | Form::In(..), Some(corr)) => {
+                    predicate(correlate::stand_in(corr, &placeholder, &sq, &outputs)?)?
+                }
+                (Form::Scalar, None) => {
                     let mut s = match around {
                         Expression::Subquery(s) => (**s).clone(),
                         _ => unreachable!("found as a subquery"),
@@ -966,7 +1026,7 @@ impl Compiler<'_> {
                     .map_err(Error::Internal)?;
                     Expression::Subquery(Box::new(s))
                 }
-                Some(corr) => match &corr.empty {
+                (Form::Scalar, Some(corr)) => match &corr.empty {
                     None => {
                         let mut s = match around {
                             Expression::Subquery(s) => (**s).clone(),
@@ -1067,6 +1127,8 @@ impl Compiler<'_> {
             })
             .collect();
         let mut compiled: Vec<(Expression, Expression)> = vec![];
+        // `x [NOT] IN (top)` rewritten whole, after the rest: see below.
+        let mut whole_ins = vec![];
         let mut pending = vec![];
         for top in tops {
             let Expression::Select(select) = top else {
@@ -1114,6 +1176,37 @@ impl Compiler<'_> {
                 )));
             }
             let sq = format!("{}{}", sql::STAND_IN_PREFIX, pending.len());
+            // `x [NOT] IN (top)`, when the target doesn't run it as written: the
+            // whole IN becomes EXISTS forms.
+            let in_node = w.this.dfs().find(|x| match x {
+                Expression::In(i) => i.query.as_ref().is_some_and(|q| match q {
+                    Expression::Subquery(s) => std::ptr::eq(&s.this, top),
+                    other => std::ptr::eq(other, top),
+                }),
+                _ => false,
+            });
+            let as_exists = match (in_node, &correlation) {
+                (Some(Expression::In(i)), corr)
+                    if corr.as_ref().is_none_or(|c| c.empty.is_none())
+                        && !in_runs_natively(self.opts.target, corr.is_some()) =>
+                {
+                    Some((i, in_node.cloned().expect("found")))
+                }
+                _ => None,
+            };
+            if let Some((i, in_node)) = as_exists {
+                whole_ins.push((
+                    in_node,
+                    i.this.clone(),
+                    i.not,
+                    correlation,
+                    placeholder.clone(),
+                    sq,
+                    outputs[0].clone(),
+                ));
+                pending.push((placeholder, node));
+                continue;
+            }
             match correlation {
                 None => {
                     let stand_in = sql::parse(
@@ -1125,36 +1218,6 @@ impl Compiler<'_> {
                     pending.push((placeholder, node));
                 }
                 Some(corr) => match &corr.empty {
-                    // `x [NOT] IN (<correlated>)` where the target takes only
-                    // correlated EXISTS: the whole IN becomes EXISTS forms.
-                    None if !crate::dialect::supports_correlated_in(self.opts.target) => {
-                        let in_node = w.this.dfs().find(|x| match x {
-                            Expression::In(i) => i.query.as_ref().is_some_and(|q| match q {
-                                Expression::Subquery(s) => std::ptr::eq(&s.this, top),
-                                other => std::ptr::eq(other, top),
-                            }),
-                            _ => false,
-                        });
-                        let stand_in = match in_node {
-                            Some(Expression::In(i)) => {
-                                let replacement = correlate::in_as_exists(
-                                    &corr,
-                                    &placeholder,
-                                    &sq,
-                                    &outputs[0],
-                                    &i.this,
-                                    i.not,
-                                )?;
-                                compiled.push((in_node.cloned().expect("found"), replacement));
-                                None
-                            }
-                            _ => Some(correlate::stand_in(&corr, &placeholder, &sq, &outputs)?),
-                        };
-                        if let Some(stand_in) = stand_in {
-                            compiled.push((top.clone(), stand_in));
-                        }
-                        pending.push((placeholder, node));
-                    }
                     None => {
                         let stand_in = correlate::stand_in(&corr, &placeholder, &sq, &outputs)?;
                         compiled.push((top.clone(), stand_in));
@@ -1186,15 +1249,34 @@ impl Compiler<'_> {
                 },
             }
         }
-        let this = sql::transform(w.this.clone(), &|x| {
-            Ok(Some(
-                compiled
-                    .iter()
-                    .find(|(original, _)| *original == x)
-                    .map_or(x, |(_, stand_in)| stand_in.clone()),
-            ))
-        })
-        .map_err(|e| Error::Internal(e.to_string()))?;
+        let apply = |e: Expression, compiled: &[(Expression, Expression)]| {
+            sql::transform(e, &|x| {
+                Ok(Some(
+                    compiled
+                        .iter()
+                        .find(|(original, _)| *original == x)
+                        .map_or(x, |(_, stand_in)| stand_in.clone()),
+                ))
+            })
+            .map_err(|e| Error::Internal(e.to_string()))
+        };
+        // The transform works bottom up, so by the time it meets an `IN` rewritten
+        // whole, a subquery on its left has been replaced: match the `IN` as it
+        // is then, and build the EXISTS forms from the replaced left side.
+        for (in_node, left, not, correlation, placeholder, sq, output) in whole_ins {
+            let key = apply(in_node, &compiled)?;
+            let left = apply(left, &compiled)?;
+            let replacement = correlate::in_as_exists(
+                correlation.as_ref(),
+                &placeholder,
+                &sq,
+                &output,
+                &left,
+                not,
+            )?;
+            compiled.push((key, replacement));
+        }
+        let this = apply(w.this.clone(), &compiled)?;
         // A subquery identical to one nested in another would have changed its
         // parent before the parent was matched.
         let left = this.contains(|x| {
@@ -1215,6 +1297,48 @@ impl Compiler<'_> {
         }
         Ok((out, pending))
     }
+}
+
+/// How an expression reads one of its subqueries.
+enum Form<'e> {
+    /// `( SELECT … )`, one value.
+    Scalar,
+    /// `EXISTS (SELECT …)`.
+    Exists,
+    /// `x [NOT] IN (SELECT …)`: the `In` node.
+    In(&'e Expression),
+}
+
+/// The expression of `item` that reads subquery `top`, which a marker replaces
+/// whole: `( SELECT … )`, or the `[NOT] EXISTS` or `x [NOT] IN` predicate around
+/// it, with any `NOT` written before the predicate. `None` for any other use.
+fn predicate_around<'e>(
+    item: &'e Expression,
+    top: &Expression,
+) -> Option<(&'e Expression, Form<'e>)> {
+    let is_body = |q: &Expression| {
+        std::ptr::eq(q, top) || matches!(q, Expression::Subquery(s) if std::ptr::eq(&s.this, top))
+    };
+    // Pre-order: a predicate is met before the `( … )` inside it. `ANY`/`ALL`
+    // read many values, so not a scalar: refused (`None`).
+    let (mut node, form) = item.dfs().find_map(|x| match x {
+        Expression::Exists(ex) if is_body(&ex.this) => Some(Some((x, Form::Exists))),
+        Expression::In(i) if i.query.as_ref().is_some_and(is_body) => Some(Some((x, Form::In(x)))),
+        Expression::Any(q) | Expression::All(q) if is_body(&q.subquery) => Some(None),
+        Expression::Subquery(s) if std::ptr::eq(&s.this, top) => Some(Some((x, Form::Scalar))),
+        _ => None,
+    })??;
+    if !matches!(form, Form::Scalar) {
+        let wraps = |outer: &Expression, inner: &Expression| match outer {
+            Expression::Not(n) => std::ptr::eq(&n.this, inner),
+            Expression::Paren(p) => std::ptr::eq(&p.this, inner),
+            _ => false,
+        };
+        while let Some(parent) = item.dfs().find(|x| wraps(x, node)) {
+            node = parent;
+        }
+    }
+    Some((node, form))
 }
 
 /// The hidden item of a grand total that selects nothing; the outer list never
@@ -1322,4 +1446,12 @@ pub(super) fn check_unique_names(outputs: &[OutCol]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `target` runs `x IN (<subquery>)` as written: a correlated one where it
+/// takes correlated `IN`, any one where its `IN` answers NULL as SQL does. Elsewhere
+/// it becomes `EXISTS` forms (`correlate::in_as_exists`).
+fn in_runs_natively(target: Option<DialectType>, correlated: bool) -> bool {
+    crate::dialect::in_is_three_valued(target)
+        && (!correlated || crate::dialect::supports_correlated_in(target))
 }

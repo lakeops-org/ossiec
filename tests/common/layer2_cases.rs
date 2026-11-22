@@ -496,6 +496,130 @@ pub const LAYER2_NESTED_CASES: &[Layer2NestedCase] = &[
         script: false,
     },
     Layer2NestedCase {
+        // §7.7: EXISTS and IN in the select list, correlated with the row's
+        // dimensions; the guest order's customer matches no returned order, and
+        // customer 7's NULL product is in no set. (ClickHouse runs the
+        // correlated IN as EXISTS.)
+        name: "select_list_exists_and_in",
+        sql: "SELECT o.customer_id, o.product_id, \
+              EXISTS (SELECT o2.id FROM orders o2 \
+                WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') AS returned_any, \
+              o.product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+                WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') AS kept, \
+              o.product_id IN (SELECT p.id FROM products p WHERE p.category = 'books') AS book \
+              FROM orders o GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id, \
+                    EXISTS (SELECT 1 FROM orders o2 \
+                      WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') AS returned_any, \
+                    o.product_id NOT IN (SELECT o2.product_id FROM orders o2 \
+                      WHERE o2.customer_id = o.customer_id AND o2.status = 'returned') AS kept, \
+                    o.product_id IN (SELECT p.product_id FROM products p WHERE p.category = 'books') AS book \
+                    FROM orders o GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        // §7.5, §7.7: NOT EXISTS in HAVING and EXISTS in ORDER BY, correlated
+        // with the row's region; IN over a set with a NULL in HAVING.
+        name: "having_and_order_by_exists_and_in",
+        sql: "SELECT c.region, AGG(o.order_count) AS n \
+              FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region \
+              HAVING NOT EXISTS (SELECT c2.id FROM customers c2 \
+                WHERE c2.region = c.region AND c2.segment = 'enterprise') \
+                OR c.region IN (SELECT c2.region FROM customers c2 WHERE c2.segment = 'smb' AND c2.id < 3) \
+              ORDER BY EXISTS (SELECT c2.id FROM customers c2 \
+                WHERE c2.region = c.region AND c2.segment = 'smb') DESC, c.region",
+        reference: "SELECT c.region, COUNT(*) AS n \
+                    FROM orders o JOIN {customers} c ON o.customer_id = c.customer_id GROUP BY c.region \
+                    HAVING NOT EXISTS (SELECT 1 FROM {customers} c2 \
+                      WHERE c2.region = c.region AND c2.segment = 'enterprise') \
+                      OR c.region IN (SELECT c2.region FROM {customers} c2 WHERE c2.segment = 'smb' AND c2.customer_id < 3) \
+                    ORDER BY EXISTS (SELECT 1 FROM {customers} c2 \
+                      WHERE c2.region = c.region AND c2.segment = 'smb') DESC, c.region NULLS FIRST",
+        script: false,
+    },
+    Layer2NestedCase {
+// §7.3, §7.7: uncorrelated `x [NOT] IN` answers NULL as SQL does: over a
+        // set of only NULLs (NULL), no rows (FALSE, so NOT IN keeps the NULL
+        // product too), and a match beside a NULL (TRUE; else NULL). ClickHouse's
+        // own IN says FALSE where SQL says NULL, so it gets EXISTS forms. Here in
+        // the select list; the `in_where_*` cases filter rows with each predicate.
+        name: "in_subquery_nulls",
+        sql: "SELECT o.customer_id, o.product_id, \
+              o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL) AS in_nulls, \
+              o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL) AS not_in_nulls, \
+              o.product_id NOT IN (SELECT p.id FROM products p WHERE p.category = 'none') AS not_in_empty, \
+              o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL) AS in_some, \
+              o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL) AS not_in_some \
+              FROM orders o GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id, \
+                    o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL) AS in_nulls, \
+                    o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL) AS not_in_nulls, \
+                    o.product_id NOT IN (SELECT p.product_id FROM products p WHERE p.category = 'none') AS not_in_empty, \
+                    o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL) AS in_some, \
+                    o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL) AS not_in_some \
+                    FROM orders o GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "in_where_not_in",
+        sql: "SELECT o.customer_id, o.product_id FROM orders o \
+              WHERE o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned') GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id FROM orders o \
+                    WHERE o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned') GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "in_where_not_in_nulls",
+        sql: "SELECT o.customer_id, o.product_id FROM orders o \
+              WHERE o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL) GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id FROM orders o \
+                    WHERE o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL) GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "in_where_in_nulls_is_null",
+        sql: "SELECT o.customer_id, o.product_id FROM orders o \
+              WHERE (o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL)) IS NULL GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id FROM orders o \
+                    WHERE (o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.product_id IS NULL)) IS NULL GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "in_where_not_in_empty",
+        sql: "SELECT o.customer_id, o.product_id FROM orders o \
+              WHERE o.product_id NOT IN (SELECT p.id FROM products p WHERE p.category = 'none') GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id FROM orders o \
+                    WHERE o.product_id NOT IN (SELECT p.product_id FROM products p WHERE p.category = 'none') GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "in_where_in_some",
+        sql: "SELECT o.customer_id, o.product_id FROM orders o \
+              WHERE o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL) GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id FROM orders o \
+                    WHERE o.product_id IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL) GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        name: "in_where_not_in_some_is_null",
+        sql: "SELECT o.customer_id, o.product_id FROM orders o \
+              WHERE (o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL)) IS NULL GROUP BY o.customer_id, o.product_id",
+        reference: "SELECT o.customer_id, o.product_id FROM orders o \
+                    WHERE (o.product_id NOT IN (SELECT o2.product_id FROM orders o2 WHERE o2.status = 'returned' OR o2.product_id IS NULL)) IS NULL GROUP BY o.customer_id, o.product_id",
+        script: false,
+    },
+    Layer2NestedCase {
+        // A subquery on the left of an `IN` that ClickHouse runs as EXISTS forms.
+        name: "in_where_subquery_on_the_left",
+        sql: "SELECT o.status, AGG(o.order_count) AS n FROM orders o \
+              WHERE (SELECT MAX(o2.product_id) FROM orders o2) IN (SELECT p.id FROM products p) \
+              GROUP BY o.status",
+        reference: "SELECT o.status, COUNT(*) AS n FROM orders o \
+                    WHERE (SELECT MAX(o2.product_id) FROM orders o2) IN (SELECT p.product_id FROM products p) \
+                    GROUP BY o.status",
+        script: false,
+    },
+    Layer2NestedCase {
         // §7.3: correlated scalar subqueries: a plain aggregate (orders above their
         // customer's average) and a measure, whose value over no matching rows is
         // the measure over none (0), not NULL.

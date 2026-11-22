@@ -38,11 +38,12 @@ Each rule exists because an engine test showed polyglot's rendering answering di
 | ClickHouse | No standard `LAG`/`LEAD`; its `lag` returns 0, not NULL, for the first row | `lagInFrame(toNullable(x), n)` over the whole partition |
 | ClickHouse | An unmatched `LEFT JOIN` column is the type's default (0, `''`), not NULL, so orphan rows merge into real groups | `SETTINGS join_use_nulls = 1` on the query |
 | ClickHouse | A correlated subquery can't be the right side of `IN` ("not supported as IN function arguments yet"), and a correlated `EXISTS` condition that reads only the outer row finds no row | `x [NOT] IN (…)` becomes correlated `EXISTS` forms with `IN`'s TRUE / NULL / FALSE answer, with every outer-only condition outside them (`where_correlated_subqueries`, `where_correlated_in_nulls`) |
+| ClickHouse | `IN` answers FALSE where SQL answers NULL: `7 NOT IN (SELECT NULL)` is 1, and `NULL NOT IN` no rows is NULL, not TRUE | An uncorrelated `x [NOT] IN (…)` becomes `EXISTS` forms too (`in_subquery_nulls`) |
 | Postgres | `UNION` branches are typed pairwise, so two bare `NULL`s become `text` and clash with a number | Each `NULL` takes its term's type |
 | Postgres | Locale collation sorts `'ada'` before `'Bob'` | `COLLATE "C"` on string dimensions |
 | MySQL | Default collation compares case-insensitively, merging `Ada` and `ada` | `COLLATE utf8mb4_bin` on string dimensions and filters |
 | MySQL | `AVG` of integers is rounded to 4 decimal places | The argument is cast to `DOUBLE` |
-| StarRocks | A subquery in `ORDER BY` is refused ("ORDER BY clause cannot contain subquery") | The keys are computed in a derived table, and the query around it orders by their names (`having_and_order_by_subqueries`) |
+| StarRocks, ClickHouse | StarRocks refuses a subquery in `ORDER BY` ("ORDER BY clause cannot contain subquery"); ClickHouse refuses a correlated one ("Correlated subqueries in ORDER BY are not supported") | The keys are computed in a derived table, and the query around it orders by their names (`having_and_order_by_subqueries`, `having_and_order_by_exists_and_in`) |
 | StarRocks | `\` in a string literal is an escape, and polyglot doesn't double it | Double it |
 | Postgres, ClickHouse, StarRocks, MySQL | `\` in a `LIKE` pattern is an escape | Double it, so it matches itself |
 | BigQuery | `DATE_TRUNC(d, WEEK)` starts weeks on Sunday; Ossie's start on Monday | `ISOWEEK` (checked by golden SQL only) |

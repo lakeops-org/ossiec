@@ -323,26 +323,31 @@ fn quoted(name: &str) -> String {
 }
 
 /// `SELECT cols FROM placeholder AS sq WHERE <keys = the enclosing row's values>`,
-/// with `extra` AND-ed on.
+/// with `extra` AND-ed on. Without a correlation, only `extra` filters.
 fn keyed(
     t: &mut sql::Tpl,
-    corr: &Correlation,
+    corr: Option<&Correlation>,
     placeholder: &str,
     sq: &str,
     cols: &str,
     extra: Option<&str>,
 ) -> String {
     let mut conds: Vec<String> = corr
-        .keys
-        .iter()
-        .zip(&corr.outer)
-        .map(|(k, o)| format!("{sq}.{} = {}", quoted(k), t.e(o.clone())))
-        .collect();
+        .map(|corr| {
+            corr.keys
+                .iter()
+                .zip(&corr.outer)
+                .map(|(k, o)| format!("{sq}.{} = {}", quoted(k), t.e(o.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
     conds.extend(extra.map(str::to_string));
-    format!(
-        "SELECT {cols} FROM {placeholder} AS {sq} WHERE {}",
-        conds.join(" AND ")
-    )
+    let query = format!("SELECT {cols} FROM {placeholder} AS {sq}");
+    if conds.is_empty() {
+        query
+    } else {
+        format!("{query} WHERE {}", conds.join(" AND "))
+    }
 }
 
 /// The stand-in for a correlated subquery: its `outputs`, kept to the rows whose
@@ -359,7 +364,7 @@ pub(super) fn stand_in(
         .map(|o| format!("{sq}.{}", quoted(o)))
         .collect::<Vec<_>>()
         .join(", ");
-    let body = keyed(&mut t, corr, placeholder, sq, &cols, None);
+    let body = keyed(&mut t, Some(corr), placeholder, sq, &cols, None);
     t.push(&format!("({body})"));
     subquery_body(t.build()?)
 }
@@ -375,11 +380,11 @@ pub(super) fn scalar_with_default(
     output: &str,
 ) -> Result<Expression> {
     let mut t = sql::Tpl::new();
-    let exists = keyed(&mut t, corr, placeholder, sq, "1", None);
+    let exists = keyed(&mut t, Some(corr), placeholder, sq, "1", None);
     // One row per key, so MAX only reads it: some engines take a correlated
     // scalar subquery only when it aggregates.
     let max = format!("MAX({sq}.{})", quoted(output));
-    let value = keyed(&mut t, corr, placeholder, sq, &max, None);
+    let value = keyed(&mut t, Some(corr), placeholder, sq, &max, None);
     let sqe = format!("{sq}_none");
     t.push(&format!(
         "(CASE WHEN EXISTS ({exists}) THEN ({value}) ELSE (SELECT {sqe}.{} FROM {empty} AS {sqe}) END)",
@@ -388,12 +393,13 @@ pub(super) fn scalar_with_default(
     t.build()
 }
 
-/// `x [NOT] IN (<correlated subquery>)` as correlated `EXISTS`, for an engine
-/// that takes no correlated subquery in `IN`. `IN`'s three values: TRUE when a
+/// `x [NOT] IN (<subquery>)` as `EXISTS` forms, for an engine that takes no
+/// correlated subquery in `IN`, or whose `IN` doesn't answer NULL as SQL does
+/// (`corr` is `None` for an uncorrelated one). `IN`'s three values: TRUE when a
 /// row equals `x`; else NULL when there are rows and `x` or one of them is NULL;
 /// else FALSE. `NOT IN` is its negation, so a NULL keeps no row either way.
 pub(super) fn in_as_exists(
-    corr: &Correlation,
+    corr: Option<&Correlation>,
     placeholder: &str,
     sq: &str,
     output: &str,
