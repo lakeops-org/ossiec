@@ -80,7 +80,7 @@ fn nested_db() -> duckdb::Connection {
     c
 }
 
-const ENGINES: [DialectType; 11] = [
+const ENGINES: [DialectType; 12] = [
     DialectType::Trino,
     DialectType::Athena,
     DialectType::StarRocks,
@@ -91,6 +91,7 @@ const ENGINES: [DialectType; 11] = [
     DialectType::Snowflake,
     DialectType::BigQuery,
     DialectType::Databricks,
+    DialectType::Spark,
     DialectType::Redshift,
 ];
 

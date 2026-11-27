@@ -4,31 +4,31 @@
 
 Every construct of `expression_language.md` that ossiec tests: 404 in all. Each is compiled for each engine and run on fixed data, against a value worked out by hand. **Verified** means it returned that value. Anything else is listed under [Gaps](#gaps): a refusal (ossiec won't compile what the engine can't express faithfully), an engine error, or the one known wrong answer. The page is written from each engine's list of gaps, and CI holds that list exact: on every commit it runs every construct on every engine, and fails if one off the list doesn't return its value or one on the list does.
 
-Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) is built on, so a function that Trino has and Athena lacks wouldn't show up here.
+Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) is built on, so a function that Trino has and Athena lacks wouldn't show up here. Spark's column is Apache Spark 4.0 with ANSI mode on, as in Databricks SQL. Databricks SQL is Spark SQL, so ossiec writes Databricks' SQL as Spark's, and its column is Spark's: a function Spark has and Databricks lacks wouldn't show up here.
 
 ## Summary
 
-| Section | DuckDB | Postgres | MySQL | ClickHouse | Trino | Athena | StarRocks |
-|---|---|---|---|---|---|---|---|
-| Operators | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 |
-| Current date/time | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 |
-| Extraction functions | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 |
-| EXTRACT | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 |
-| DATE_PART | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 |
-| DATE_TRUNC | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 |
-| Date arithmetic | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 |
-| Construction | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 |
-| Experimental | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 |
-| Strings | ✅ 30/30 | ✅ 30/30 | ⚠️ 29/30 | ✅ 30/30 | ✅ 30/30 | ✅ 30/30 | ✅ 30/30 |
-| Math | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 |
-| Conditional | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 |
-| Casts | ✅ 14/14 | ⚠️ 12/14 | ⚠️ 12/14 | ✅ 14/14 | ✅ 14/14 | ✅ 14/14 | ✅ 14/14 |
-| Null-safe | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 |
-| Edge cases | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ⚠️ 97/98 |
-| Case-insensitive function names | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 |
-| Aggregates | ✅ 39/39 | ✅ 39/39 | ⚠️ 21/39 | ✅ 39/39 | ⚠️ 23/39 | ⚠️ 23/39 | ✅ 39/39 |
-| Conditional aggregates | ✅ 26/26 | ✅ 26/26 | ⚠️ 23/26 | ✅ 26/26 | ⚠️ 23/26 | ⚠️ 23/26 | ✅ 26/26 |
-| Windows | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ⚠️ 24/25 |
+| Section | DuckDB | Postgres | MySQL | ClickHouse | Trino | Athena | Spark | Databricks | StarRocks |
+|---|---|---|---|---|---|---|---|---|---|
+| Operators | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 |
+| Current date/time | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ✅ 6/6 | ⚠️ 4/6 | ⚠️ 4/6 | ✅ 6/6 |
+| Extraction functions | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 | ✅ 8/8 |
+| EXTRACT | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 |
+| DATE_PART | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 | ✅ 11/11 |
+| DATE_TRUNC | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 |
+| Date arithmetic | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 | ✅ 19/19 |
+| Construction | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ✅ 10/10 | ⚠️ 9/10 | ⚠️ 9/10 | ✅ 10/10 |
+| Experimental | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 |
+| Strings | ✅ 30/30 | ✅ 30/30 | ⚠️ 29/30 | ✅ 30/30 | ✅ 30/30 | ✅ 30/30 | ✅ 30/30 | ✅ 30/30 | ✅ 30/30 |
+| Math | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 | ✅ 28/28 |
+| Conditional | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 | ✅ 17/17 |
+| Casts | ✅ 14/14 | ⚠️ 12/14 | ⚠️ 12/14 | ✅ 14/14 | ✅ 14/14 | ✅ 14/14 | ✅ 14/14 | ✅ 14/14 | ✅ 14/14 |
+| Null-safe | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 | ✅ 5/5 |
+| Edge cases | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ✅ 98/98 | ⚠️ 97/98 |
+| Case-insensitive function names | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 | ✅ 2/2 |
+| Aggregates | ✅ 39/39 | ✅ 39/39 | ⚠️ 21/39 | ✅ 39/39 | ⚠️ 23/39 | ⚠️ 23/39 | ✅ 39/39 | ✅ 39/39 | ✅ 39/39 |
+| Conditional aggregates | ✅ 26/26 | ✅ 26/26 | ⚠️ 23/26 | ✅ 26/26 | ⚠️ 23/26 | ⚠️ 23/26 | ✅ 26/26 | ✅ 26/26 | ✅ 26/26 |
+| Windows | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ✅ 25/25 | ⚠️ 24/25 |
 
 ## Gaps
 
@@ -98,6 +98,12 @@ Athena's column is ossiec's Athena SQL run on Trino, which Athena's engine (v3) 
 | Athena | `MEDIAN(v) FILTER (WHERE g = 'a')` | Refused: MEDIAN has no equivalent on Athena that gives the same answer |
 | Athena | `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'b')` | Refused: PERCENTILE_CONT has no equivalent on Athena that gives the same answer |
 | Athena | `PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE g = 'a')` | Refused: PERCENTILE_DISC has no equivalent on Athena that gives the same answer |
+| Spark | `CURRENT_TIME IS NOT NULL` | Refused: CURRENT_TIME has no equivalent on Spark that gives the same answer |
+| Spark | `CURRENT_TIME() IS NOT NULL` | Refused: CURRENT_TIME has no equivalent on Spark that gives the same answer |
+| Spark | `TIME '10:30:00' IS NOT NULL` | Refused: TIME_LITERAL has no equivalent on Spark that gives the same answer |
+| Databricks | `CURRENT_TIME IS NOT NULL` | Refused: CURRENT_TIME has no equivalent on Databricks that gives the same answer |
+| Databricks | `CURRENT_TIME() IS NOT NULL` | Refused: CURRENT_TIME has no equivalent on Databricks that gives the same answer |
+| Databricks | `TIME '10:30:00' IS NOT NULL` | Refused: TIME_LITERAL has no equivalent on Databricks that gives the same answer |
 | StarRocks | `UPPER(uni) = 'HÉLLO'` | **Wrong answer** (known: the engine has no Unicode form) |
 | StarRocks | `NTH_VALUE(SUM(v), 2) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)` | Engine error |
 

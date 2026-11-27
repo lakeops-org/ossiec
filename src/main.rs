@@ -12,7 +12,7 @@ USAGE:
 
 OPTIONS:
     --dialect <name>   Target dialect: trino, snowflake, bigquery, duckdb, postgres, clickhouse,
-                       starrocks, databricks, redshift, athena, mysql, ... (default: the model's source dialect)
+                       starrocks, spark, databricks, redshift, athena, mysql, ... (default: the model's source dialect)
     --prefer <name>    Prefer this Ossie dialect's expressions when a field or metric declares one
     --include-unmatched
                        Layer 2: also return one-side rows no fact reaches (same as a

@@ -20,7 +20,7 @@ ossiec persist-view <model.yaml> <view.sql> [--out <model.yaml>]
 
 | Option | Meaning |
 |---|---|
-| `--dialect <name>` | Target engine: `duckdb`, `postgres`, `mysql`, `trino`, `athena`, `starrocks`, `clickhouse`, `snowflake`, `bigquery`, `databricks`, `redshift`, and others polyglot renders. Default: the model's source dialect |
+| `--dialect <name>` | Target engine: `duckdb`, `postgres`, `mysql`, `trino`, `athena`, `starrocks`, `clickhouse`, `snowflake`, `bigquery`, `spark`, `databricks`, `redshift`, and others polyglot renders. Default: the model's source dialect |
 | `--prefer <name>` | Use this Ossie dialect's expressions (`SNOWFLAKE`, `TRINO`, …) where a field or metric declares one |
 | `--include-unmatched` | Layer 2: also return the one-side rows no fact reaches |
 | `--compact` | One-line SQL |

@@ -1,9 +1,11 @@
-//! The Docker engines (Trino, StarRocks, ClickHouse, Postgres, MySQL): which
-//! one, running SQL on it, and comparing its rows. Athena has no container:
+//! The Docker engines (Trino, StarRocks, ClickHouse, Postgres, MySQL, Spark):
+//! which one, running SQL on it, and comparing its rows. Athena has no container:
 //! its engine (v3) is Trino, so ossiec's Athena SQL runs on the Trino one.
+//! Databricks' SQL is Spark SQL, so ossiec's Databricks SQL runs on the Spark one.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 
 use super::*;
 
@@ -17,6 +19,10 @@ pub enum Engine {
     MySql,
     /// ossiec's Athena dialect, run on the Trino container.
     Athena,
+    /// Apache Spark SQL.
+    Spark,
+    /// ossiec's Databricks dialect, run on the Spark container.
+    Databricks,
 }
 
 impl Engine {
@@ -30,14 +36,17 @@ impl Engine {
             Engine::ClickHouse => D::ClickHouse,
             Engine::MySql => D::MySQL,
             Engine::Athena => D::Athena,
+            Engine::Spark => D::Spark,
+            Engine::Databricks => D::Databricks,
         }
     }
 
-    /// The engine whose container runs this one's SQL: Trino for Athena,
-    /// otherwise itself. Seed data and result parsing follow the host.
+    /// The engine whose container runs this one's SQL: Trino for Athena, Spark
+    /// for Databricks, otherwise itself. Seed data and result parsing follow the host.
     pub fn host(self) -> Engine {
         match self {
             Engine::Athena => Engine::Trino,
+            Engine::Databricks => Engine::Spark,
             e => e,
         }
     }
@@ -77,6 +86,9 @@ pub fn run(engine: Engine, sql: &str) -> Result<Vec<Vec<String>>, String> {
 
 /// [`run`], with Trino's catalog and schema for unqualified names.
 pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<String>>, String> {
+    if engine.host() == Engine::Spark {
+        return run_on_spark(sql);
+    }
     let (container, args, stdin): (&str, Vec<&str>, Option<String>) = match engine.host() {
         Engine::Postgres => (
             "ossiec-postgres",
@@ -143,6 +155,8 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
         ),
         Engine::DuckDb => unreachable!("DuckDB runs in-process"),
         Engine::Athena => unreachable!("Athena runs on its host, Trino"),
+        Engine::Spark => unreachable!("Spark runs on its SQL server"),
+        Engine::Databricks => unreachable!("Databricks runs on its host, Spark"),
     };
     let mut cmd = Command::new("docker");
     cmd.arg("exec").arg("-i").arg(container).args(&args);
@@ -181,6 +195,104 @@ pub fn run_in(engine: Engine, sql: &str, trino: (&str, &str)) -> Result<Vec<Vec<
                 .collect())
         })
         .collect()
+}
+
+/// `scripts/spark_sql_server.py`, running in the Spark container for as long as
+/// this test binary does, so the JVM starts once.
+struct Spark {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+const SPARK_MARK: &str = "\x1eOSSIEC ";
+
+/// Starts every error that means the server is gone, so the next query restarts it.
+const SPARK_GONE: &str = "the Spark SQL server exited";
+
+impl Spark {
+    fn start() -> Result<Spark, String> {
+        let mut child = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                "ossiec-spark",
+                "python3",
+                "/ossiec/spark_sql_server.py",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("docker: {e}"))?;
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut spark = Spark {
+            _child: child,
+            stdin,
+            stdout,
+        };
+        spark.answer()?;
+        Ok(spark)
+    }
+
+    /// The next marked line, skipping whatever else Spark printed.
+    fn answer(&mut self) -> Result<serde_json::Value, String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| format!("{SPARK_GONE}: {e}"))?
+                == 0
+            {
+                return Err(format!(
+                    "{SPARK_GONE} (is `scripts/engines.sh up` running?)"
+                ));
+            }
+            if let Some(json) = line.strip_prefix(SPARK_MARK) {
+                return serde_json::from_str(json).map_err(|e| format!("spark JSON: {e}: {json}"));
+            }
+        }
+    }
+
+    fn run(&mut self, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        let request = serde_json::json!({ "sql": sql }).to_string();
+        // A server that died between requests fails the write: the same as
+        // its exit, so `run_on_spark` starts a new one.
+        let gone = |e: std::io::Error| format!("{SPARK_GONE}: {e}");
+        writeln!(self.stdin, "{request}").map_err(gone)?;
+        self.stdin.flush().map_err(gone)?;
+        let answer = self.answer()?;
+        if let Some(e) = answer.get("error") {
+            return Err(e.as_str().unwrap_or_default().to_string());
+        }
+        let rows = answer["rows"].as_array().cloned().unwrap_or_default();
+        Ok(rows
+            .iter()
+            .map(|r| {
+                r.as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_str().map_or_else(|| "NULL".to_string(), norm_text))
+                    .collect()
+            })
+            .collect())
+    }
+}
+
+fn run_on_spark(sql: &str) -> Result<Vec<Vec<String>>, String> {
+    static SPARK: Mutex<Option<Spark>> = Mutex::new(None);
+    let mut spark = SPARK.lock().unwrap_or_else(|e| e.into_inner());
+    if spark.is_none() {
+        *spark = Some(Spark::start()?);
+    }
+    let result = spark.as_mut().unwrap().run(sql);
+    if result.as_ref().is_err_and(|e| e.starts_with(SPARK_GONE)) {
+        *spark = None;
+    }
+    result
 }
 
 /// Rows equal, with numbers compared to a relative tolerance: a DOUBLE ratio and

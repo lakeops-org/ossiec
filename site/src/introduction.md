@@ -44,7 +44,7 @@ Ossie organizes its spec in layers ([`spec_layers.md`](https://github.com/apache
 
 ## At a glance
 
-- **Six engines verified by execution:** DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL. Every correctness case runs on each and must return the same rows. Athena's SQL, which is Trino's, runs on Trino too. Snowflake, BigQuery, Databricks, Redshift and others are compile-checked. See [Engines](engines.md).
+- **Six engines verified by execution:** DuckDB, Postgres, Trino, StarRocks, ClickHouse and MySQL. Every correctness case runs on each and must return the same rows. Apache Spark is run too, and Athena and Databricks are written as the engines they're built on: Athena's SQL is Trino's and runs on Trino, Databricks' is Spark's and runs on Spark. Snowflake, BigQuery, Redshift and others are compile-checked. See [Engines](engines.md).
 - **Refuses rather than guesses.** A question with no safe answer gets the spec's error code (`E_NO_PATH`, `E_AMBIGUOUS_PATH`, …), and a function an engine can't express gets a clear refusal rather than a different answer. The known exceptions: on StarRocks, `UPPER` of non-ASCII text changes ASCII letters only, and one `NTH_VALUE` form fails with an engine error ([gaps](generated/functions.md#gaps)).
 - **Spec coverage, section by section:** see [Spec coverage](spec-coverage.md). The function and Layer 2 tables are generated from the test suite, so they can't drift from what ossiec does.
 - **A small Rust library and CLI.** No server, no runtime, no Python. Deterministic: the same model, request and options give byte-identical SQL.
